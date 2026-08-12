@@ -200,10 +200,15 @@ def make_boss_background():
     # Real forced boss-mode capture, converted to native VDC tiles. Bowser is
     # absent at f2300. Mario/HUD are removed; the arena's brown floor row is
     # extended through 240 just as normal levels extend their final visual row.
-    im=Image.open(BOSSREF/'b3_2300.png').convert('RGB')
+    src=Image.open(BOSSREF/'b3_2300.png').convert('RGB')
+    # The Mega Drive boss plane begins below a two-tile black status margin.
+    # The old screenshot conversion discarded that scroll origin, lifting the
+    # entire room by 16 pixels and making Bowser appear to float.
+    im=Image.new('RGB',(256,240),(0,0,0))
+    im.paste(src.crop((0,0,256,224)),(0,16))
     for y in range(152,208):
         for x in range(0,48): im.putpixel((x,y),im.getpixel((x+64,y)))
-    floor=im.crop((0,200,256,208))
+    floor=im.crop((0,216,256,224))
     for y in range(208,240,8): im.paste(floor,(0,y))
     return ba.pack_bg_rgb(im)
 

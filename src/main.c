@@ -115,6 +115,10 @@ extern void pcfx_tetsu_wait_frame(void);
 #define HURT_FRAMES 60
 #define HURT_FLICKER_HALF_PERIOD 6
 
+/* MODE1 toggles this at runtime.  It deliberately lives in the release build:
+   the requested debug mode is a testing aid, not a forced gameplay rule. */
+#define DEBUG_AMMO_DISPLAY 9
+
 #define STATE_BOOT       0
 #define STATE_TITLE_FADE 1
 #define STATE_MENU       2
@@ -163,6 +167,9 @@ typedef struct {
     unsigned char state;
     unsigned char flags;
     unsigned char defeated;
+    unsigned char flying;
+    unsigned char flight_phase;
+    short home_y;
 } Enemy;
 
 typedef struct {
@@ -181,22 +188,22 @@ typedef struct {
 /* 32x16 platform reconstructed from the actual Level-2 grass ledge tiles.
  * The words are in VDC sprite order and use source palette line 3. */
 static const u16 g_level2_platform_words[128] = {
-    0x0000, 0x0000, 0x0000, 0x0C52, 0x1305, 0x1881, 0x3162, 0x0A09,
-    0x114A, 0x1294, 0x1B50, 0x764C, 0x70B9, 0x3FC7, 0x0C3C, 0x0000,
-    0x3FFF, 0x6000, 0x4000, 0xC000, 0x8000, 0x8010, 0x8484, 0x9152,
-    0x8420, 0x8909, 0x8083, 0x81A3, 0xAFC7, 0xD7FF, 0x7FFF, 0x3C3C,
-    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-    0x0000, 0x1FFF, 0x3FFF, 0x3FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF,
-    0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x7FFF, 0x3C3C, 0x0000,
-    0x0000, 0x0000, 0x0000, 0x5252, 0x0505, 0x8181, 0x6262, 0x0909,
-    0x89C9, 0x4242, 0x9192, 0x8746, 0xE829, 0x03C6, 0x5CB9, 0x0000,
-    0xFFFF, 0x0000, 0x0000, 0x0000, 0x0000, 0x1010, 0x8484, 0x5252,
-    0x4202, 0x2828, 0x0001, 0xA0A1, 0x87D7, 0xFFFF, 0xFFFF, 0xFFFF,
-    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-    0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-    0x0000, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
-    0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0x3FFE, 0xDCB9, 0x0000,
+    0x0100,0x0000,0x0300,0x0700,0x0300,0x0101,0x823F,0xFFDF,
+    0x0000,0x0000,0x0000,0x8000,0x8000,0x80FF,0x80FF,0x00FF,
+    0xDC00,0xE700,0x8C00,0x3800,0xFC00,0xFE01,0x7D50,0x0040,
+    0x0000,0x0000,0x0000,0x0000,0x0000,0x00FF,0x0000,0x0000,
+    0x23FF,0x38FF,0x73FF,0xC7FF,0x03FF,0x81FE,0xFBC0,0xFF20,
+    0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFF00,0xFF00,0xFF00,
+    0x23FF,0x38FF,0x73FF,0xC7FF,0x03FE,0x81E1,0xFBD0,0xFF40,
+    0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFF00,0xFFFF,0xFF00,0xFF00,
+    0x0000,0x0000,0x005C,0x0043,0x0080,0x9000,0xFC02,0xFD10,
+    0x0000,0x0000,0x0000,0x0100,0x00C0,0x01C0,0x0140,0x0040,
+    0x0000,0x0000,0x0038,0x00C2,0x0080,0x9000,0x7202,0x0E10,
+    0x0000,0x0000,0x0000,0x0000,0x0180,0x01C0,0x0140,0x0040,
+    0xFFFF,0xFFFF,0xFFE7,0xFFBD,0xFF7F,0x6FFF,0x03FD,0x00EF,
+    0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFF7F,0xFE3F,0xFEBF,0xFFBF,
+    0xFFFF,0xFFFF,0xFFFF,0xFFFF,0x7FFF,0x9FFF,0x73FF,0x0EFF,
+    0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFFFF,0xFFFF,
 };
 
 static int g_state;
@@ -269,6 +276,8 @@ static Fireball g_fireballs[MAX_FIREBALLS];
 static MovingPlatform g_moving_platforms[MAX_MOVING_PLATFORMS];
 static int g_moving_platform_count;
 static int g_on_moving_platform=-1;
+static int g_drop_platform_timer;
+static int g_debug_mode;
 
 static void enter_menu(void);
 static void enter_boot(void);
@@ -773,7 +782,7 @@ static void upload_game_sprites(void)
     vdc_set_vram_write(FRONT_CHIP,FIREBALL_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_fireball_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_HEART_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_heart_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_DIGIT_BASE_WORD); for(i=0;i<640;++i)vdc_vram_write(FRONT_CHIP,g_hud_digit_words[i]);
-    if (g_current_level==1 && !g_in_boss) {
+    if ((g_current_level==1 && !g_in_boss) || g_in_boss) {
         vdc_set_vram_write(FRONT_CHIP,PLATFORM_BASE_WORD);
         for(i=0;i<128;++i)vdc_vram_write(FRONT_CHIP,g_level2_platform_words[i]);
     }
@@ -990,7 +999,7 @@ static void resolve_player_vertical(s32 next_y)
 
         /* Moving platforms are one-way floors: Mario can pass upward through
            them, then land when his feet cross the top from above. */
-        for (i=0;i<g_moving_platform_count;++i) {
+        for (i=0;i<g_moving_platform_count && g_drop_platform_timer==0;++i) {
             MovingPlatform *p=&g_moving_platforms[i];
             int px=(int)(p->x>>FIX_SHIFT), top=(int)(p->y>>FIX_SHIFT);
             if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+MOVING_PLATFORM_W) continue;
@@ -1099,7 +1108,19 @@ static void init_moving_platforms(void)
     MovingPlatform *p;
     g_moving_platform_count=0;
     g_on_moving_platform=-1;
-    if (g_in_boss || g_current_level!=1) return;
+    g_drop_platform_timer=0;
+    if (g_in_boss) {
+        /* The first arena uses three pass-through carriers.  Bowser occupies
+           the upper one; the lower pair form Mario's approach route. */
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)16<<FIX_SHIFT;p->y=(s32)144<<FIX_SHIFT;p->min_x=16;p->max_x=16;p->dir=1;p->speed=0;
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)96<<FIX_SHIFT;p->y=(s32)112<<FIX_SHIFT;p->min_x=96;p->max_x=96;p->dir=1;p->speed=0;
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)160<<FIX_SHIFT;p->y=(s32)80<<FIX_SHIFT;p->min_x=160;p->max_x=160;p->dir=1;p->speed=0;
+        return;
+    }
+    if (g_current_level!=1) return;
 
     /* r11 discarded non-crate/non-gem level-entry objects while generating
        the 19-level tables.  These Level-2 carriers are restored over the
@@ -1149,9 +1170,16 @@ static void init_objects(void)
         for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){g_gems[i].x=g_level->gems[i*2];g_gems[i].y=g_level->gems[i*2+1];g_gems[i].active=1;}
         for(i=0;i<g_level->enemy_count && i<MAX_ENEMIES;++i){
             const short *e=&g_level->enemies[i*7];
+            int gi;
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)e[1]<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
+            gi=g_level->variant_ids[g_enemies[i].variant];
+            /* Graphics family $14 is the winged Koopa family.  Earlier
+               generated records discarded this identity and gravity turned
+               every one into a ground walker. */
+            g_enemies[i].flying=(gi==2||gi==8||gi==9);
+            g_enemies[i].home_y=e[1];g_enemies[i].flight_phase=(unsigned char)(i*23);
         }
     }
     init_moving_platforms();
@@ -1175,15 +1203,16 @@ static void update_crates(void)
         }
 
         if (c->thrown) {
-            int sx;
+            int sx,sy;
             /* Source-style thrown boxes are screen attacks: no terrain
                collision, no gravity and no impact response. They may pass
                through walls and defeated enemies and only vanish after they
                have completely left the visible 256-pixel playfield. */
-            c->x+=c->vx;
-            c->vy=0;
+            c->x+=c->vx;c->y+=c->vy;
             sx=(int)(c->x>>FIX_SHIFT)-g_camera_x;
-            if ((c->vx>0 && sx>256) || (c->vx<0 && sx+CRATE_W<0))
+            sy=(int)(c->y>>FIX_SHIFT);
+            if ((c->vx>0 && sx>256) || (c->vx<0 && sx+CRATE_W<0) ||
+                sy+CRATE_H<0 || sy>240)
                 c->active=0;
             continue;
         }
@@ -1229,11 +1258,17 @@ static void do_crate_action(void)
     if (g_carry_index >= 0) {
         Crate *c = &g_crates[g_carry_index];
         c->carried = 0;
-        c->x = g_player_x + (s32)(g_facing > 0 ? 18 : -14) * FIX_ONE;
-        /* r7: throw flight is 32 px lower than r5. */
-        c->y = g_player_y + (s32)26 * FIX_ONE;
-        c->vx = (s32)g_facing * 6 * FIX_ONE;
-        c->vy = 0;
+        if (read_buttons()&JOY_UP) {
+            c->x=g_player_x+(s32)4*FIX_ONE;c->y=g_player_y-(s32)8*FIX_ONE;
+            c->vx=0;c->vy=-6*FIX_ONE;
+        } else if (read_buttons()&JOY_DOWN) {
+            c->x=g_player_x+(s32)4*FIX_ONE;c->y=g_player_y+(s32)34*FIX_ONE;
+            c->vx=0;c->vy=6*FIX_ONE;
+        } else {
+            c->x=g_player_x+(s32)(g_facing>0?18:-14)*FIX_ONE;
+            c->y=g_player_y+(s32)26*FIX_ONE;
+            c->vx=(s32)g_facing*6*FIX_ONE;c->vy=0;
+        }
         c->thrown = 1;
         c->flight_timer = 0;
         g_carry_index = -1;
@@ -1260,10 +1295,10 @@ static void fire_fireball(void)
 {
     int i;
     Fireball *f=0;
-    if (g_fireball_ammo<=0 || g_player_mode!=PMODE_NORMAL) return;
+    if ((!g_debug_mode && g_fireball_ammo<=0) || g_player_mode!=PMODE_NORMAL) return;
     for (i=0;i<MAX_FIREBALLS;++i) if (!g_fireballs[i].active) { f=&g_fireballs[i]; break; }
     if (!f) return;
-    --g_fireball_ammo;
+    if (!g_debug_mode) --g_fireball_ammo;
     f->active=1;
     f->x=g_player_x+(s32)(g_facing>0?32:-24)*FIX_ONE;
     f->y=g_player_y+(s32)16*FIX_ONE;
@@ -1328,6 +1363,7 @@ static void update_gems(void)
 
 static void begin_player_death(void)
 {
+    if (g_debug_mode) return;
     if (g_player_mode!=PMODE_NORMAL) return;
     if (g_carry_index>=0) {
         Crate *c=&g_crates[g_carry_index];
@@ -1348,6 +1384,7 @@ static void begin_player_death(void)
 
 static void hurt_player(void)
 {
+    if (g_debug_mode) return;
     if (g_player_mode!=PMODE_NORMAL || g_invuln>0) return;
     if (g_player_hearts>0) --g_player_hearts;
     g_invuln=HURT_FRAMES;
@@ -1390,6 +1427,16 @@ static void update_enemies(void)
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
 
+        if (e->flying) {
+            int ph=(e->flight_phase+g_state_frame)&127;
+            int wave=(ph<32)?ph:(ph<64?64-ph:(ph<96?64-ph:ph-128));
+            e->x+=e->vx;
+            e->y=(s32)(e->home_y+wave)<<FIX_SHIFT;
+            x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
+            /* Predetermined patrols ignore stage collision by design. */
+            goto enemy_attack_checks;
+        }
+
         e->vy+=64;
         if (e->vy>4*FIX_ONE) e->vy=4*FIX_ONE;
 
@@ -1417,6 +1464,7 @@ static void update_enemies(void)
             y=top-h;
         }
 
+enemy_attack_checks:
         /* A thrown crate is the single-hit projectile: it defeats one enemy
            and disappears. Fireballs deliberately differ and pass through. */
         {
@@ -1531,8 +1579,10 @@ static void draw_game_sprites(void)
         player_visible=((g_invuln/HURT_FLICKER_HALF_PERIOD)&1)!=0;
 
     if (g_player_mode==PMODE_DYING) {
-        /* The MD death state reuses the normal jump graphic (frame 4). */
-        u16 da=(u16)(PLAYER_BASE_WORD+3*PLAYER_FRAME_WORDS_LOCAL);
+        /* The source game-over fall advances through four body poses. */
+        static const unsigned char death_frames[4]={4,5,6,5};
+        int df=death_frames[(g_death_timer/6)&3];
+        u16 da=(u16)(PLAYER_BASE_WORD+(df-1)*PLAYER_FRAME_WORDS_LOCAL);
         u16 dc=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_1|player_pal);
         if (g_facing<0) dc|=VDC_SPR_X_INVERT;
         set_sprite_entry(satb,n++,px,py,da,dc);
@@ -1730,6 +1780,7 @@ static void start_boss(int fade_in)
     x=(int)bp[0]-128; y=(int)bp[1]-128;
     if(x<-96||x>256)x=172;
     if(y<-64||y>192)y=104;
+    if(g_current_level==2){x=152;y=96;}
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_class=boss_class_for_level(g_current_level);g_boss_phase=0;g_boss_face=-1;
@@ -1772,12 +1823,18 @@ static void update_boss_motion(void)
     switch(g_boss_class){
     default:
     case 0: /* levels 3/6: horizontal pass + high/low jump states */
-        if((t%180)==0){g_boss_phase=(g_boss_phase+1)&3;if(g_boss_phase==2)g_boss_vy=-4*FIX_ONE;}
+        /* Bowser remains seated on the carrier: walk, run, pause/turn and
+           occasional teleport are horizontal states, never jumps. */
+        if((t%150)==0){
+            g_boss_phase=(g_boss_phase+1)&3;
+            if(g_boss_phase==3)g_boss_x=(s32)((g_player_x<(128*FIX_ONE))?168:24)<<FIX_SHIFT;
+            g_boss_vx=(g_boss_phase==1?3:1)*FIX_ONE*((g_player_x<g_boss_x)?-1:1);
+        }
         g_boss_x+=g_boss_vx;
         bx=(int)(g_boss_x>>FIX_SHIFT);
         if(bx<=12){g_boss_x=(s32)12<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;g_boss_face=1;}
         if(bx>=152){g_boss_x=(s32)152<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;g_boss_face=-1;}
-        if(g_boss_vy||by<g_boss_ground_y){g_boss_vy+=64;g_boss_y+=g_boss_vy;if((int)(g_boss_y>>FIX_SHIFT)>=g_boss_ground_y){g_boss_y=(s32)g_boss_ground_y<<FIX_SHIFT;g_boss_vy=0;}}
+        g_boss_y=(s32)g_boss_ground_y<<FIX_SHIFT;g_boss_vy=0;
         if((t%120)==0)boss_fire_at_player(3);
         break;
     case 1: /* level 8: diagonal 44-frame traversals plus faster 4px dives */
@@ -1829,6 +1886,14 @@ static void update_boss_actor(void)
         return;
     }
     update_boss_motion();
+    /* The ceiling dispenser supplies the arena's ammunition. */
+    if((g_boss_timer%120)==1){
+        for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
+            g_crates[i].active=1;g_crates[i].carried=0;g_crates[i].thrown=0;
+            g_crates[i].x=(s32)(32+((g_boss_timer/120)%6)*32)<<FIX_SHIFT;
+            g_crates[i].y=0;g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
+        }
+    }
     if(g_boss_shot_active){int sx,sy;g_boss_shot_x+=g_boss_shot_vx;sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT);if(sx<-32||sx>272)g_boss_shot_active=0;else if(g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,sx+4,sy+4,16,16)){hurt_player();g_boss_shot_active=0;}}
     bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
     /* $15D20 is used by the source boss collision path. Values vary sharply by
@@ -1877,6 +1942,23 @@ static void start_gameplay(int fade_in)
 static void update_play(u16 btn, u16 pressed)
 {
     const s32 run_speed=2*FIX_ONE;
+
+    if (pressed&JOY_MODE1) {
+        g_debug_mode^=1;
+        if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;g_invuln=0;g_hurt_pending_death=0;}
+    }
+    if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;}
+    if (g_drop_platform_timer>0)--g_drop_platform_timer;
+    if (!g_in_boss && g_current_level==2 && g_game_fade_level==16 && (g_state_frame&7)==0) {
+        /* The castle lava uses a four-step colour chase in the MD VDP.  Cycle
+           the three hot entries without rewriting the whole stage palette. */
+        int phase=(g_state_frame>>3)&3;
+        static const unsigned char lava_idx[4]={9,10,11,10};
+        int a=lava_idx[phase],b=lava_idx[(phase+1)&3],c=lava_idx[(phase+2)&3];
+        tetsu_set_palette(49,g_level->palette[48+a]);
+        tetsu_set_palette(50,g_level->palette[48+b]);
+        tetsu_set_palette(51,g_level->palette[48+c]);
+    }
 
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
@@ -1959,7 +2041,9 @@ static void update_play(u16 btn, u16 pressed)
         g_vx=run_speed; g_facing=1;
     } else g_vx=0;
 
-    if (g_grounded && (pressed&JOY_I) && g_lift_timer==0 && g_throw_timer==0) {
+    if (g_grounded && (pressed&JOY_I) && (btn&JOY_DOWN) && g_on_moving_platform>=0) {
+        g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;
+    } else if (g_grounded && (pressed&JOY_I) && g_lift_timer==0 && g_throw_timer==0) {
         g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;
         Play_Sound_Sample(1,0,0);
     }
