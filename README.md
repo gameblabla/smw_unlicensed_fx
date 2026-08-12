@@ -11,12 +11,14 @@ Revision 11 extends the r10 gameplay engine from Stage 1 to the complete 19-slot
 r12 resumes from the r11 19-level/full-game source and repairs regressions introduced by that expansion:
 
 - Reserve lives and continue credits are independent. A death decrements the HUD life reserve and reloads the current level while lives remain; only zero reserves enter the CONTINUE room. Accepting a continue consumes a separate credit, restores four reserve lives, and restarts the level.
-- Level 2 has live one-way moving platforms over its otherwise non-traversable gaps. Their visible 32x16 cells are reconstructed from Level 2's own grass-platform tiles. r11's generator discarded every level-entry object that was not a crate or gem, which is the source of this regression.
+- Levels 2 and 6 restore the source moving-carrier records from `$10B2A`: three metasprite-741 carriers in Level 2 and the missing metasprite-742 carrier before boss 2. Handler `$F5B0` moves each 48x8 platform vertically through the original 100-pixel down/up cycle and carries Mario while he stands on it.
 - Levels 1, 2 and 4 keep the original 224-line cloud/background artwork and place it at Y+16 instead of extending it to 240 lines by repeating the last tile row.
+- Level 3 removes its unused top map row and uses the Mega Drive's 224-line active origin; its objects move up 8 pixels and its screen-fixed HUD moves up the full 16-pixel capture border.
+- Level 3 and boss rooms extend their 224-line active picture to the PC-FX's 240 lines by repeating the final visible 8-pixel tile row twice; hidden Mega Drive map rows are never exposed.
 - Normal gameplay sprites use the source level palette line 0 again. r11's forced palette-line-13 selection was the cause of the yellow/green Mario regression; line 13 remains available for boss arenas.
+- Enemy palettes are deduplicated by their 16 color values rather than by generated-array address. This prevents Level 6's 13 same-palette variants from overflowing the 12-line hardware palette table and corrupting the return stack during the load before boss 2.
+- Boss damage now follows the Mega Drive state-3 response: a nonfatal crate or fireball hit plays the placeholder hit sample, holds the captured recoil/impact-puff frame for 30 frames without flicker or movement, rejects further hits during that pause, then resumes the interrupted action. Bowser's attached breath flame is also replaced by the detached projectile rather than being drawn underneath it.
 - The title wall now continues its 80-pixel vertical tile period into rows 224-239, completing the Mario/Luigi faces instead of duplicating the last visible hat row.
-
-The original extracted level-entry object JSON is not embedded in the r11 archive, so the Level-2 platform motion ranges are reconstructed from the retained r11 collision/map geometry rather than claimed as byte-for-byte translations of discarded object records.
 
 Implemented data coverage:
 
@@ -80,9 +82,35 @@ make clean
 make
 ```
 
-`tools/build_full_game.py` generates `src/game_levels_generated.[ch]`. The three boss-reference captures needed by that generator are included under `assets/reference/boss/`, so a separate boss capture directory is not required unless you want to replace them.
+`tools/build_full_game.py` generates `src/game_levels_generated.[ch]`. Its boss-reference captures are included under `assets/reference/boss/`: the real boss-1 arena plus four walk and four breath poses, and the older forced-mode shots retained for reference.
 
 For targeted emulator/development testing, `src/main.c` accepts optional compile-time `FORCE_LEVEL` (0-based) and `FORCE_BOSS` macros. They are **not** enabled in the release build. For example: `make EXTRA_CFLAGS='-DFORCE_LEVEL=2 -DFORCE_BOSS=1'`.
+
+## HTML level editor
+
+Start the local editor from the repository root:
+
+```sh
+make editor KIT=Super_Mario_Bros_MD_reconstruction_kit
+```
+
+Then open `http://127.0.0.1:8765/`. It edits the final PC-FX 8×8 foreground segments and 64×30 background planes, including the two PC-FX-only tile rows at Y=224–239. The layer selector also exposes independent 32×32 foreground/background maps for every boss slot (3, 6, 8, 10, 13, 16 and 19); their extra rows remain editable for wraparound effects. Available operations include pencil, fill, erase, rectangular tile selection/copy/paste, palette and flip selection, map undo/redo, and direct 8×8 tile-pixel editing. Select a rectangle and use **Copy**, then choose **Paste** and click its destination; Ctrl+C/Ctrl+V are also supported. Foreground maps and tile graphics are shared when their source stage set is shared; the editor displays the affected level slots. Levels 9 and 10 share map layouts but use different graphics banks, so their selectors expose only their source-valid segment ranges (0–7 and 8–21 respectively).
+
+The default Y=224–239 foreground is derived by stage family: Level 3 continues its cropped masonry phase, Levels 6 and 9 continue each column's established terrain period, Levels 7–8 extend the jungle interior without repeating decorative cap tiles, and Level 10 onward uses transparent foreground cells so the level-specific background remains visible. The editor and asset generator share this conversion logic.
+
+**Save overrides** writes small JSON files under `level_overrides/` without modifying the reconstruction kit. **Restore default** removes the selected map override and its layer-specific tile-pixel overrides, returning to the extracted Mega Drive source. Visual edits do not alter collision grids.
+
+Apply saved edits and rebuild with:
+
+```sh
+make apply-level-edits \
+  KIT=Super_Mario_Bros_MD_reconstruction_kit \
+  ROM=/path/to/smb_patched.md
+make clean
+make
+```
+
+The full `make assets` target also applies `level_overrides/`. Use `LEVEL_OVERRIDES=/another/directory` with the editor and generator to maintain alternate map sets.
 
 ## Current fidelity limits
 
@@ -90,7 +118,7 @@ Revision 11 implements the complete level-data/progression structure, but severa
 
 1. A small set of late-game route records uses `FF0050 = 2` for vertical room transitions. Their original mode/quadrant metadata is preserved, but r11 currently linearizes these rooms into the horizontal PC-FX world instead of reproducing the exact 2-D transition camera. This mainly affects levels 11, 12, 14, 15 and 19.
 2. Enemy graphics/placement/animation are ROM-derived for all levels, but special enemy state machines still share generalized C movement/collision logic rather than being exact ports of every 68000 object handler.
-3. Boss occurrence and handler class come directly from the disassembly, and the PC-FX boss actor has damage, projectiles, jumping and defeat/progression. The six individual 68000 boss handler state machines are **not yet instruction-for-instruction translations**; r11 uses source-derived class/parameter differences on a common C boss actor.
+3. Boss occurrence and handler class come directly from the disassembly. Boss 1 now follows the `$7526` action table and its six reachable movement/breath states; the five later handler classes are still source-derived approximations rather than instruction-for-instruction translations.
 4. The final level-19 boss currently returns to the opening/front-end after defeat; the original ending sequence is not yet reconstructed.
 5. Full active two-player gameplay is still unfinished. The front-end 2P presentation remains, but r11 does not claim a complete second-player object/controller implementation.
 

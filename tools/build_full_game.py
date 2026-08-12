@@ -4,12 +4,14 @@ import json,csv,sys
 from PIL import Image
 sys.path.insert(0,str(Path(__file__).parent))
 import build_assets as ba
+from level_extension import foreground_words_240
 
 import os
 PROJECT=Path(__file__).resolve().parent.parent
 KIT=Path(os.environ.get('KIT','/mnt/data/mdkit_full/Super_Mario_Bros_MD_reconstruction_kit'))
 ROMPATH=Path(os.environ.get('ROM','/mnt/data/r9mdrom/smb_patched.md'))
 BOSSREF=Path(os.environ.get('BOSSREF',str(PROJECT/'assets/reference/boss')))
+LEVEL_OVERRIDES=Path(os.environ.get('LEVEL_OVERRIDES',str(PROJECT/'level_overrides')))
 
 # These slots share the early cloud-sky background family.  The Mega Drive
 # source is a 224-line composition; on PC-FX it is placed at Y+16 rather than
@@ -28,10 +30,64 @@ BG_PLANE_W=64
 # maps hold below this was never on screen.
 MD_VISIBLE_ROWS=28
 
+# Level 3's extracted foreground retains one empty top map row.  The other
+# eight pixels of the 16-line emulator border came from the VDP raster origin,
+# so only this one stored row is removed from the PC-FX tile/collision maps.
+LEVEL3_ACTIVE_CROP_ROWS=1
 
-def row_is_empty(words,row):
-    return not any(w&0x7FF for w in words[row*32:row*32+32])
+def override_json(name):
+    path=LEVEL_OVERRIDES/name
+    if not path.exists(): return None
+    data=json.loads(path.read_text())
+    if data.get('version')!=1: raise RuntimeError(f'Unsupported level override version in {path}')
+    return data
 
+def override_words(name,default,expected):
+    data=override_json(name)
+    if data is None: return default
+    words=data.get('words')
+    if not isinstance(words,list) or len(words)!=expected or any(not isinstance(x,int) or not 0<=x<=0xFFFF for x in words):
+        raise RuntimeError(f'Invalid {expected}-word tilemap override: {LEVEL_OVERRIDES/name}')
+    return words
+
+def apply_tile_overrides(vram,name):
+    data=override_json(name)
+    if data is None:return vram
+    out=bytearray(vram)
+    for key,pixels in data.get('tiles',{}).items():
+        tile=int(key)
+        if not 0<=tile<2048 or not isinstance(pixels,list) or len(pixels)!=64 or any(not isinstance(x,int) or not 0<=x<16 for x in pixels):
+            raise RuntimeError(f'Invalid tile override {key}: {LEVEL_OVERRIDES/name}')
+        off=tile*32
+        for i in range(32):out[off+i]=(pixels[i*2]<<4)|pixels[i*2+1]
+    return bytes(out)
+
+def apply_packed_tile_overrides(asset,name):
+    """Apply editor pixels to an already packed PC-FX 4bpp tile bank."""
+    data=override_json(name)
+    if data is None:return asset
+    words=list(asset['tile_words']);highest=asset['tile_count']-1
+    for key,pixels in data.get('tiles',{}).items():
+        tile=int(key)
+        if not 0<=tile<2048 or not isinstance(pixels,list) or len(pixels)!=64 or any(not isinstance(x,int) or not 0<=x<16 for x in pixels):
+            raise RuntimeError(f'Invalid packed boss tile override {key}: {LEVEL_OVERRIDES/name}')
+        while len(words)<(tile+1)*16:words.extend([0]*16)
+        words[tile*16:(tile+1)*16]=ba.encode_bg_tile(tuple(pixels));highest=max(highest,tile)
+    asset['tile_words']=words;asset['tile_count']=highest+1
+    return asset
+
+def packed_with_transparent_zero(asset):
+    """Reserve BAT index zero for a genuinely transparent foreground cell.
+
+    pack_bg_rgb() assigns index zero to the first visible arena tile.  Boss
+    foreground defaults also use zero, so sharing that bank without shifting
+    it paints the first wall/floor tile across VDC1 and hides VDC0.
+    """
+    out=dict(asset)
+    out['tile_words']=[0]*16+list(asset['tile_words'])
+    out['bat']=[(w&0xF000)|((w&0x0FFF)+1) for w in asset['bat']]
+    out['tile_count']=asset['tile_count']+1
+    return out
 
 def background_plane_halves(level_dir):
     """The level's two background maps, left half first.
@@ -101,30 +157,24 @@ def build_sets(stage_manifest):
     sets=[]
     for sx in stage_manifest:
         root=find_set_root(sx['set_id']); first=sx['level_slots'][0]
-        vram=(KIT/f'graphics/levels/level_{first:02d}/assembled_vram.bin').read_bytes()
+        vram=apply_tile_overrides((KIT/f'graphics/levels/level_{first:02d}/assembled_vram.bin').read_bytes(),f'set_{sx["set_id"]:02d}_tiles.json')
         tiles=[tuple([0]*64)]; lookup={(0,tiles[0]):0}; bat=[]; collisions=[]
         for seg in range(sx['segment_count']):
             sd=root/f'segments/segment_{seg:02d}'
             words=ba.read_words_be(sd/'map_decoded_words_be.bin')
             segbat=[]
-            src_h=max(1,len(words)//32)
-            for y in range(30):
-                # Mode-2 maps can contain the full 32 source rows. Ordinary
-                # V28 maps are 28 rows and extend their last row through 240.
-                sy=y if src_h>=30 else min(y,src_h-1)
-                # The Mega Drive only ever showed rows 0..27 (V28).  Where a
-                # 32-row map leaves the rows past that empty, the PC-FX's two
-                # extra rows would show the background straight through under
-                # the ground, so continue the last displayed row instead.
-                if y>=MD_VISIBLE_ROWS and sy>=MD_VISIBLE_ROWS and row_is_empty(words,sy):
-                    sy=MD_VISIBLE_ROWS-1
-                for x in range(32): segbat.append(ba.append_genesis_word(words[sy*32+x],vram,tiles,lookup))
+            default_words=foreground_words_240(sx['set_id'],words)
+            edited_words=override_words(f'set_{sx["set_id"]:02d}_segment_{seg:02d}.json',default_words,32*30)
+            for word in edited_words:segbat.append(ba.append_genesis_word(word,vram,tiles,lookup))
             bat.extend(segbat)
-            cf=next(sd.glob('collision_ROM_*.bin')).read_bytes(); collisions.extend(cf[:1024])
+            cf=next(sd.glob('collision_ROM_*.bin')).read_bytes()[:1024]
+            if sx['set_id']==3:
+                cf=cf[32:]+cf[-32:]
+            collisions.extend(cf)
         # Level-specific background layers are converted into this set's shared tile dictionary.
         bgs={}
         for slot in sx['level_slots']:
-            ld=KIT/f'graphics/levels/level_{slot:02d}'; vv=(ld/'assembled_vram.bin').read_bytes()
+            ld=KIT/f'graphics/levels/level_{slot:02d}'; vv=apply_tile_overrides((ld/'assembled_vram.bin').read_bytes(),f'level_{slot:02d}_background_tiles.json')
             halves=background_plane_halves(ld)
             if halves:
                 left,right=halves; bb=[]
@@ -136,10 +186,17 @@ def build_sets(stage_manifest):
                         # with the source sky row; do not repeat bottom art.
                         sy=0 if y<2 else min(y-2,27)
                     else:
-                        sy=y if src_h>=30 else min(y,src_h-1)
+                        crop=LEVEL3_ACTIVE_CROP_ROWS if slot==3 else 0
+                        if y>=MD_VISIBLE_ROWS:
+                            sy=min(MD_VISIBLE_ROWS-1+crop,src_h-1)
+                        else:
+                            sy=min(y+crop,src_h-1)
                     for half in (left,right):
                         for x in range(32): bb.append(ba.append_genesis_word(half[sy*32+x],vv,tiles,lookup))
             else: bb=[0]*(BG_PLANE_W*30)
+            raw_bg=override_words(f'level_{slot:02d}_background.json',None,BG_PLANE_W*30)
+            if raw_bg is not None:
+                bb=[ba.append_genesis_word(word,vv,tiles,lookup) for word in raw_bg]
             bgs[slot]=bb
         tw=[]
         for t in tiles: tw.extend(ba.encode_bg_tile(t))
@@ -240,21 +297,26 @@ def build_enemy_variants(r,levels):
         lev['enemy_records']=rec
     return variants
 
-def make_boss_background():
-    # Real forced boss-mode capture, converted to native VDC tiles. Bowser is
-    # absent at f2300. Mario/HUD are removed; the arena's brown floor row is
-    # extended through 240 just as normal levels extend their final visual row.
-    src=Image.open(BOSSREF/'b3_2300.png').convert('RGB')
-    # The Mega Drive boss plane begins below a two-tile black status margin.
-    # The old screenshot conversion discarded that scroll origin, lifting the
-    # entire room by 16 pixels and making Bowser appear to float.
+def make_boss_background(slot):
+    # The emulator capture is a 224-line Mega Drive active picture in a
+    # 240-line screenshot: rows 0..15 are capture padding, not room graphics.
+    # Crop that padding and keep the PC-FX's extra bottom 16 lines filled with
+    # the room's own floor pattern.
+    src=Image.open(BOSSREF/'boss1_arena.png').convert('RGB')
+    for y in range(208,240):
+        for x in range(128): src.putpixel((x,y),src.getpixel((x+128,y)))
     im=Image.new('RGB',(256,240),(0,0,0))
-    im.paste(src.crop((0,0,256,224)),(0,16))
-    for y in range(152,208):
-        for x in range(0,48): im.putpixel((x,y),im.getpixel((x+64,y)))
-    floor=im.crop((0,216,256,224))
-    for y in range(208,240,8): im.paste(floor,(0,y))
-    return ba.pack_bg_rgb(im)
+    im.paste(src.crop((0,16,256,240)),(0,0))
+    # Extend the 224-line active picture one tile at a time.  Repeating a
+    # 16-line strip incorrectly alternates two floor rows in the extra area.
+    last_tile_row=im.crop((0,216,256,224))
+    im.paste(last_tile_row,(0,224))
+    im.paste(last_tile_row,(0,232))
+    result=packed_with_transparent_zero(ba.pack_bg_rgb(im));result['bat'] += [0]*(32*32-len(result['bat']))
+    result['bat']=override_words(f'boss_{slot:02d}_background.json',result['bat'],32*32)
+    result=apply_packed_tile_overrides(result,f'boss_{slot:02d}_tiles.json')
+    fg=override_words(f'boss_{slot:02d}_foreground.json',[0]*(32*32),32*32)
+    return result,fg
 
 def _largest_diff_component(ref,im):
     import numpy as np
@@ -271,31 +333,55 @@ def _largest_diff_component(ref,im):
             if len(pts)>len(best) and max(p[1] for p in pts)>150:best=pts
     return best
 
-def make_bowser_sprite():
-    """Recover two Bowser animation poses from forced boss-mode captures.
+def _diff_components(ref,im):
+    """All four-connected changed regions, largest first."""
+    import numpy as np
+    a=np.asarray(ref);b=np.asarray(im);d=np.any(a!=b,axis=2);seen=np.zeros(d.shape,bool);out=[]
+    for y in range(d.shape[0]):
+        for x in range(d.shape[1]):
+            if not d[y,x] or seen[y,x]: continue
+            stack=[(x,y)];seen[y,x]=1;pts=[]
+            while stack:
+                xx,yy=stack.pop();pts.append((xx,yy))
+                for nx,ny in ((xx-1,yy),(xx+1,yy),(xx,yy-1),(xx,yy+1)):
+                    if 0<=nx<d.shape[1] and 0<=ny<d.shape[0] and d[ny,nx] and not seen[ny,nx]:seen[ny,nx]=1;stack.append((nx,ny))
+            out.append(pts)
+    return sorted(out,key=len,reverse=True)
 
-    b3_2300 is a clean arena. 2600/2620 contain Bowser at two animation
-    phases.  The alpha mask comes from the largest connected difference
-    component, while RGB is read from the live frame.  Importantly, black
-    outline pixels remain non-zero sprite indices rather than being confused
-    with PC-FX transparent colour 0.
-    """
-    ref=Image.open(BOSSREF/'b3_2300.png').convert('RGB')
+def make_bowser_sprite():
+    """Recover four walk poses and the breath pose from the real fight."""
+    ref=Image.open(BOSSREF/'boss1_arena.png').convert('RGB')
     src=[]; freq={}
-    for fn in ('b3_2600.png','b3_2620.png'):
+    frames=(('boss1_walk0.png',True,False),('boss1_walk1.png',True,False),
+            ('boss1_walk2.png',True,False),('boss1_walk3.png',True,False),
+            ('boss1_breath0.png',False,False),('boss1_breath1.png',False,False),
+            ('boss1_breath2.png',False,False),('boss1_breath3.png',False,False),
+            # The captured state-3 frame faces left. Normalize it to the same
+            # right-facing storage convention as the walk/breath bank.
+            ('boss1_hurt.png',True,True))
+    for fn,mirror,is_hurt in frames:
         im=Image.open(BOSSREF/fn).convert('RGB')
-        pts=_largest_diff_component(ref,im)
+        if is_hurt:
+            # State 3 is metasprite 6 plus disconnected impact-puff pieces.
+            # Retain every changed component local to Bowser, not only his
+            # connected body component.
+            pts=[p for comp in _diff_components(ref,im)
+                 if len(comp)>=12 and min(y for x,y in comp)>=110
+                 and max(y for x,y in comp)<210 for p in comp]
+        else:
+            pts=_largest_diff_component(ref,im)
         if not pts: raise RuntimeError(f'Could not isolate Bowser in {fn}')
         xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
         x0,y0=min(xs),min(ys)
         pix={}
         for x,y in pts:
             xx,yy=x-x0,y-y0
+            if mirror: xx=95-xx
             if 0<=xx<96 and 0<=yy<96:
                 c=im.getpixel((x,y)); pix[(xx,yy)]=c; freq[c]=freq.get(c,0)+1
         src.append(pix)
-    # Index 0 must remain transparent. The fifteen visible entries include
-    # true black, preserving Bowser's outline from the MD sprite.
+    # Index 0 remains transparent.  These components use exactly fifteen
+    # visible Mega Drive colors, so no source color needs to be discarded.
     colors=[c for c,_ in sorted(freq.items(),key=lambda kv:-kv[1])][:15]
     words=[]; masks=[]
     for pix in src:
@@ -309,9 +395,112 @@ def make_bowser_sprite():
                 if any(any(row) for row in cell): mask|=1<<(cy*6+cx)
                 words.extend(ba.encode_sprite_cell(cell))
         masks.append(mask)
+    # The detached 42x18 flame is the second large changed component in the
+    # breath capture (the first is Bowser, the third is Mario).  Store it as a
+    # 3x2 grid of 16-pixel cells using Bowser's source palette.
+    breath=Image.open(BOSSREF/'boss1_breath2.png').convert('RGB')
+    flame=max((p for p in _diff_components(ref,breath)
+               if 200<len(p)<1000 and min(y for x,y in p)>120),key=len)
+    fx0,fy0=min(x for x,y in flame),min(y for x,y in flame)
+    fidx=[[0]*48 for _ in range(32)]
+    for x,y in flame:
+        xx,yy=x-fx0,y-fy0
+        if 0<=xx<48 and 0<=yy<32:
+            c=breath.getpixel((x,y));ci=min(range(len(colors)),key=lambda j:sum((colors[j][k]-c[k])**2 for k in range(3)))
+            fidx[yy][xx]=ci+1
+    flamewords=[];flamemask=0
+    for cy in range(2):
+        for cx in range(3):
+            cell=[[fidx[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+            if any(any(row) for row in cell): flamemask|=1<<(cy*3+cx)
+            flamewords.extend(ba.encode_sprite_cell(cell))
     py=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
     py += [ba.rgb_to_yuv(0,0,0)]*(16-len(py))
-    return words,masks,py[:16]
+    return words,masks,py[:16],flamewords,flamemask
+
+def make_later_boss_assets():
+    """Pack the five non-Bowser encounters captured from the Mega Drive.
+
+    These are deliberately separate banks: the original loader selects a
+    different graphics, palette and room-map pointer for every boss slot.
+    """
+    out=[]
+    spawns={8:(96,46),10:(8,20),13:(125,57),16:(76,53),19:(88,49)}
+    for slot in (8,10,13,16,19):
+        root=BOSSREF/'later'
+        bg=packed_with_transparent_zero(ba.pack_bg_rgb(Image.open(root/f'boss{slot}_arena.png').convert('RGB')))
+        # Boss maps use a 32-row BAT so vertically scrolling rooms wrap on
+        # complete source data.  Captured 240-line rooms have two blank rows;
+        # slot 19 is replaced below by the exact two VDP planes.
+        bg['bat'] += [0]*(32*32-len(bg['bat']))
+        fg=dict(tile_words=[0]*16,bat=[0]*(32*32),tile_count=1)
+        if slot==19:
+            layer=BOSSREF/'layers/boss19'
+            vram=apply_tile_overrides((layer/'md19_vram.bin').read_bytes(),'boss_19_tiles.json')
+            dump=json.loads((layer/'md19_dump.json').read_text())
+            palette=[ba.rgb_to_yuv(0,0,0)]*256
+            for i,wc in enumerate(dump['cram']):palette[i]=ba.rgb_to_yuv(*ba.genesis_cram_rgb(wc))
+            tiles=[tuple([0]*64)];lookup={(0,tiles[0]):0}
+            maps={}
+            for name in ('background','foreground'):
+                raw=ba.read_words_be(layer/f'md19_{name}_words_be.bin')
+                # The dumped VDP plane is 64x32.  The live room occupies the
+                # first 32 columns; the second half is inactive work space.
+                # V28 only displays rows 0..27.  Rows 28..31 in the live VDP
+                # allocation are unrelated scratch tiles (foreground) or
+                # blank (background), never room artwork.  PC-FX is 240 lines,
+                # so continue the final visible tile row into the extension
+                # and hidden wrap rows instead of exposing that work area.
+                if name=='foreground':
+                    # The platform ends at source row 25. Rows 26-27 are
+                    # transparent padding and rows 28+ are object work tiles.
+                    default=[raw[y*64+x] if y<26 else 0 for y in range(32) for x in range(32)]
+                else:
+                    default=[raw[min(y,27)*64+x] for y in range(32) for x in range(32)]
+                source=override_words(f'boss_19_{name}.json',default,32*32)
+                maps[name]=[ba.append_genesis_word(w,vram,tiles,lookup) for w in source]
+            tile_words=[]
+            for t in tiles:tile_words.extend(ba.encode_bg_tile(t))
+            bg=dict(palette=palette,tile_words=tile_words,bat=maps['background'],tile_count=len(tiles))
+            # Both planes deliberately reference one shared tile bank/palette.
+            fg=dict(tile_words=tile_words,bat=maps['foreground'],tile_count=len(tiles))
+        else:
+            bg['bat']=override_words(f'boss_{slot:02d}_background.json',bg['bat'],32*32)
+            bg=apply_packed_tile_overrides(bg,f'boss_{slot:02d}_tiles.json')
+            fg['bat']=override_words(f'boss_{slot:02d}_foreground.json',fg['bat'],32*32)
+            # Foreground and background share a bank so a copied tile has the
+            # same meaning in both editor layers.
+            fg['tile_words']=bg['tile_words'];fg['tile_count']=bg['tile_count']
+        im=Image.open(root/f'boss{slot}_pose1.png').convert('RGBA')
+        box=im.getchannel('A').getbbox()
+        if not box: raise RuntimeError(f'empty boss {slot} sprite')
+        im=im.crop(box); w=((im.width+15)//16)*16; h=((im.height+15)//16)*16
+        freq={}
+        for r,g,b,a in im.getdata():
+            if a: freq[(r,g,b)]=freq.get((r,g,b),0)+1
+        colors=[c for c,_ in sorted(freq.items(),key=lambda kv:-kv[1])[:15]]
+        if slot==19:
+            dump=json.loads((BOSSREF/'layers/boss19/md19_dump.json').read_text())
+            colors=[ba.genesis_cram_rgb(w) for w in dump['cram'][17:32]]
+        idx=[[0]*w for _ in range(h)]
+        pix=im.load()
+        for y in range(im.height):
+            for x in range(im.width):
+                r,g,b,a=pix[x,y]
+                if not a: continue
+                c=min(range(len(colors)),key=lambda j:sum((colors[j][k]-(r,g,b)[k])**2 for k in range(3)))
+                idx[y][x]=c+1
+        words=[];mask=0;cols=w//16;rows=h//16
+        for cy in range(rows):
+            for cx in range(cols):
+                cell=[[idx[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+                if any(any(row) for row in cell): mask|=1<<(cy*cols+cx)
+                words.extend(ba.encode_sprite_cell(cell))
+        pal=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
+        pal += [ba.rgb_to_yuv(0,0,0)]*(16-len(pal))
+        out.append(dict(slot=slot,bg=bg,fg=fg,words=words,palette=pal[:16],mask=mask,
+                        cols=cols,rows=rows,spawn=spawns[slot]))
+    return out
 
 def boss_tables(r):
     # Source tables used by the special-level loader at $6CDE-$6D6C and
@@ -327,17 +516,88 @@ def boss_tables(r):
     # 68K handler entry points selected by the level dispatch at $748E.
     handlers=[0]*19
     for slot,addr in {3:0x7526,6:0x7526,8:0x806A,10:0x8764,13:0x8CEC,16:0x99BE,19:0x940E}.items(): handlers[slot-1]=addr
-    return hp1,hp2,params,offsets,altspawn,handlers
+    collisions=[]
+    for slot in (3,8,10,13,16,19):
+        p=int.from_bytes(r[0x7038C+(slot-1)*4:0x70390+(slot-1)*4],'big')
+        collisions.extend(r[p:p+1024])
+    return hp1,hp2,params,offsets,altspawn,handlers,collisions
+
+def make_level6_platform_words():
+    """Exact metasprite 742 ($1D962), six source tiles 467..472."""
+    vram=(KIT/'graphics/levels/level_06/assembled_vram.bin').read_bytes()
+    canvas=[[0]*48 for _ in range(16)]
+    for tx in range(6):
+        pix=ba.tilepix(vram,467+tx)
+        for y in range(8):
+            for x in range(8): canvas[y][tx*8+x]=pix[y*8+x]
+    words=[]
+    for cx in range(3):
+        words.extend(ba.encode_sprite_cell(
+            [[canvas[y][cx*16+x] for x in range(16)] for y in range(16)]))
+    return words
+
+def make_final_boss_aux_words():
+    """Exact 24x24 ring/hammer objects from the final-room live VDP bank."""
+    vram=(BOSSREF/'layers/boss19/md19_vram.bin').read_bytes();out=[]
+    for base in (1216,1225):
+        canvas=[[0]*32 for _ in range(32)]
+        for tx in range(3):
+            for ty in range(3):
+                pix=ba.tilepix(vram,base+tx*3+ty)
+                for y in range(8):
+                    for x in range(8):canvas[ty*8+y][tx*8+x]=pix[y*8+x]
+        for cy in range(2):
+            for cx in range(2):out.extend(ba.encode_sprite_cell([[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]))
+    cram=json.loads((BOSSREF/'layers/boss19/md19_dump.json').read_text())['cram']
+    palette=[ba.rgb_to_yuv(*ba.genesis_cram_rgb(w)) for w in cram[16:32]]
+    return out[:256],out[256:],palette
+
+def make_boss_item_words():
+    """Distinct throwable silhouettes used by $806A (pot) and $99BE (bell)."""
+    def bank(kind):
+        c=[[0]*32 for _ in range(32)]
+        if kind=='pot':
+            # Metasprite 428 is an 8x16 pot. Enlarge it to a readable 16x24
+            # PC-FX cell while retaining the narrow neck/rounded body.
+            for y,(x0,x1) in enumerate([(12,19),(10,21),(10,21),(12,19),(8,23),(7,24),(6,25),(6,25),(7,24),(8,23),(9,22),(10,21),(11,20),(12,19),(13,18),(13,18)]):
+                yy=y+8
+                for x in range(x0,x1+1):c[yy][x]=2 if x in (x0,x1) else (4 if y<4 else 3)
+        else:
+            for y in range(7,24):
+                half=4+max(0,(y-8)//3);x0=16-half;x1=15+half
+                for x in range(x0,x1+1):c[y][x]=2 if x in (x0,x1) else 5
+            for x in range(11,21):c[6][x]=3
+            for x in range(9,23):c[24][x]=3
+            for y in range(24,28):c[y][15]=c[y][16]=2
+        words=[]
+        for cy in range(2):
+            for cx in range(2):words.extend(ba.encode_sprite_cell([[c[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]))
+        return words
+    rgb=[(0,0,0),(49,49,49),(87,49,0),(206,119,0),(255,206,87),(255,174,0)]+[(0,0,0)]*10
+    return bank('pot'),bank('bell'),[ba.rgb_to_yuv(*c) for c in rgb]
 
 def main():
     r=ROMPATH.read_bytes(); sm=json.load(open(KIT/'graphics/stage_sets/stage_sets_manifest.json')); init=json.load(open(KIT/'graphics/metasprites/level_init_objects_and_spawns.json'))
     routes=parse_routes(r,sm); sets=build_sets(sm); levels=parse_level_objects(r,routes,init); variants=build_enemy_variants(r,levels)
     set_index={slot:s['set_id']-1 for s in sets for slot in s['slots']}
     palettes={slot:palette_for_level(slot) for slot in range(1,20)}
-    bossbg=make_boss_background(); bosswords,bossmasks,bosspal=make_bowser_sprite()
-    bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers=boss_tables(r)
+    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosswords,bossmasks,bosspal,bossflamewords,bossflamemask=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,bellwords,itempal=make_boss_item_words()
+    bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
-    h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[2];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#endif\n''')
+    h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#endif\n''')
+    # Keep the generated declarations tied to the actual captured pose count.
+    # Extend the legacy generated declaration block for the complete captured
+    # boss-1 bank and its detached flame metasprite.
+    hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
+    hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
+        'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palette; unsigned short bg_tile_count,fg_tile_count; unsigned long long sprite_mask; unsigned char cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
+    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned short g_boss_hp_1p')
+    hs=hs.replace('extern const unsigned long g_boss_handler_address[19];',
+        'extern const unsigned long g_boss_handler_address[19];\nextern const BossVisualData g_later_boss_visuals[5];\nextern const unsigned char g_boss_collision[6144];')
+    hs=hs.replace('extern const unsigned char g_bowser_flame_mask;',
+        'extern const BossRoomData g_bowser_rooms[2];\nextern const unsigned short g_final_ring_words[256],g_final_hammer_words[256],g_final_aux_palette[16],g_boss_pot_words[256],g_boss_bell_words[256],g_boss_item_palette[16];\nextern const unsigned char g_bowser_flame_mask;')
+    h.write_text(hs)
     with out.open('w') as f:
         f.write('#include "game_levels_generated.h"\n\n')
         for s in sets:
@@ -360,8 +620,22 @@ def main():
             f.write(f'  {{{set_index[slot]},{len(route)},level{slot:02d}_route,level{slot:02d}_modes,level{slot:02d}_quads,level{slot:02d}_pal,{bg},{lev["spawn"][0]},{lev["spawn"][1]},{len(lev["crates"])},{len(lev["gems"])},{len(lev["enemy_records"])},level{slot:02d}_crates,level{slot:02d}_gems,level{slot:02d}_enemies,{len(lev["variant_ids"])},level{slot:02d}_variants}},\n')
         f.write('};\n\n')
         flags=[1 if s in (3,6,8,10,13,16,19) else 0 for s in range(1,20)]; emit_u8(f,'g_boss_level_flags',flags)
-        emit_u16(f,'g_boss_bg_palette',bossbg['palette']);emit_u16(f,'g_boss_bg_tile_words',bossbg['tile_words']);emit_u16(f,'g_boss_bg_bat',bossbg['bat']);f.write(f'const unsigned short g_boss_bg_tile_count={bossbg["tile_count"]};\n\n')
-        emit_u16(f,'g_bowser_words',bosswords);emit_u16(f,'g_bowser_palette',bosspal);f.write(f'const unsigned long long g_bowser_masks[2]={{0x{bossmasks[0]:09X}ULL,0x{bossmasks[1]:09X}ULL}};\n')
+        for ri,(room,fg) in enumerate(bowserrooms):
+            q=f'bowser_room{ri}';emit_u16(f,q+'_palette',room['palette'],static=True);emit_u16(f,q+'_tiles',room['tile_words'],static=True);emit_u16(f,q+'_bg_bat',room['bat'],static=True);emit_u16(f,q+'_fg_bat',fg,static=True)
+        f.write('const BossRoomData g_bowser_rooms[2]={\n')
+        for ri,(room,fg) in enumerate(bowserrooms):
+            q=f'bowser_room{ri}';f.write(f'  {{{q}_palette,{q}_tiles,{q}_bg_bat,{q}_fg_bat,{room["tile_count"]}}},\n')
+        f.write('};\n\n')
+        emit_u16(f,'g_bowser_words',bosswords);emit_u16(f,'g_bowser_flame_words',bossflamewords);emit_u16(f,'g_bowser_palette',bosspal);f.write('const unsigned long long g_bowser_masks[9]={'+','.join(f'0x{x:09X}ULL' for x in bossmasks)+'};\n');f.write(f'const unsigned char g_bowser_flame_mask=0x{bossflamemask:02X};\n');emit_u16(f,'g_level6_platform_words',level6platform);emit_u16(f,'g_final_ring_words',finalring);emit_u16(f,'g_final_hammer_words',finalhammer);emit_u16(f,'g_final_aux_palette',finalauxpal);emit_u16(f,'g_boss_pot_words',potwords);emit_u16(f,'g_boss_bell_words',bellwords);emit_u16(f,'g_boss_item_palette',itempal)
+        for b in laterboss:
+            q=f'boss{b["slot"]}'
+            emit_u16(f,q+'_bg_palette',b['bg']['palette'],static=True);emit_u16(f,q+'_bg_tiles',b['bg']['tile_words'],static=True);emit_u16(f,q+'_bg_bat',b['bg']['bat'],static=True)
+            emit_u16(f,q+'_fg_tiles',b['fg']['tile_words'],static=True);emit_u16(f,q+'_fg_bat',b['fg']['bat'],static=True)
+            emit_u16(f,q+'_sprite_words',b['words'],static=True);emit_u16(f,q+'_sprite_palette',b['palette'],static=True)
+        f.write('const BossVisualData g_later_boss_visuals[5]={\n')
+        for b in laterboss:
+            q=f'boss{b["slot"]}'; f.write(f'  {{{q}_bg_palette,{q}_bg_tiles,{q}_bg_bat,{q}_fg_tiles,{q}_fg_bat,{q}_sprite_words,{q}_sprite_palette,{b["bg"]["tile_count"]},{b["fg"]["tile_count"]},0x{b["mask"]:016X}ULL,{b["cols"]},{b["rows"]},{b["spawn"][0]},{b["spawn"][1]}}},\n')
+        f.write('};\n\n');emit_u8(f,'g_boss_collision',bosscollision)
         emit_u16(f,'g_boss_hp_1p',bosshp1); emit_u16(f,'g_boss_hp_2p',bosshp2)
         emit_u16(f,'g_boss_params',bossparams); emit_s16(f,'g_boss_hit_offsets',[bossoffsets])
         emit_u16(f,'g_boss_alt_spawn',bossaltspawn)

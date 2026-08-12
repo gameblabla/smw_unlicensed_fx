@@ -38,6 +38,8 @@ extern void pcfx_tetsu_wait_frame(void);
 #define TILE_WORDS 16
 
 #define FG_TILE_BASE_WORD 0x0800
+#define BOSS_BG_TILE_BASE_WORD 0x1000
+#define BOSS_BG_TILE_BASE_INDEX (BOSS_BG_TILE_BASE_WORD/TILE_WORDS)
 #define FG_TILE_BASE_INDEX (FG_TILE_BASE_WORD / TILE_WORDS)
 #define BG_TILE_BASE_WORD 0x1000
 #define BG_TILE_BASE_INDEX (BG_TILE_BASE_WORD / TILE_WORDS)
@@ -85,9 +87,18 @@ extern void pcfx_tetsu_wait_frame(void);
 #endif
 #define HUD_CELL_WORDS 64
 #define ENEMY_VARIANT_WORDS ENEMY_VARIANT_VRAM_WORDS
-#define BOSS_BASE_WORD 0xB000
+#define BOSS_BASE_WORD 0x7400
+#define BOSS_FLAME_BASE_WORD (BOSS_BASE_WORD + BOWSER_FRAME_WORDS * BOWSER_FRAME_COUNT)
+#define BOSS_AUX_BASE_WORD 0xC500
+#define BOSS_RING_BASE_WORD BOSS_AUX_BASE_WORD
+#define BOSS_HAMMER_BASE_WORD (BOSS_AUX_BASE_WORD+256)
+#define BOSS_POT_BASE_WORD (BOSS_AUX_BASE_WORD+512)
+#define BOSS_BELL_BASE_WORD (BOSS_AUX_BASE_WORD+768)
+#define BOSS_AUX_SPR_PAL 12
+#define BOSS_ITEM_SPR_PAL 11
 #define PLAYER_SPR_PAL 13
 #define BOSS_SPR_PAL 14
+#define BOSS_HURT_FRAMES 30
 #define SPR_ORIGIN_X 0x20
 #define SPR_ORIGIN_Y 0x40
 
@@ -179,7 +190,7 @@ typedef struct {
 
 typedef struct {
     s32 x, y;
-    short min_x, max_x;
+    short min_y, max_y;
     signed char dir;
     unsigned char speed;
 } MovingPlatform;
@@ -264,7 +275,8 @@ static int g_after_boss=0;
 static s32 g_boss_x,g_boss_y,g_boss_vx,g_boss_vy;
 static int g_boss_hp,g_boss_timer,g_boss_invuln,g_boss_defeated;
 static int g_boss_class,g_boss_phase,g_boss_face=1,g_boss_ground_y;
-static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx;
+static int g_boss_action,g_boss_action_timer,g_boss_action_dir;
+static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx,g_boss_shot_vy;
 static int g_boss_shot_active;
 
 static Crate g_crates[MAX_CRATES];
@@ -276,6 +288,7 @@ static int g_moving_platform_count;
 static int g_on_moving_platform=-1;
 static int g_drop_platform_timer;
 static int g_debug_mode;
+static int g_crate_hide;
 
 static void enter_menu(void);
 static void enter_boot(void);
@@ -594,6 +607,13 @@ static void upload_front_sprites(void)
     for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_menu_luigi_words[i]);
 }
 
+static int palettes_equal(const unsigned short *a, const unsigned short *b)
+{
+    int i;
+    for (i=0;i<16;++i) if (a[i]!=b[i]) return 0;
+    return 1;
+}
+
 static void upload_game_sprites(void)
 {
     int i,j,uniq=0;
@@ -617,9 +637,10 @@ static void upload_game_sprites(void)
     vdc_set_vram_write(FRONT_CHIP,FIREBALL_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_fireball_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_HEART_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_heart_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_DIGIT_BASE_WORD); for(i=0;i<640;++i)vdc_vram_write(FRONT_CHIP,g_hud_digit_words[i]);
-    if ((g_current_level==1 && !g_in_boss) || g_in_boss) {
+    if ((!g_in_boss && (g_current_level==1 || g_current_level==5)) || (g_in_boss&&g_boss_class==3)) {
+        const u16 *platform_words=(g_current_level==5||g_in_boss)?g_level6_platform_words:g_level2_platform_words;
         vdc_set_vram_write(FRONT_CHIP,PLATFORM_BASE_WORD);
-        for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,g_level2_platform_words[i]);
+        for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,platform_words[i]);
     }
 
     /* F3AE/F3E4 in the 68000 disassembly load an enemy palette from F426 ->
@@ -629,7 +650,7 @@ static void upload_game_sprites(void)
     if (!g_in_boss && g_level) {
         for(i=0;i<g_level->variant_count;++i) {
             int gi=g_level->variant_ids[i]; const EnemyVariantData *v=&g_enemy_variants[gi]; int line=-1;
-            for(j=0;j<uniq;++j) if(seen[j]==v->palette){ line=4+j; break; }
+            for(j=0;j<uniq;++j) if(palettes_equal(seen[j],v->palette)){ line=4+j; break; }
             if(line<0){ seen[uniq]=v->palette; line=4+uniq; for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),v->palette[j]); ++uniq; }
             g_enemy_palette_line[i]=(unsigned char)line;
             vdc_set_vram_write(FRONT_CHIP,(u16)(ENEMY_BASE_WORD+i*ENEMY_VARIANT_VRAM_WORDS));
@@ -641,14 +662,18 @@ static void upload_game_sprites(void)
 static void set_game_palette_fade(int level)
 {
     int i,j,uniq=0; const unsigned short *seen[12];
-    const unsigned short *pal = g_in_boss ? g_boss_bg_palette : g_level->palette;
+    const BossVisualData *bv=(g_in_boss&&g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;
+    const BossRoomData *br=(g_in_boss&&g_boss_class==0)?&g_bowser_rooms[(g_current_level==5)?1:0]:0;
+    const unsigned short *pal = g_in_boss ? (bv?bv->bg_palette:br->palette) : g_level->palette;
     for(i=0;i<256;++i)tetsu_set_palette((u16)i,fade_yuv(pal[i],level));
     for(i=0;i<16;++i)tetsu_set_palette((u16)(PLAYER_SPR_PAL*16+i),fade_yuv(g_player_palette[i],level));
-    if(g_in_boss){ for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_SPR_PAL*16+i),fade_yuv(g_bowser_palette[i],level)); }
+    if(g_in_boss){ const unsigned short *sp=bv?bv->sprite_palette:g_bowser_palette;for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_SPR_PAL*16+i),fade_yuv(sp[i],level)); }
+    if(g_in_boss&&g_boss_class>0)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_AUX_SPR_PAL*16+i),fade_yuv(g_final_aux_palette[i],level));
+    if(g_in_boss&&g_boss_class>0)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_item_palette[i],level));
     else if(g_level){
         for(i=0;i<g_level->variant_count;++i){
             const EnemyVariantData *v=&g_enemy_variants[g_level->variant_ids[i]]; int line=-1;
-            for(j=0;j<uniq;++j)if(seen[j]==v->palette){line=4+j;break;}
+            for(j=0;j<uniq;++j)if(palettes_equal(seen[j],v->palette)){line=4+j;break;}
             if(line<0){seen[uniq]=v->palette;line=4+uniq;++uniq;}
             g_enemy_palette_line[i]=(unsigned char)line;
             for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),fade_yuv(v->palette[j],level));
@@ -701,7 +726,16 @@ static void init_level_ring(void)
 static unsigned char collision_at(int x,int y)
 {
     int tx,ty,screen,seg,lx;
-    if(g_in_boss){ if(x<0||x>=256)return 1; if(y>=192&&y<240)return 1; return 0; }
+    if(g_in_boss){
+        int ci=(g_boss_class<0||g_boss_class>5)?0:g_boss_class;
+        if(x<0||x>=256)return 1;if(y<0)return 0;if(y>=256)return 1;
+        /* Slot 13's three gold carriers are separate source objects rather
+           than entries in the room grid. Their captured positions remain
+           one-way surfaces in the PC-FX reconstruction. */
+        if(ci==3&&((x<64&&y>=64&&y<72)||(x>=160&&x<224&&y>=88&&y<96)||(x>=192&&y>=176&&y<184)))return 2;
+        /* Exact 32x32 collision grids selected by ROM table $7038C. */
+        return g_boss_collision[ci*1024+(y>>3)*32+(x>>3)];
+    }
     if(x<0)return 1;tx=x>>3;ty=y>>3;
     if(!g_level||tx<0||tx>=g_level_width_tiles)return 1;if(ty<0)return 0;if(ty>=32)return 0;
     screen=tx>>5;lx=tx&31;if(screen>=g_level->route_len)return 1;seg=g_level->route[screen];if(seg==255||seg>=g_stage_set->segment_count)return 0;
@@ -849,9 +883,17 @@ static void resolve_player_vertical(s32 next_y)
         /* Scan every crossed pixel so the source jump table's 4-6 px steps
            cannot tunnel through one-way/horizontal collision records. */
         for (probe=old_bottom;probe<=new_bottom+1;++probe) {
-            if (solid_v(bx+3,probe)||solid_v(bx+PLAYER_BODY_W-4,probe)) {
+            unsigned char left=collision_at(bx+3,probe),right=collision_at(bx+PLAYER_BODY_W-4,probe);
+            int hit=(left==1||right==1)||
+                (g_drop_platform_timer==0&&(left==2||right==2));
+            if (hit) {
                 int top=(probe>>3)<<3;
-                if (top<best_top) { best_top=top; best_platform=-1; }
+                if (top<best_top) {
+                    best_top=top;
+                    /* -2 identifies a collision-map one-way floor; nonnegative
+                       values continue to identify sprite platforms. */
+                    best_platform=(left==2||right==2)?-2:-1;
+                }
                 break;
             }
         }
@@ -908,7 +950,14 @@ static const signed char g_flying_koopa_dy[58]={
 
 static void update_camera(void)
 {
-    if(g_in_boss){g_camera_x=0;g_camera_tile=0;vdc_set_scroll(FRONT_CHIP,0,0);vdc_set_scroll(BACK_CHIP,0,0);return;}
+    if(g_in_boss){
+        g_camera_x=0;g_camera_tile=0;
+        vdc_set_scroll(FRONT_CHIP,0,0);
+        /* Handler $940E continuously advances the final room's wall plane;
+           its collision/platform plane remains fixed. */
+        vdc_set_scroll(BACK_CHIP,0,(g_boss_class==5)?(u16)((g_boss_timer>>2)%224):0);
+        return;
+    }
     int px=(int)(g_player_x>>FIX_SHIFT);
     int max_camera=g_level_width_tiles*8-SCREEN_W;
     int new_tile;
@@ -943,34 +992,32 @@ static void init_moving_platforms(void)
     g_on_moving_platform=-1;
     g_drop_platform_timer=0;
     if (g_in_boss) {
-        /* The first arena uses three pass-through carriers.  Bowser occupies
-           the upper one; the lower pair form Mario's approach route. */
-        p=&g_moving_platforms[g_moving_platform_count++];
-        p->x=(s32)16<<FIX_SHIFT;p->y=(s32)144<<FIX_SHIFT;p->min_x=16;p->max_x=16;p->dir=1;p->speed=0;
-        p=&g_moving_platforms[g_moving_platform_count++];
-        p->x=(s32)96<<FIX_SHIFT;p->y=(s32)112<<FIX_SHIFT;p->min_x=96;p->max_x=96;p->dir=1;p->speed=0;
-        p=&g_moving_platforms[g_moving_platform_count++];
-        p->x=(s32)160<<FIX_SHIFT;p->y=(s32)80<<FIX_SHIFT;p->min_x=160;p->max_x=160;p->dir=1;p->speed=0;
+        /* The $8CEC room owns two live carriers. They are not decoration:
+           both Mario and the frog use their current Y while waiting/jumping. */
+        if(g_boss_class==3){
+            p=&g_moving_platforms[g_moving_platform_count++];
+            p->x=(s32)16<<FIX_SHIFT;p->y=(s32)48<<FIX_SHIFT;p->min_y=48;p->max_y=120;p->dir=1;p->speed=1;
+            p=&g_moving_platforms[g_moving_platform_count++];
+            p->x=(s32)192<<FIX_SHIFT;p->y=(s32)152<<FIX_SHIFT;p->min_y=80;p->max_y=152;p->dir=-1;p->speed=1;
+        }
         return;
     }
-    if (g_current_level!=1) return;
-
-    /* r11 discarded non-crate/non-gem level-entry objects while generating
-       the 19-level tables.  These Level-2 carriers are restored over the
-       traversal gaps that cannot be cleared by the source 45-frame jump.
-       Their visible cells are taken from Level 2 itself rather than invented
-       replacement art. */
-    p=&g_moving_platforms[g_moving_platform_count++];
-    p->x=(s32)1280<<FIX_SHIFT; p->y=(s32)112<<FIX_SHIFT;
-    p->min_x=1280; p->max_x=1440; p->dir=1; p->speed=1;
-
-    p=&g_moving_platforms[g_moving_platform_count++];
-    p->x=(s32)1408<<FIX_SHIFT; p->y=(s32)144<<FIX_SHIFT;
-    p->min_x=1296; p->max_x=1456; p->dir=-1; p->speed=1;
-
-    p=&g_moving_platforms[g_moving_platform_count++];
-    p->x=(s32)2176<<FIX_SHIFT; p->y=(s32)168<<FIX_SHIFT;
-    p->min_x=2160; p->max_x=2240; p->dir=1; p->speed=1;
+    /* Exact 12-byte records loaded through $10B2A/$10A48. Handler 1 at $F5B0
+       moves each 48x8 carrier down one pixel for 100 frames, then up for 100.
+       World X is reconstructed from (route segment,tile trigger). */
+    if (g_current_level==1) {
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)1296<<FIX_SHIFT;p->y=(s32)72<<FIX_SHIFT;p->min_y=72;p->max_y=172;p->dir=1;p->speed=1;
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)1376<<FIX_SHIFT;p->y=(s32)88<<FIX_SHIFT;p->min_y=88;p->max_y=188;p->dir=1;p->speed=1;
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)2208<<FIX_SHIFT;p->y=(s32)48<<FIX_SHIFT;p->min_y=48;p->max_y=148;p->dir=1;p->speed=1;
+    } else if (g_current_level==5) {
+        /* Level 6 record $10BA2: segment 5, tile 16, (x,y)=(384,200),
+           metasprite 742, handler 1 -> world (1408,72). */
+        p=&g_moving_platforms[g_moving_platform_count++];
+        p->x=(s32)1408<<FIX_SHIFT;p->y=(s32)72<<FIX_SHIFT;p->min_y=72;p->max_y=172;p->dir=1;p->speed=1;
+    }
 }
 
 static void update_moving_platforms(void)
@@ -978,32 +1025,32 @@ static void update_moving_platforms(void)
     int i;
     for (i=0;i<g_moving_platform_count;++i) {
         MovingPlatform *p=&g_moving_platforms[i];
-        s32 old_x=p->x;
-        p->x+=(s32)p->dir*(s32)p->speed*FIX_ONE;
-        if ((int)(p->x>>FIX_SHIFT)<=p->min_x) {
-            p->x=(s32)p->min_x<<FIX_SHIFT; p->dir=1;
-        } else if ((int)(p->x>>FIX_SHIFT)>=p->max_x) {
-            p->x=(s32)p->max_x<<FIX_SHIFT; p->dir=-1;
+        s32 old_y=p->y;
+        p->y+=(s32)p->dir*(s32)p->speed*FIX_ONE;
+        if ((int)(p->y>>FIX_SHIFT)<=p->min_y) {
+            p->y=(s32)p->min_y<<FIX_SHIFT; p->dir=1;
+        } else if ((int)(p->y>>FIX_SHIFT)>=p->max_y) {
+            p->y=(s32)p->max_y<<FIX_SHIFT; p->dir=-1;
         }
-        if (g_on_moving_platform==i && g_grounded) g_player_x+=p->x-old_x;
+        if (g_on_moving_platform==i && g_grounded) g_player_y+=p->y-old_y;
     }
 }
 
 static void init_objects(void)
 {
-    int i;
+    int i,ycrop=(!g_in_boss&&g_current_level==2)?8:0;
     for(i=0;i<MAX_CRATES;++i){g_crates[i].active=0;g_crates[i].carried=0;g_crates[i].thrown=0;}
     for(i=0;i<MAX_GEMS;++i)g_gems[i].active=0;
     for(i=0;i<MAX_ENEMIES;++i)g_enemies[i].active=0;
     if(!g_in_boss && g_level){
         for(i=0;i<g_level->crate_count && i<MAX_CRATES;++i){
-            g_crates[i].x=(s32)g_level->crates[i*3]<<FIX_SHIFT;g_crates[i].y=(s32)g_level->crates[i*3+1]<<FIX_SHIFT;
+            g_crates[i].x=(s32)g_level->crates[i*3]<<FIX_SHIFT;g_crates[i].y=(s32)(g_level->crates[i*3+1]-ycrop)<<FIX_SHIFT;
             g_crates[i].vx=g_crates[i].vy=0;g_crates[i].extra=(unsigned char)g_level->crates[i*3+2];g_crates[i].active=1;g_crates[i].flight_timer=0;
         }
-        for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){g_gems[i].x=g_level->gems[i*2];g_gems[i].y=g_level->gems[i*2+1];g_gems[i].active=1;}
+        for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){g_gems[i].x=g_level->gems[i*2];g_gems[i].y=g_level->gems[i*2+1]-ycrop;g_gems[i].active=1;}
         for(i=0;i<g_level->enemy_count && i<MAX_ENEMIES;++i){
             const short *e=&g_level->enemies[i*7];
-            g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)e[1]<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
+            g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
             /* Record word 9 is the original handler state. State 18 dispatches
@@ -1015,6 +1062,7 @@ static void init_objects(void)
     }
     init_moving_platforms();
     g_carry_index=-1;g_lift_timer=0;g_gem_count=0;g_invuln=0;
+    g_crate_hide=0;
     for(i=0;i<MAX_FIREBALLS;++i)g_fireballs[i].active=0;
 }
 
@@ -1027,7 +1075,7 @@ static void update_crates(void)
         if (!c->active) continue;
         if (c->carried) {
             c->x=g_player_x+(s32)4*FIX_ONE;
-            c->y=g_player_y-(s32)13*FIX_ONE;
+            c->y=g_player_y+(s32)(g_crate_hide?18:-13)*FIX_ONE;
             c->vx=c->vy=0;
             c->thrown=0;
             continue;
@@ -1216,6 +1264,9 @@ static void begin_player_death(void)
 static void hurt_player(void)
 {
     if (g_debug_mode) return;
+    /* Holding DOWN while carrying enters the source box-disguise state: the
+       crate-with-eyes is the only visible body and attacks pass through it. */
+    if (g_crate_hide && g_carry_index>=0) return;
     if (g_player_mode!=PMODE_NORMAL || g_invuln>0) return;
     if (g_player_hearts>0) --g_player_hearts;
     g_invuln=HURT_FRAMES;
@@ -1379,6 +1430,7 @@ static void draw_game_sprites(void)
     u16 pctrl = (u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | player_pal);
     u16 paddr = (u16)(PLAYER_BASE_WORD + (frame-1) * PLAYER_FRAME_WORDS_LOCAL);
     int player_visible=1;
+    int hud_yoff=(g_in_boss||(!g_in_boss&&g_current_level==2))?-16:0;
 
     for (i = 0; i < 64 * 4; ++i) satb[i] = 0;
 
@@ -1388,7 +1440,7 @@ static void draw_game_sprites(void)
     for (i = 0; i < 14 && n < 64; ++i) {
         if (g_hud_cell_mask[i]) {
             int cx = i % 7, cy = i / 7;
-            set_sprite_entry(satb,n++,cx*16,209+cy*16,
+            set_sprite_entry(satb,n++,cx*16,209+hud_yoff+cy*16,
                 (u16)(HUD_BASE_WORD + i*HUD_CELL_WORDS),(u16)(VDC_SPR_PRIO_SP|player_pal));
         }
     }
@@ -1396,18 +1448,19 @@ static void draw_game_sprites(void)
        now live instead of the baked x4 from the runtime capture. */
     if (n<64) {
         int lives=g_lives; if (lives<0) lives=0; if (lives>9) lives=9;
-        set_sprite_entry(satb,n++,32,217,(u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
+        set_sprite_entry(satb,n++,32,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
     for (i=0;i<g_player_hearts && i<PLAYER_MAX_HEARTS && n<64;++i)
-        set_sprite_entry(satb,n++,40+i*8,217,HUD_HEART_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|player_pal));
+        set_sprite_entry(satb,n++,40+i*8,217+hud_yoff,HUD_HEART_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|player_pal));
     if (n<64) {
         int digit=g_fireball_ammo;
         if (digit<0) digit=0; if (digit>9) digit=9;
-        set_sprite_entry(satb,n++,96,217,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
+        set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
 
     if (g_invuln>0 && g_player_mode==PMODE_NORMAL)
         player_visible=((g_invuln/HURT_FLICKER_HALF_PERIOD)&1)!=0;
+    if(g_crate_hide&&g_carry_index>=0)player_visible=0;
 
     if (g_player_mode==PMODE_DYING) {
         /* The source game-over fall advances through four body poses. */
@@ -1460,8 +1513,8 @@ static void draw_game_sprites(void)
         sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
         sy = (int)(g_crates[i].y >> FIX_SHIFT);
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
-        set_sprite_entry(satb,n++,sx,sy,CRATE_BASE_WORD,
-            (u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_2 | player_pal));
+        {u16 addr=CRATE_BASE_WORD,pal=player_pal;if(g_in_boss){if(g_crates[i].extra==1){addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;}else if(g_crates[i].extra==2){addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;}else if(g_crates[i].extra==3){addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}}
+        set_sprite_entry(satb,n++,sx,sy,addr,(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_2 | pal));}
     }
 
     /* Traversal-critical Level-2 moving platforms get SATB priority over
@@ -1491,14 +1544,59 @@ static void draw_game_sprites(void)
     }
 
     if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<58){
-        int bx=(int)(g_boss_x>>FIX_SHIFT),by=(int)(g_boss_y>>FIX_SHIFT),anim=(g_boss_timer/10)&1,cx,cy;unsigned long long mask=g_bowser_masks[anim];
-        int vis=(g_boss_invuln==0)||((g_boss_invuln/3)&1);
-        if(vis)for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx;if(!(mask&(1ULL<<cell)))continue;set_sprite_entry(satb,n++,bx+cx*16,by+cy*16,(u16)(BOSS_BASE_WORD+anim*BOWSER_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL));}
+        /* Hurt includes an impact puff four pixels above the body, so its
+           capture origin needs +4 relative to the old value to keep Bowser's
+           feet aligned with the neighboring walk poses. */
+        static const signed char pose_y_offset[9]={18,22,22,18,16,22,22,16,12};
+        int bx=(int)(g_boss_x>>FIX_SHIFT),by=(int)(g_boss_y>>FIX_SHIFT),anim,cx,cy;
+        unsigned long long mask;
+        u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
+        if(g_boss_class>0){
+            const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];
+            mask=v->sprite_mask;
+            for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
+                int cell=cy*v->cols+cx,dx,dy=by+cy*16;if(!(mask&(1ULL<<cell)))continue;
+                dx=(g_boss_face<0)?(v->cols-1-cx)*16:cx*16;
+                /* Slot 13 is two source objects: the frog jumps away while
+                   the treaded vehicle remains on the middle carrier. */
+                if(g_boss_class==3&&cy>=4){dx+=(96-bx);dy=112+(cy-4)*16;}
+                set_sprite_entry(satb,n++,bx+dx,dy,
+                    (u16)(BOSS_BASE_WORD+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
+            }
+        }else{
+        /* The real capture has four distinct walk cells and a separate
+           forward-leaning breath cell. State 3 is a solid fixed hurt pose;
+           the Mega Drive does not flicker the boss during this pause. */
+        if(g_boss_invuln>0)anim=8;
+        else if(g_boss_class==0&&(g_boss_action==1||g_boss_action==7||g_boss_action==9))
+            anim=(g_boss_action_timer<8)?4:(5+(((g_boss_action_timer-8)/8)&1));
+        else anim=(g_boss_timer/10)&3;
+        by+=pose_y_offset[anim]-16;
+        mask=g_bowser_masks[anim];
+        for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(5-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOSS_BASE_WORD+anim*BOWSER_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        }
     }
 
     if(g_in_boss && g_boss_shot_active && n<63){
-        int sx=(int)(g_boss_shot_x>>FIX_SHIFT),sy=(int)(g_boss_shot_y>>FIX_SHIFT);
-        set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|player_pal|VDC_SPR_X_INVERT));
+        int sx=(int)(g_boss_shot_x>>FIX_SHIFT),sy=(int)(g_boss_shot_y>>FIX_SHIFT),cx,cy;
+        u16 flip=(g_boss_shot_vx<0)?VDC_SPR_X_INVERT:0;
+        if(g_boss_class>0){
+            if(g_boss_class==4||g_boss_class==5){
+                int count=(g_boss_class==4)?3:4,k;
+                for(k=0;k<count&&n<64;++k)set_sprite_entry(satb,n++,sx-(g_boss_shot_vx<0?-k*18:k*18),sy-k*22,BOSS_RING_BASE_WORD,
+                    (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS_AUX_SPR_PAL|flip));
+            }else set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,
+                (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|PLAYER_SPR_PAL|flip));
+        }else{
+        /* The breath object's coordinates precede its visible metasprite by
+           (+32,+13) when travelling right; mirror that offset to the left. */
+        sx+=(g_boss_shot_vx<0)?-32:32;sy-=3;
+        for(cy=0;cy<2&&n<64;++cy)for(cx=0;cx<3&&n<64;++cx){
+            int cell=cy*3+cx,dx;if(!(g_bowser_flame_mask&(1u<<cell)))continue;
+            dx=(g_boss_shot_vx<0)?(2-cx)*16:cx*16;
+            set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(BOSS_FLAME_BASE_WORD+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
+        }
+        }
     }
 
     for (i=0;i<MAX_FIREBALLS && n<64;++i) {
@@ -1584,14 +1682,33 @@ static void start_boss(int fade_in)
 {
     int i,x,y;
     const unsigned short *bp;
+    const BossVisualData *bv;
+    const BossRoomData *br;
     g_in_boss=1; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32;
+    g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     clear_bat(BACK_CHIP,BG_BAT_WORDS);clear_bat(FRONT_CHIP,FG_BAT_WORDS);
-    vdc_set_vram_write(BACK_CHIP,FG_TILE_BASE_WORD);
-    for(i=0;i<g_boss_bg_tile_count*TILE_WORDS;++i)vdc_vram_write(BACK_CHIP,g_boss_bg_tile_words[i]);
-    for(y=0;y<30;++y){vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(BACK_CHIP,relocate_bat(g_boss_bg_bat[y*32+x],FG_TILE_BASE_INDEX));}
+    vdc_set_vram_write(BACK_CHIP,BOSS_BG_TILE_BASE_WORD);
+    for(i=0;i<(bv?bv->bg_tile_count:br->tile_count)*TILE_WORDS;++i)vdc_vram_write(BACK_CHIP,bv?bv->bg_tile_words[i]:br->tile_words[i]);
+    /* The final wall scrolls through a 224-line (28-row) source. Populate two
+       complete repetitions in the 64-row VDC0 BAT; a 240-line viewport can
+       then cross the source seam without ever exposing VDP scratch rows. */
+    for(y=0;y<((g_boss_class==5)?64:32);++y){int sy=(g_boss_class==5)?(y%28):y;vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(BACK_CHIP,relocate_bat(bv?bv->bg_bat[sy*32+x]:br->bg_bat[sy*32+x],BOSS_BG_TILE_BASE_INDEX));}
+    if(bv){
+        vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
+        for(i=0;i<bv->fg_tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,bv->fg_tile_words[i]);
+        for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(bv->fg_bat[y*32+x],FG_TILE_BASE_INDEX));}
+    }
+    else{
+        vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
+        for(i=0;i<br->tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,br->tile_words[i]);
+        for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(br->fg_bat[y*32+x],FG_TILE_BASE_INDEX));}
+    }
     upload_game_sprites();
-    vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);for(i=0;i<BOWSER_FRAME_WORDS*2;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
+    if(bv)for(i=0;i<bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
+    else{for(i=0;i<BOWSER_FRAME_WORDS*BOWSER_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);}
+    if(bv){vdc_set_vram_write(FRONT_CHIP,BOSS_AUX_BASE_WORD);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_ring_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_hammer_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_bell_words[i]);}
     init_objects();
 
     /* Special-mode player spawn is the alternate table at ROM $1DC56.
@@ -1609,19 +1726,19 @@ static void start_boss(int fade_in)
        object position in the same +$80 coordinate system; the third is a
        graphics/metasprite selector retained in generated data/documentation. */
     bp=&g_boss_params[g_current_level*3];
-    x=(int)bp[0]-128; y=(int)bp[1]-128;
+    x=bv?bv->spawn_x:(int)bp[0]-128; y=bv?bv->spawn_y:(int)bp[1]-128;
     if(x<-96||x>256)x=172;
     if(y<-64||y>192)y=104;
-    if(g_current_level==2){x=152;y=96;}
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
-    g_boss_class=boss_class_for_level(g_current_level);g_boss_phase=0;g_boss_face=-1;
+    g_boss_phase=0;g_boss_face=-1;
+    g_boss_action=0;g_boss_action_timer=0;g_boss_action_dir=0;
 
     /* Exact 1P HP table $6D6E: 8,8,10,10,12,12,12 for the seven bosses.
        $6D94 is also exported for the later two-player implementation. */
     g_boss_hp=(int)g_boss_hp_1p[g_current_level];
     if(g_boss_hp<=0)g_boss_hp=8;
-    g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_after_boss=0;
+    g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_after_boss=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);draw_game_sprites();
     g_state=STATE_STAGE_LOAD;g_state_frame=0;
 }
@@ -1629,8 +1746,9 @@ static void start_boss(int fade_in)
 static void boss_take_hit(void)
 {
     if(g_boss_invuln||g_boss_defeated||g_boss_hp<=0)return;
-    --g_boss_hp;g_boss_invuln=24;Play_Sound_Sample(4,0,0);
+    --g_boss_hp;Play_Sound_Sample(4,0,0);
     if(g_boss_hp<=0){g_boss_defeated=1;g_boss_vx=0;g_boss_vy=-5*FIX_ONE;g_boss_shot_active=0;}
+    else g_boss_invuln=BOSS_HURT_FRAMES;
 }
 
 static void boss_fire_at_player(int speed)
@@ -1640,6 +1758,7 @@ static void boss_fire_at_player(int speed)
     g_boss_shot_x=g_boss_x+(s32)32*FIX_ONE;
     g_boss_shot_y=g_boss_y+(s32)36*FIX_ONE;
     g_boss_shot_vx=((g_player_x<g_boss_x)?-speed:speed)*FIX_ONE;
+    g_boss_shot_vy=0;
 }
 
 static void update_boss_motion(void)
@@ -1654,21 +1773,45 @@ static void update_boss_motion(void)
        48/64/100-frame state timers; $940E chooses a new action every 48. */
     switch(g_boss_class){
     default:
-    case 0: /* levels 3/6: horizontal pass + high/low jump states */
-        /* Bowser remains seated on the carrier: walk, run, pause/turn and
-           occasional teleport are horizontal states, never jumps. */
-        if((t%150)==0){
-            g_boss_phase=(g_boss_phase+1)&3;
-            if(g_boss_phase==3)g_boss_x=(s32)((g_player_x<(128*FIX_ONE))?168:24)<<FIX_SHIFT;
-            g_boss_vx=(g_boss_phase==1?3:1)*FIX_ONE*((g_player_x<g_boss_x)?-1:1);
+    case 0: { /* levels 3/6: literal action script used by handler $7526 */
+        static const unsigned char action[12]={1,5,2,6,3,4,1,5,2,5,3,4};
+        static const unsigned char direction[12]={0,1,1,1,0,1,0,1,1,0,0,1};
+        int a;
+        if(g_boss_action_timer==0){
+            a=action[g_boss_action];g_boss_action_dir=direction[g_boss_action];
+            g_boss_face=g_boss_action_dir?1:-1;
         }
-        g_boss_x+=g_boss_vx;
-        bx=(int)(g_boss_x>>FIX_SHIFT);
-        if(bx<=12){g_boss_x=(s32)12<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;g_boss_face=1;}
-        if(bx>=152){g_boss_x=(s32)152<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;g_boss_face=-1;}
-        g_boss_y=(s32)g_boss_ground_y<<FIX_SHIFT;g_boss_vy=0;
-        if((t%120)==0)boss_fire_at_player(3);
+        a=action[g_boss_action];++g_boss_action_timer;
+        if(a==5&&g_boss_action_timer==8){
+            /* Metasprite 10 owns the attached flame during wind-up. Create
+               the detached object only when the clean breath pose begins. */
+            g_boss_shot_active=1;
+            g_boss_shot_x=g_boss_x+(s32)(g_boss_action_dir?72:0)*FIX_ONE;
+            g_boss_shot_y=g_boss_y+(s32)32*FIX_ONE;
+            g_boss_shot_vx=(s32)(g_boss_action_dir?4:-4)*FIX_ONE;
+        }
+        if(a==1){
+            g_boss_x-=(s32)2*FIX_ONE;
+            if((int)(g_boss_x>>FIX_SHIFT)<=12){g_boss_x=(s32)12<<FIX_SHIFT;g_boss_action_timer=0;g_boss_action=(g_boss_action+1)%12;}
+        }else if(a==2){
+            g_boss_x+=(s32)2*FIX_ONE;
+            if((int)(g_boss_x>>FIX_SHIFT)>=152){g_boss_x=(s32)152<<FIX_SHIFT;g_boss_action_timer=0;g_boss_action=(g_boss_action+1)%12;}
+        }else if(a==3){
+            g_boss_x-=(s32)4*FIX_ONE;
+            if((int)(g_boss_x>>FIX_SHIFT)<=-88){g_boss_x=(s32)-88*FIX_ONE;g_boss_y=(s32)(((int)(g_boss_y>>FIX_SHIFT)==104)?24:104)<<FIX_SHIFT;g_boss_action_timer=0;g_boss_action=(g_boss_action+1)%12;}
+        }else if(a==4){
+            g_boss_x+=(s32)4*FIX_ONE;
+            if((int)(g_boss_x>>FIX_SHIFT)>=256){g_boss_x=(s32)256*FIX_ONE;g_boss_y=(s32)(((int)(g_boss_y>>FIX_SHIFT)==104)?24:104)<<FIX_SHIFT;g_boss_action_timer=0;g_boss_action=(g_boss_action+1)%12;}
+        }else if(a==5&&g_boss_action_timer>8){
+            if(!g_boss_shot_active){g_boss_action_timer=0;g_boss_action=(g_boss_action+1)%12;}
+        }else if(a==6&&g_boss_action_timer>=9){
+            g_boss_x=(s32)(((int)(g_boss_x>>FIX_SHIFT)==12)?152:12)<<FIX_SHIFT;
+            g_boss_y=(s32)(((int)(g_boss_y>>FIX_SHIFT)==24)?104:24)<<FIX_SHIFT;
+            g_boss_action_timer=0;g_boss_action=(g_boss_action+1)%12;
+        }
+        g_boss_vx=0;g_boss_vy=0;
         break;
+    }
     case 1: /* level 8: diagonal 44-frame traversals plus faster 4px dives */
         if((t%44)==0){g_boss_phase=(g_boss_phase+1)&3;g_boss_vx=(g_boss_phase&1)?2*FIX_ONE:-2*FIX_ONE;g_boss_vy=(g_boss_phase&2)?FIX_ONE:-FIX_ONE;}
         if((t%176)>=132){g_boss_vx=(g_boss_vx<0)?-4*FIX_ONE:4*FIX_ONE;g_boss_vy=4*FIX_ONE;}
@@ -1683,25 +1826,46 @@ static void update_boss_motion(void)
         if(bx<-88){g_boss_x=(s32)-88*FIX_ONE;g_boss_vx=2*FIX_ONE;}if(bx>332){g_boss_x=(s32)332*FIX_ONE;g_boss_vx=-2*FIX_ONE;}
         g_boss_face=(g_boss_vx<0)?-1:1;if((t%80)==0)boss_fire_at_player(4);
         break;
-    case 3: /* level 13: slower alternating horizontal/vertical phases */
-        if((t%96)==0)g_boss_phase=(g_boss_phase+1)&3;
-        if(g_boss_phase==0)g_boss_x-=FIX_ONE;else if(g_boss_phase==1)g_boss_y+=FIX_ONE;else if(g_boss_phase==2)g_boss_x+=2*FIX_ONE;else g_boss_y-=FIX_ONE;
-        bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
-        if(bx<16)g_boss_x=(s32)16<<FIX_SHIFT;if(bx>192)g_boss_x=(s32)192<<FIX_SHIFT;if(by<24)g_boss_y=(s32)24<<FIX_SHIFT;if(by>152)g_boss_y=(s32)152<<FIX_SHIFT;
-        g_boss_face=(g_player_x<g_boss_x)?-1:1;if((t%72)==0)boss_fire_at_player(4);
+    case 3: { /* level 13/$8CEC: wait on either carrier, then cross by arc */
+        int q=t%160,from=(t/160)&1,to=from^1,step;
+        int fx=(int)(g_moving_platforms[from].x>>FIX_SHIFT),fy=(int)(g_moving_platforms[from].y>>FIX_SHIFT)-64;
+        int tx=(int)(g_moving_platforms[to].x>>FIX_SHIFT),ty=(int)(g_moving_platforms[to].y>>FIX_SHIFT)-64;
+        if(q<48){bx=fx;by=fy;}
+        else if(q<112){step=q-48;bx=fx+(tx-fx)*step/64;by=fy+(ty-fy)*step/64-(64-(iabs_i(step-32)*2));}
+        else{bx=tx;by=ty;if(q==120)boss_fire_at_player(4);}
+        g_boss_x=(s32)bx<<FIX_SHIFT;g_boss_y=(s32)by<<FIX_SHIFT;
+        g_boss_face=(g_player_x<g_boss_x)?-1:1;
         break;
-    case 4: /* level 16: diagonal cycles and denser projectile cadence */
-        if((t%48)==0){g_boss_phase=(g_boss_phase+1)&3;g_boss_vx=(g_boss_phase&1)?3*FIX_ONE:-3*FIX_ONE;g_boss_vy=(g_boss_phase&2)?2*FIX_ONE:-2*FIX_ONE;}
+    }
+    case 4: /* level 16/$99BE: random 64/48-frame sweeps and falling bells */
+        if((t%64)==0){g_boss_phase=(g_boss_phase+1)%5;
+            if(g_boss_phase==0){
+                static const short tele_x[4]={16,120,48,176};
+                static const short tele_y[4]={24,72,112,40};int ti=(t/64)&3;
+                g_boss_x=(s32)tele_x[ti]<<FIX_SHIFT;g_boss_y=(s32)tele_y[ti]<<FIX_SHIFT;
+                g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
+            }
+            else if(g_boss_phase==1){g_boss_vx=3*FIX_ONE;g_boss_vy=2*FIX_ONE;}
+            else if(g_boss_phase==2){g_boss_vx=-3*FIX_ONE;g_boss_vy=-2*FIX_ONE;}
+            else {g_boss_vx=0;g_boss_vy=0;}
+            if(g_boss_phase==3&&!g_boss_shot_active){g_boss_shot_active=1;g_boss_shot_x=g_player_x;g_boss_shot_y=-16*FIX_ONE;g_boss_shot_vx=0;g_boss_shot_vy=3*FIX_ONE;}
+            if(g_boss_phase==4)boss_fire_at_player(5);
+        }
         g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
-        if(bx<24){g_boss_x=(s32)24<<FIX_SHIFT;g_boss_vx=3*FIX_ONE;}if(bx>192){g_boss_x=(s32)192<<FIX_SHIFT;g_boss_vx=-3*FIX_ONE;}
-        if(by<48){g_boss_y=(s32)48<<FIX_SHIFT;g_boss_vy=2*FIX_ONE;}if(by>144){g_boss_y=(s32)144<<FIX_SHIFT;g_boss_vy=-2*FIX_ONE;}
-        g_boss_face=(g_boss_vx<0)?-1:1;if((t%64)==0)boss_fire_at_player(5);
+        if(bx<8){g_boss_x=(s32)8<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;}if(bx>136){g_boss_x=(s32)136<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}
+        if(by<8){g_boss_y=(s32)8<<FIX_SHIFT;g_boss_vy=2*FIX_ONE;}if(by>112){g_boss_y=(s32)112<<FIX_SHIFT;g_boss_vy=-2*FIX_ONE;}
+        g_boss_face=(g_player_x<g_boss_x)?-1:1;
         break;
-    case 5: /* level 19: source selects a new action on a 48-frame timer */
-        if((t%48)==0){g_boss_phase=(g_boss_phase+1)%6;switch(g_boss_phase){case 0:g_boss_vx=FIX_ONE;g_boss_vy=0;break;case 1:g_boss_vx=2*FIX_ONE;break;case 2:g_boss_vx=-2*FIX_ONE;break;case 3:g_boss_vx=-FIX_ONE;g_boss_vy=-2*FIX_ONE;break;case 4:g_boss_vx=2*FIX_ONE;g_boss_vy=2*FIX_ONE;break;default:g_boss_vx=0;g_boss_vy=0;break;}}
-        g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
-        if(bx<0){g_boss_x=0;g_boss_vx=2*FIX_ONE;}if(bx>192){g_boss_x=(s32)192<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}if(by<32){g_boss_y=(s32)32<<FIX_SHIFT;g_boss_vy=2*FIX_ONE;}if(by>160){g_boss_y=(s32)160<<FIX_SHIFT;g_boss_vy=-2*FIX_ONE;}
-        g_boss_face=(g_boss_vx<0)?-1:1;if((t%56)==0)boss_fire_at_player(5);
+    case 5: /* level 19/$940E: grounded elephant patrol/trunk attack */
+        if((t%56)==0){g_boss_phase=(g_boss_phase+1)%5;
+            if(g_boss_phase==0)g_boss_vx=-2*FIX_ONE;
+            else if(g_boss_phase==2)g_boss_vx=2*FIX_ONE;
+            else g_boss_vx=0;
+            if(g_boss_phase==1||g_boss_phase==4)boss_fire_at_player(4);
+        }
+        g_boss_x+=g_boss_vx;bx=(int)(g_boss_x>>FIX_SHIFT);
+        if(bx<8){g_boss_x=(s32)8<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;}if(bx>136){g_boss_x=(s32)136<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}
+        g_boss_y=(s32)49<<FIX_SHIFT;g_boss_face=(g_player_x<g_boss_x)?-1:1;
         break;
     }
 }
@@ -1709,7 +1873,6 @@ static void update_boss_motion(void)
 static void update_boss_actor(void)
 {
     int i,bx,by,hitx,hity,hitw,hith;
-    ++g_boss_timer;if(g_boss_invuln>0)--g_boss_invuln;
     if(g_boss_defeated){
         /* Source HP-zero path at $16398 changes the boss state instead of
            erasing it. Keep the sprite visible while it launches/falls away. */
@@ -1717,39 +1880,55 @@ static void update_boss_actor(void)
         if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;g_state=STATE_LEVEL_FADE;g_state_frame=0;}
         return;
     }
-    update_boss_motion();
-    /* The ceiling dispenser supplies the arena's ammunition. */
-    if((g_boss_timer%120)==1){
-        for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
-            g_crates[i].active=1;g_crates[i].carried=0;g_crates[i].thrown=0;
-            g_crates[i].x=(s32)(32+((g_boss_timer/120)%6)*32)<<FIX_SHIFT;
-            g_crates[i].y=0;g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
+    if(g_boss_invuln>0)--g_boss_invuln;
+    else{
+        ++g_boss_timer;
+#ifdef FORCE_BOSS_HURT
+        if(g_boss_timer==FORCE_BOSS_HURT)boss_take_hit();
+#endif
+        if(g_boss_invuln==0)update_boss_motion();
+    }
+    /* The source dispenser ($7958) waits while its previous crate object is
+       live.  Do the same so unused ammunition cannot carpet the catwalk. */
+    if(g_boss_invuln==0&&(g_boss_timer%120)==1){
+        int any_crate=0;
+        for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
+        if(!any_crate)for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
+                g_crates[i].active=1;g_crates[i].carried=0;g_crates[i].thrown=0;
+                g_crates[i].extra=(g_boss_class==1)?1:(g_boss_class==4)?2:(g_boss_class==5)?3:0;
+                g_crates[i].x=(s32)(32+((g_boss_timer/120)%6)*32)<<FIX_SHIFT;
+                g_crates[i].y=(s32)-16*FIX_ONE;g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
         }
     }
-    if(g_boss_shot_active){int sx,sy;g_boss_shot_x+=g_boss_shot_vx;sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT);if(sx<-32||sx>272)g_boss_shot_active=0;else if(g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,sx+4,sy+4,16,16)){hurt_player();g_boss_shot_active=0;}}
+    if(g_boss_shot_active){int sx,sy;g_boss_shot_x+=g_boss_shot_vx;g_boss_shot_y+=g_boss_shot_vy;sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT)-16;if(sx<-40||sx>272||sy>240)g_boss_shot_active=0;else if(g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,sx+4,sy+4,24,24)){hurt_player();g_boss_shot_active=0;}}
     bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
     /* $15D20 is used by the source boss collision path. Values vary sharply by
        boss class, so use them to tune the broad collision body rather than the
        old universal 56x68 rectangle. */
-    hitx=bx+12;hity=by+8;hitw=72;hith=72;
-    if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
-    if(g_boss_hit_offsets[g_current_level*2+1]>0)hith=g_boss_hit_offsets[g_current_level*2+1];
-    if(hith<48)hith=64;if(hith>88)hith=88;
-    for(i=0;i<MAX_FIREBALLS;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
-    for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT);if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
-    if(g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,hitx+4,hity+4,hitw-8,hith-8))hurt_player();
+    if(g_boss_class>0){const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];hitx=bx+8;hity=by+8;hitw=v->cols*16-16;hith=(g_boss_class==3)?56:v->rows*16-16;}
+    else{hitx=bx+12;hity=by-8;hitw=72;hith=72;
+        if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
+        if(g_boss_hit_offsets[g_current_level*2+1]>0)hith=g_boss_hit_offsets[g_current_level*2+1];
+        if(hith<48)hith=64;if(hith>88)hith=88;}
+    if(g_boss_invuln==0){
+        for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
+        for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT);if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
+        if(!g_boss_defeated&&g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,hitx+4,hity+4,hitw-8,hith-8))hurt_player();
+    }
 }
 
 static void start_gameplay(int fade_in)
 {
+    int ycrop;
     /* Every normal level is selected through the 19-entry reconstruction table. */
     g_in_boss=0;
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     init_level_ring();
     init_objects();
+    ycrop=(g_current_level==2)?8:0;
     g_player_x=(s32)g_level->spawn_x<<FIX_SHIFT;
-    g_player_y=(s32)g_level->spawn_y<<FIX_SHIFT;
+    g_player_y=(s32)(g_level->spawn_y-ycrop)<<FIX_SHIFT;
     g_vx=g_vy=0;
     g_grounded=1;
     g_facing=1;
@@ -1784,6 +1963,7 @@ static void update_play(u16 btn, u16 pressed)
         }
     }
     if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;}
+    g_crate_hide=(g_carry_index>=0&&g_grounded&&(btn&JOY_DOWN))?1:0;
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
@@ -1848,10 +2028,11 @@ static void update_play(u16 btn, u16 pressed)
 
     /* Actions are latched before horizontal input so the very first throw
        frame cannot inherit the previous walking velocity/camera movement. */
-    if ((pressed&JOY_II) && g_lift_timer==0 && g_throw_timer==0) do_crate_action();
+    if ((pressed&JOY_II) && !g_crate_hide && g_lift_timer==0 && g_throw_timer==0) do_crate_action();
     if ((pressed&JOY_III) && g_lift_timer==0 && g_throw_timer==0) fire_fireball();
 
-    if (g_lift_timer>0) {
+    if(g_crate_hide){g_vx=0;g_camera_hold=1;}
+    else if (g_lift_timer>0) {
         --g_lift_timer;
         g_vx=0;
     } else if (g_throw_timer>0 && g_grounded) {
@@ -1866,7 +2047,7 @@ static void update_play(u16 btn, u16 pressed)
         g_vx=run_speed; g_facing=1;
     } else g_vx=0;
 
-    if (g_grounded && (pressed&JOY_I) && (btn&JOY_DOWN) && g_on_moving_platform>=0) {
+    if (g_grounded && (pressed&JOY_I) && (btn&JOY_DOWN) && g_on_moving_platform!=-1) {
         g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;
     } else if (g_grounded && (pressed&JOY_I) && g_lift_timer==0 && g_throw_timer==0) {
         g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;

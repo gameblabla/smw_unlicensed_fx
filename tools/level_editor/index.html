@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Super Mario Bros. PC-FX Level Editor</title><link rel="stylesheet" href="style.css"></head>
+<body>
+<header><div><h1>PC-FX Level Editor</h1><p>Edit the final 8×8 tile arrangement used by the 256×240 PC-FX renderer.</p></div><div id="status">Loading…</div></header>
+<main>
+  <section class="toolbar panel">
+    <label>Level <select id="level"></select></label>
+    <label>Layer <select id="layer"><option value="foreground">Level foreground</option><option value="background">Level background</option><option value="boss-foreground">Boss foreground</option><option value="boss-background">Boss background</option></select></label>
+    <label id="segmentLabel">Segment <select id="segment"></select></label>
+    <span id="shared"></span>
+    <button id="save" class="primary">Save overrides</button><button id="restore" class="danger">Restore default</button>
+  </section>
+  <section class="tools panel">
+    <div class="buttonrow"><button data-tool="pencil" class="active">Pencil</button><button data-tool="fill">Fill</button><button data-tool="erase">Erase</button><button data-tool="select">Select</button><button id="copy">Copy</button><button data-tool="paste" id="paste">Paste</button><button id="undo">Undo</button><button id="redo">Redo</button></div>
+    <div class="buttonrow"><label>Palette <select id="palette"><option>0</option><option>1</option><option>2</option><option>3</option></select></label><button id="hflip">Flip H</button><button id="vflip">Flip V</button><label class="check"><input id="grid" type="checkbox" checked> Grid</label></div>
+    <div><b>Selected:</b> <span id="selectedInfo">tile 0</span><br><small>Left-drag paints. Select drag + Copy captures a rectangle; Paste then click places it. Ctrl+C/Ctrl+V also work. Right-click samples.</small></div>
+  </section>
+  <section class="workspace">
+    <div class="panel mapPanel"><h2 id="mapTitle">Map</h2><div id="mapScroll"><canvas id="map"></canvas></div><p id="mapPosition" class="position">Move over the map to see coordinates.</p><p class="note"><span class="extensionKey"></span> Rows from Y=224 onward are editable. Boss maps retain 32 rows so scrolling backgrounds wrap without a seam. Visual tile editing does not change the collision grid.</p></div>
+    <aside class="panel"><h2>Tile pixels</h2><canvas id="pixel" width="192" height="192"></canvas><div id="colors"></div><button id="resetTile">Reset selected tile</button><p class="note">Pixel changes affect every use of this tile in the selected foreground set or background level.</p></aside>
+  </section>
+  <section class="panel"><h2>Tile picker</h2><div id="tilesScroll"><canvas id="tiles"></canvas></div></section>
+</main><script src="editor.js"></script></body></html>

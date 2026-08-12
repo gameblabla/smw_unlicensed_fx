@@ -7,6 +7,7 @@ BINCUT := $(V810GCC)/bin/bincat
 PCFX_CDLINK := $(V810GCC)/bin/pcfx-cdlink
 TARGET := smb_pcfx
 BOSSREF ?= assets/reference/boss
+LEVEL_OVERRIDES ?= level_overrides
 OBJDIR := build
 INCLUDES := -I. -Isrc -I$(V810GCC)/include -I$(V810GCC)/$(PREFIX)/include
 CFLAGS := -O2 -fomit-frame-pointer -fno-builtin -ffunction-sections -fdata-sections \
@@ -23,14 +24,18 @@ ELF := $(OBJDIR)/$(TARGET).elf
 PROGRAM_BIN := $(OBJDIR)/$(TARGET).bin
 MAP := $(OBJDIR)/$(TARGET).map
 
-.PHONY: all disc clean assets
+.PHONY: all disc clean assets editor apply-level-edits
 all: disc
 assets:
 	KIT=$(KIT) python3 tools/prepare_boot_frames.py
 	python3 tools/build_assets.py --kit $(KIT) --rom $(ROM) --project .
 	python3 tools/build_boot_exact.py --frames assets/derived/boot_exact_fixed --project . --first 12 --last 600
 	python3 tools/build_boot_dual.py
-	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) python3 tools/build_full_game.py
+	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) LEVEL_OVERRIDES=$(LEVEL_OVERRIDES) python3 tools/build_full_game.py
+editor:
+	python3 tools/level_editor.py --kit $(if $(KIT),$(KIT),Super_Mario_Bros_MD_reconstruction_kit) --overrides $(LEVEL_OVERRIDES)
+apply-level-edits:
+	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) LEVEL_OVERRIDES=$(LEVEL_OVERRIDES) python3 tools/build_full_game.py
 $(OBJDIR)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@

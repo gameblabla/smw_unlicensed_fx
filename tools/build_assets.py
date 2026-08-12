@@ -577,7 +577,10 @@ def build_continue_assets(kit):
                             if ci and 0<=dx+xx<256 and 0<=dy+yy<240: px[dx+xx,dy+yy]=pal[pidx*16+ci]
 
     # Object coordinates include the Mega Drive +128 sprite origin.
-    objects={302:(72,48),305:(152,48),308:(112,112),429:(88,144),320:(128,192)}
+    # Metasprite 308 (the 184px GAME OVER line) spans x=-96..87 relative
+    # to its object.  x=132 places its actual bounds at 36..219, centered in
+    # the 256px raster; the old x=112 was visibly twenty pixels left.
+    objects={302:(72,48),305:(152,48),308:(132,112),429:(88,144),320:(128,192)}
     for mid,(x,y) in objects.items(): draw_meta_rgb(canvas,mid,x,y)
     bgasset=pack_bg_rgb(canvas)
 
