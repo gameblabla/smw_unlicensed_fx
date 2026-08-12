@@ -608,7 +608,6 @@ static void boot_exact_apply(unsigned frame)
     n=*p++;
     if (source_frame>=421) {
         boot_dual_apply(source_frame);
-        if (source_frame>=434) preload_menu_step();
         return;
     }
     for (i=0;i<n;++i) {
@@ -2361,7 +2360,9 @@ static void update_frontend(u16 pressed)
             clear_front_sprites();
         } else if (g_state_frame<110) {
             if (g_state_frame==90) {
-                /* The menu CHR/BAT was staged during exact frames 434..600. */
+                /* Stage menu CHR/BAT only after the title has reached black.
+                   Writing the high VDC0 pattern area during the live reveal
+                   caused the reported one-frame title corruption. */
                 if (!g_menu_preloaded) load_menu_asset();
                 g_last_front_asset=&g_menu_combo_asset;
                 g_menu_choice=MENU_1P;

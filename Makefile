@@ -11,6 +11,7 @@ OBJDIR := build
 INCLUDES := -I. -Isrc -I$(V810GCC)/include -I$(V810GCC)/$(PREFIX)/include
 CFLAGS := -O2 -fomit-frame-pointer -fno-builtin -ffunction-sections -fdata-sections \
           -Wall -Wextra -std=gnu99 -mv810 -mprolog-function -msda=0 $(INCLUDES)
+CFLAGS += $(EXTRA_CFLAGS)
 LDFLAGS := -L$(V810GCC)/lib -L$(V810GCC)/$(PREFIX)/lib \
            -L$(V810GCC)/lib/gcc/$(PREFIX)/4.9.4 \
            $(V810GCC)/$(PREFIX)/lib/crt0.o --gc-sections
