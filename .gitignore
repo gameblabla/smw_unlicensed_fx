@@ -1,0 +1,21 @@
+# Generated build and disc outputs
+/build/
+*.iso
+*.bin
+*.cue
+*.zip
+
+# Documentation and verification artifacts
+*.md
+/FILES.txt
+/verification/
+/verification_r*/
+
+# Python cache and local emulator/tool artifacts
+__pycache__/
+*.py[cod]
+*blastem*
+
+# Local reconstruction/reference trees
+/Super_Mario_Bros_MD_reconstruction_kit/
+/Super_Mario_Bros_PC_FX_fullgame_r12n/

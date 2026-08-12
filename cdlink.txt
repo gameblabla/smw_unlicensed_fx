@@ -1,0 +1,7 @@
+binary ./out_ram.bin
+name SMB PCFX Reconstruction
+maker OpenAI
+makerid OAI
+date 20260812
+country JP
+version 01
