@@ -6,5 +6,5 @@
 #define BOOT_EXACT_CELL_COUNT 960
 extern const unsigned char g_boot_exact_cell_palette[BOOT_EXACT_CELL_COUNT];
 extern const unsigned int g_boot_exact_offsets[BOOT_EXACT_FRAME_COUNT+1];
-extern const unsigned short g_boot_exact_stream[89223];
+extern const unsigned short g_boot_exact_stream[187679];
 #endif

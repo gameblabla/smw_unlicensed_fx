@@ -110,10 +110,7 @@ for path in sorted(SRC.glob('f*.png')):
             for x in range(40,220):
                 px[x,y]=(0,0,0)
 
-    # The title wall starts at frame 348.  Populate its upper tile row from
-    # that first reveal frame instead of leaving an eight-pixel black border
-    # until frame 400 and making the whole row appear at once.
-    if 348 <= n <= 600:
+    if 400 <= n <= 600:
         im=clean_title_top(im)
 
     # Use the final screen's exact wall cells during the partial reveal, then
@@ -127,21 +124,6 @@ for path in sorted(SRC.glob('f*.png')):
     if n==600:
         target=PROJ/'assets/reference/front_timeline/world_nopush.png'
         if target.exists(): im=Image.open(target).convert('RGB')
-
-    # Finish the central opening in 16-pixel face-block columns.  These are
-    # real exact frames, so their patterns and palette slots advance through
-    # the normal uploader instead of a separate BAT/pattern-bank workaround.
-    if 421 <= n <= 432:
-        base=Image.open(OUT/'f0420.png').convert('RGB')
-        final=Image.open(SRC/'f0429.png').convert('RGB')
-        columns=min(12,n-420)
-        base.paste(final.crop((40,96,40+columns*16,208)),(40,96))
-        # Characters remain runtime sprites until the background is complete.
-        px=base.load()
-        for y in range(100,208):
-            for x in range(40,220):
-                if x>=40+columns*16: px[x,y]=(0,0,0)
-        im=base
 
     im.save(OUT/path.name)
 

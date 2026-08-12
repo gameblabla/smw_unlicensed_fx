@@ -75,25 +75,24 @@ def lib(frames,base):
   maps[n]=bat
  return [w for p in pats for w in p],maps
 BACK_BASE=0x5000;FRONT_BASE=0x9000
-back_frames=[422,424,427,429,433]+list(range(434,602));seen=set();back_frames=[n for n in back_frames if not(n in seen or seen.add(n))]
-front_frames=[421,423,426,428]
+back_frames=[433]+list(range(434,602))
+front_frames=[]
 back_words,bmaps=lib(back_frames,BACK_BASE);front_words,fmaps=lib(front_frames,FRONT_BASE)
 def delta(a,b):
  out=[]
  for ci,(x,y) in enumerate(zip(a,b)):
   if x!=y:out.extend((ci,y))
  return out
-# After frame 433, VDC0 top-left contains f429 == f433 and receives cheap BAT deltas.
+# The MD routine (ADR_9CE -> ADR_1847C) keeps one pattern library resident and
+# advances the tile map in ordered batches.  Mirror that on VDC0: preload frame
+# 433 into the hidden lower BAT half, reveal it atomically, then apply BAT deltas.
 title_targets=list(range(434,601));to=[0];ts=[];prev=bmaps[433]
 for n in title_targets:ts+=delta(prev,bmaps[n]);to.append(len(ts));prev=bmaps[n]
 # bmaps[600] is the settled no-PUSH title. frame 601 is the PUSH START variant.
 blink_on=delta(bmaps[600],bmaps[601])
 blink_off=delta(bmaps[601],bmaps[600])
-# Three preloaded VDC0 alternate quadrants and all four VDC1 quadrants.
-back_pre=[]
-for n in [422,424,427]:back_pre+=bmaps[n]
+back_pre=bmaps[433]
 front_pre=[]
-for n in [421,423,426,428]:front_pre+=fmaps[n]
 print('back patterns',len(back_words)//16,'front patterns',len(front_words)//16,'pre BAT',len(back_pre)+len(front_pre),'title max',max((to[i+1]-to[i])//2 for i in range(len(title_targets))))
 
 def e16(f,n,v,cols=12):
@@ -107,4 +106,4 @@ def e32(f,n,v,cols=10):
 h=proj/'src/boot_dual.h';cc=proj/'src/boot_dual.c'
 h.write_text(f'''#ifndef SMB_PCFX_BOOT_DUAL_H\n#define SMB_PCFX_BOOT_DUAL_H\n#define BOOT_DUAL_BACK_BASE_WORD 0x{BACK_BASE:04X}\n#define BOOT_DUAL_BACK_TILE_WORDS {len(back_words)}\n#define BOOT_DUAL_BACK_PRE_WORDS {len(back_pre)}\n#define BOOT_DUAL_FRONT_BASE_WORD 0x{FRONT_BASE:04X}\n#define BOOT_DUAL_FRONT_TILE_WORDS {len(front_words)}\n#define BOOT_DUAL_FRONT_PRE_WORDS {len(front_pre)}\nextern const unsigned short g_boot_dual_back_tiles[{len(back_words)}];\nextern const unsigned short g_boot_dual_back_pre[{len(back_pre)}];\nextern const unsigned short g_boot_dual_front_tiles[{len(front_words)}];\nextern const unsigned short g_boot_dual_front_pre[{len(front_pre)}];\nextern const unsigned short g_boot_dual_frame429[960];\nextern const unsigned int g_boot_dual_title_offsets[{len(to)}];\nextern const unsigned short g_boot_dual_title_stream[{len(ts)}];\nextern const unsigned short g_boot_dual_blink_off[{len(blink_off)}];\nextern const unsigned short g_boot_dual_blink_on[{len(blink_on)}];\n#define BOOT_DUAL_BLINK_OFF_WORDS {len(blink_off)}\n#define BOOT_DUAL_BLINK_ON_WORDS {len(blink_on)}\n#endif\n''')
 with cc.open('w') as f:
- f.write('#include "boot_dual.h"\n\n');e16(f,'g_boot_dual_back_tiles',back_words);e16(f,'g_boot_dual_back_pre',back_pre);e16(f,'g_boot_dual_front_tiles',front_words);e16(f,'g_boot_dual_front_pre',front_pre);e16(f,'g_boot_dual_frame429',bmaps[429]);e32(f,'g_boot_dual_title_offsets',to);e16(f,'g_boot_dual_title_stream',ts);e16(f,'g_boot_dual_blink_off',blink_off);e16(f,'g_boot_dual_blink_on',blink_on)
+ f.write('#include "boot_dual.h"\n\n');e16(f,'g_boot_dual_back_tiles',back_words);e16(f,'g_boot_dual_back_pre',back_pre);e16(f,'g_boot_dual_front_tiles',front_words);e16(f,'g_boot_dual_front_pre',front_pre);e16(f,'g_boot_dual_frame429',bmaps[433]);e32(f,'g_boot_dual_title_offsets',to);e16(f,'g_boot_dual_title_stream',ts);e16(f,'g_boot_dual_blink_off',blink_off);e16(f,'g_boot_dual_blink_on',blink_on)
