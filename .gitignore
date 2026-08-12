@@ -4,6 +4,8 @@
 *.bin
 *.cue
 *.zip
+*.mcr
+smb_pcfx_shot_*.png
 
 # Documentation and verification artifacts
 *.md

@@ -423,11 +423,24 @@ static void load_title_assets(void)
 
 static void load_menu_asset(void)
 {
+    int x,y;
     /* By the time this runs the title has faded to black, so the title-only
-       CHR region can be reused without exposing a transient tile mismatch. */
+       CHR region can be reused without exposing a transient tile mismatch.
+       Upload the corresponding BAT at the same time. The old incremental
+       preloader used to populate rows 32..61; after that preloader was removed
+       to cure title corruption, leaving those rows untouched made the menu
+       interpret stale title cells with the new menu patterns. */
     g_front_res_assets[2]=&g_menu_combo_asset;
     g_front_res_bases[2]=(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS);
     upload_tiles(BACK_CHIP,FRONT_TILE_BASE_WORD,&g_menu_combo_asset);
+    for(y=0;y<30;++y){
+        vdc_set_vram_write(BACK_CHIP,(u16)((32+y)*BG_BAT_W));
+        for(x=0;x<32;++x){
+            u16 e=g_menu_combo_asset.bat[y*g_menu_combo_asset.width_tiles+x];
+            vdc_vram_write(BACK_CHIP,relocate_bat(e,(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS)));
+        }
+    }
+    g_menu_preloaded=1;
 }
 
 static u16 front_asset_base(const BgAsset *a)
