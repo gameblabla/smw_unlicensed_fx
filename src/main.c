@@ -1944,7 +1944,11 @@ static void update_play(u16 btn, u16 pressed)
 
     if (pressed&JOY_MODE1) {
         g_debug_mode^=1;
-        if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;g_invuln=0;g_hurt_pending_death=0;}
+        if (g_debug_mode) {
+            g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;
+            g_invuln=0;g_hurt_pending_death=0;
+            if(g_player_mode==PMODE_DYING||g_player_mode==PMODE_FADE_OUT)g_player_mode=PMODE_NORMAL;
+        }
     }
     if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;}
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
@@ -2086,6 +2090,10 @@ static void update_play(u16 btn, u16 pressed)
     /* Falling through an open pit is fatal once Mario leaves the 224-line
        source playfield. The visual extension rows remain non-colliding. */
     if ((int)(g_player_y>>FIX_SHIFT)>224) {
+        if(g_debug_mode){
+            g_player_y=(s32)96<<FIX_SHIFT;g_vy=0;g_jump_active=0;g_bounce_active=0;
+            draw_game_sprites();return;
+        }
         begin_player_death();
         draw_game_sprites();
         return;
