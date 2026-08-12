@@ -9,6 +9,10 @@ from build_assets import encode_bg_tile, rgb_to_yuv
 
 W,H=256,240
 TW,TH=32,30
+# From this source frame on, the title is driven by the resident tile library in
+# boot_dual.c (BAT deltas only).  The runtime skips this stream's CHR payload
+# there, so it is not emitted at all.
+DUAL_FIRST_MD_FRAME=433
 CELL_COUNT=TW*TH
 MAX_LINES=16
 
@@ -142,6 +146,7 @@ def main():
                 if words!=prev_tile_words[ci]:
                     tile_updates.append(ci); tile_updates.extend(words)
                     prev_tile_words[ci]=words
+        if a.first+fi>=DUAL_FIRST_MD_FRAME: tile_updates=[]
         npal=len(pal_updates)//2; ntile=len(tile_updates)//17
         stream.append(npal); stream.extend(pal_updates)
         stream.append(ntile); stream.extend(tile_updates)

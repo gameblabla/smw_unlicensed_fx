@@ -218,8 +218,6 @@ static int g_state;
 static unsigned g_state_frame;
 static u16 g_prev_buttons;
 static int g_menu_choice;
-static const BgAsset *g_last_front_asset;
-static int g_transition_panel;
 static int g_prompt_visible;
 
 static s32 g_player_x, g_player_y;
@@ -251,11 +249,8 @@ static int g_throw_timer;
 static int g_camera_hold;
 static int g_prev_body_y;
 static unsigned g_boot_dual_load_pos;
-static unsigned g_menu_preload_pos;
-static int g_menu_preloaded;
 static u16 g_title_exact_palette[256];
 
-static void preload_menu_step(void);
 static int g_fireball_ammo;
 static int g_continue_digit;
 static int g_continue_resume;
@@ -271,10 +266,6 @@ static int g_boss_hp,g_boss_timer,g_boss_invuln,g_boss_defeated;
 static int g_boss_class,g_boss_phase,g_boss_face=1,g_boss_ground_y;
 static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx;
 static int g_boss_shot_active;
-
-#define FRONT_RES_COUNT 3
-static const BgAsset *g_front_res_assets[FRONT_RES_COUNT];
-static u16 g_front_res_bases[FRONT_RES_COUNT];
 
 static Crate g_crates[MAX_CRATES];
 static Gem g_gems[MAX_GEMS];
@@ -341,8 +332,6 @@ static void show_black(void)
     vdc_set_scroll(BACK_CHIP, 0, 0);
     vdc_set_scroll(FRONT_CHIP, 0, 0);
     clear_satb();
-    g_last_front_asset = 0;
-    g_transition_panel = -1;
 }
 
 static void init_video(void)
@@ -384,11 +373,6 @@ static u16 fade_yuv(u16 c, int level)
     return (u16)((y<<8)|((u&15)<<4)|(v&15));
 }
 
-static void upload_bg_palette(const BgAsset *a)
-{
-    int i;
-    for (i = 0; i < 256; ++i) tetsu_set_palette((u16)i, a->palette[i]);
-}
 
 static void set_asset_palette_fade(const BgAsset *a, int level)
 {
@@ -415,30 +399,14 @@ static u16 relocate_bat(u16 e, u16 base_index)
     return (u16)((e & 0xF000u) | ((e & 0x0FFFu) + base_index));
 }
 
-static void load_title_assets(void)
-{
-    u16 word=FRONT_TILE_BASE_WORD;
-    g_front_res_assets[0]=&g_world_nopush_asset;
-    g_front_res_assets[1]=&g_world_push_asset;
-    g_front_res_assets[2]=&g_menu_combo_asset;
-    g_front_res_bases[0]=(u16)(word/TILE_WORDS);
-    upload_tiles(BACK_CHIP,word,&g_world_nopush_asset);
-    word=(u16)(word+g_world_nopush_asset.tile_count*TILE_WORDS);
-    g_front_res_bases[1]=(u16)(word/TILE_WORDS);
-    upload_tiles(BACK_CHIP,word,&g_world_push_asset);
-}
 
 static void load_menu_asset(void)
 {
     int x,y;
     /* By the time this runs the title has faded to black, so the title-only
        CHR region can be reused without exposing a transient tile mismatch.
-       Upload the corresponding BAT at the same time. The old incremental
-       preloader used to populate rows 32..61; after that preloader was removed
-       to cure title corruption, leaving those rows untouched made the menu
-       interpret stale title cells with the new menu patterns. */
-    g_front_res_assets[2]=&g_menu_combo_asset;
-    g_front_res_bases[2]=(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS);
+       CHR and the matching BAT rows 32..61 must be written together: uploading
+       one without the other leaves the menu interpreting stale title cells. */
     upload_tiles(BACK_CHIP,FRONT_TILE_BASE_WORD,&g_menu_combo_asset);
     for(y=0;y<30;++y){
         vdc_set_vram_write(BACK_CHIP,(u16)((32+y)*BG_BAT_W));
@@ -447,37 +415,9 @@ static void load_menu_asset(void)
             vdc_vram_write(BACK_CHIP,relocate_bat(e,(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS)));
         }
     }
-    g_menu_preloaded=1;
 }
 
-static u16 front_asset_base(const BgAsset *a)
-{
-    int i;
-    for (i=0;i<FRONT_RES_COUNT;++i)
-        if (g_front_res_assets[i]==a) return g_front_res_bases[i];
-    return 0;
-}
 
-static void show_front_asset(const BgAsset *a)
-{
-    int y,x;
-    u16 baseidx;
-    if (a==g_last_front_asset) return;
-    g_last_front_asset=a;
-    baseidx=front_asset_base(a);
-    /* Front-end assets are always written as 32x30 tiles = 256x240. */
-    for (y=0;y<30;++y) {
-        vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));
-        for (x=0;x<32;++x) {
-            u16 e=0;
-            if (y<a->height_tiles && x<a->width_tiles)
-                e=relocate_bat(a->bat[y*a->width_tiles+x],baseidx);
-            vdc_vram_write(BACK_CHIP,e);
-        }
-    }
-    vdc_set_scroll(BACK_CHIP,0,0);
-    vdc_set_scroll(FRONT_CHIP,0,0);
-}
 
 static void boot_exact_setup(void)
 {
@@ -560,8 +500,7 @@ static void boot_dual_apply(unsigned source_frame)
         vdc_set_scroll(BACK_CHIP,0,256);
         set_boot_visible(BACK_CHIP);
         clear_front_sprites();
-    } else if (source_frame>=434 && source_frame<=600) {
-        set_boot_visible(BACK_CHIP);
+    } else if (source_frame<=600) {
         boot_apply_title_delta(source_frame);
     }
 }
@@ -609,95 +548,15 @@ static void apply_bat_pairs(int chip,const unsigned short *stream,unsigned words
 
 static void set_baked_title_prompt(int visible)
 {
+    /* Source frame 600 is the settled no-PUSH title, so the first transition
+       out of the initial state is always blink-on. */
     if (g_prompt_visible==visible) return;
-    if (g_prompt_visible<0) {
-        /* Source frame 600 is the settled no-PUSH title. */
-        if (visible) apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,32);
-    } else if (visible) {
-        apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,32);
-    } else {
-        apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_off,BOOT_DUAL_BLINK_OFF_WORDS,32);
-    }
+    if (visible) apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,32);
+    else if (g_prompt_visible>0) apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_off,BOOT_DUAL_BLINK_OFF_WORDS,32);
     g_prompt_visible=visible;
 }
 
-static void preload_menu_step(void)
-{
-    /* Once source frame 433 has settled, VDC0's lower BAT half and the high
-       CHR area are free. Stage the first SMB menu there while the remaining
-       title animation is visible, eliminating the old black-frame bulk upload. */
-    const unsigned tile_words=(unsigned)g_menu_combo_asset.tile_count*TILE_WORDS;
-    const unsigned total=tile_words+960;
-    unsigned left=40,pos,n,i;
-    g_front_res_assets[2]=&g_menu_combo_asset;
-    g_front_res_bases[2]=(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS);
-    while (left && g_menu_preload_pos<total) {
-        pos=g_menu_preload_pos;
-        if (pos<tile_words) {
-            n=tile_words-pos; if (n>left) n=left;
-            vdc_set_vram_write(BACK_CHIP,(u16)(FRONT_TILE_BASE_WORD+pos));
-            for (i=0;i<n;++i) vdc_vram_write(BACK_CHIP,g_menu_combo_asset.tile_words[pos+i]);
-        } else {
-            pos-=tile_words; n=960-pos; if (n>left) n=left;
-            for (i=0;i<n;++i) {
-                unsigned ci=pos+i;
-                u16 e=g_menu_combo_asset.bat[(ci>>5)*g_menu_combo_asset.width_tiles+(ci&31)];
-                vdc_set_vram_write(BACK_CHIP,(u16)((32+(ci>>5))*BG_BAT_W+(ci&31)));
-                vdc_vram_write(BACK_CHIP,relocate_bat(e,(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS)));
-            }
-        }
-        g_menu_preload_pos+=n; left-=n;
-    }
-    if (g_menu_preload_pos>=total) g_menu_preloaded=1;
-}
 
-static void draw_title_prompt(int visible)
-{
-    static u16 satb[64*4];
-    int i,n=0;
-    for (i=0;i<64*4;++i) satb[i]=0;
-    if (visible) {
-        for (i=0;i<16;++i) tetsu_set_palette((u16)(240+i),g_push_palette[i]);
-        /* The extracted 96x16 crop has 9 px transparent left and 1 px top;
-           x=79/y=140 therefore places the visible pixels at the source bbox
-           x=88..167, y=141..149. Palette line 15 is unused by this title. */
-        for (i=0;i<6;++i)
-            set_sprite_entry(satb,n++,79+i*16,140,(u16)(PUSH_BASE_WORD+i*64),(u16)(VDC_SPR_PRIO_SP|15));
-    }
-    submit_front_satb(satb);
-}
-
-static void show_transition_panel(int panel)
-{
-    const BgAsset *a=&g_front_transition_asset;
-    u16 baseidx=front_asset_base(a);
-    int y,x,prev=g_transition_panel;
-    if (panel<0) panel=0; if (panel>60) panel=60;
-    if (g_last_front_asset!=a) { g_last_front_asset=a; prev=-1; }
-    if (panel==prev) return;
-    if (prev<0) {
-        for (y=0;y<30;++y) {
-            vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));
-            for (x=0;x<32;++x) {
-                u16 e=a->bat[y*a->width_tiles + panel*32+x];
-                vdc_vram_write(BACK_CHIP,relocate_bat(e,baseidx));
-            }
-        }
-    } else {
-        /* Only commit cells that changed between the two captured MD frames.
-           This keeps the 5-frame animation cadence cheap enough to update in
-           VBlank instead of visibly crawling through a full-screen upload. */
-        for (y=0;y<30;++y) for (x=0;x<32;++x) {
-            u16 e=a->bat[y*a->width_tiles + panel*32+x];
-            u16 o=a->bat[y*a->width_tiles + prev*32+x];
-            if (e==o) continue;
-            vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W+x));
-            vdc_vram_write(BACK_CHIP,relocate_bat(e,baseidx));
-        }
-    }
-    g_transition_panel=panel;
-    vdc_set_scroll(BACK_CHIP,0,0);
-}
 
 static void set_sprite_entry(u16 *satb, int index, int x, int y, u16 addr, u16 ctrl)
 {
@@ -820,13 +679,15 @@ static void upload_level_back(void)
     for(x=0;x<g_stage_set->tile_count*TILE_WORDS;++x)vdc_vram_write(BACK_CHIP,g_stage_set->tile_words[x]);
     for(y=0;y<30;++y){
         vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));
-        for(x=0;x<64;++x){u16 e=g_level->bg_bat[y*32+(x&31)];vdc_vram_write(BACK_CHIP,relocate_bat(e,FG_TILE_BASE_INDEX));}
+        /* The background plane is the Mega Drive's full 64-cell width; it
+           wraps every 512 pixels, not every 256. */
+        for(x=0;x<64;++x){u16 e=g_level->bg_bat[y*BG_BAT_W+x];vdc_vram_write(BACK_CHIP,relocate_bat(e,FG_TILE_BASE_INDEX));}
     }
 }
 
 static void init_level_ring(void)
 {
-    int col,i; g_last_front_asset=0;
+    int col,i;
     g_level=&g_game_levels[g_current_level]; g_stage_set=&g_stage_sets[g_level->set_index]; g_level_width_tiles=g_level->route_len*32;
     clear_bat(BACK_CHIP,BG_BAT_WORDS); clear_bat(FRONT_CHIP,FG_BAT_WORDS);
     upload_level_back();
@@ -1074,20 +935,6 @@ static void update_camera(void)
     vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
 }
 
-static void set_camera_x(int x)
-{
-    int max_camera=g_level_width_tiles*8-SCREEN_W;
-    if (x<0) x=0;
-    if (x>max_camera) x=max_camera;
-    g_camera_x=x;
-    g_camera_tile=x>>3;
-    {
-        int col;
-        for (col=0;col<FG_BAT_W;++col) stream_level_column(g_camera_tile+col);
-    }
-    vdc_set_scroll(FRONT_CHIP,(u16)(g_camera_x&0x01FF),0);
-    vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
-}
 
 static void init_moving_platforms(void)
 {
@@ -2138,12 +1985,6 @@ static void set_front_sprite_fade(int level)
     }
 }
 
-static int lerp_i(int a,int b,int num,int den)
-{
-    if (num<=0) return a;
-    if (num>=den) return b;
-    return a+(b-a)*num/den;
-}
 
 static void draw_boot_motion(unsigned f)
 {
@@ -2152,7 +1993,11 @@ static void draw_boot_motion(unsigned f)
     unsigned sf;
     for (i=0;i<64*4;++i) satb[i]=0;
 
-    if (f<60 || f>=421) {
+    /* Sprites cover the moving part of the opening only.  From source frame
+       348 the pair stands still and the captured frames carry it themselves,
+       so the wall can close over and behind it exactly as on the Mega Drive
+       instead of leaving a reconstructed hole around the sprites. */
+    if (f<60 || f>=348) {
         submit_front_satb(satb);
         return;
     }
@@ -2217,8 +2062,7 @@ static void show_menu_back(int choice)
 {
     int y,x;
     int panel=(choice==MENU_2P)?1:0;
-    u16 baseidx=front_asset_base(&g_menu_combo_asset);
-    g_last_front_asset=&g_menu_combo_asset;
+    u16 baseidx=(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS);
     for (y=0;y<30;++y) {
         vdc_set_vram_write(BACK_CHIP,(u16)((32+y)*BG_BAT_W));
         for (x=0;x<32;++x) {
@@ -2276,11 +2120,8 @@ static void enter_boot(void)
     upload_front_sprites();
     boot_exact_setup();
     g_boot_dual_load_pos=0;
-    g_menu_preload_pos=0;
-    g_menu_preloaded=0;
     g_state=STATE_BOOT;
     g_state_frame=0;
-    g_transition_panel=-1;
     g_prompt_visible=-1;
     g_menu_choice=MENU_1P;
     g_lives=4; g_continues=5; g_current_level=0; g_in_boss=0;
@@ -2345,8 +2186,7 @@ static void update_frontend(u16 pressed)
                 /* Stage menu CHR/BAT only after the title has reached black.
                    Writing the high VDC0 pattern area during the live reveal
                    caused the reported one-frame title corruption. */
-                if (!g_menu_preloaded) load_menu_asset();
-                g_last_front_asset=&g_menu_combo_asset;
+                load_menu_asset();
                 g_menu_choice=MENU_1P;
                 g_menu_sprite_fade=0;
                 vdc_set_scroll(BACK_CHIP,0,256);

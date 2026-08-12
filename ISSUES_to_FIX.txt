@@ -1,12 +1,4 @@
 
-The background in first level/second level, one of the clouds is missing tiles on its left side.
-
-There are some brief graphical glitches/corruption at titlescreen animation.
-
-You cannot throw crates up or down (the animation remains the same, just that the crate is throw up or down).
-
-The flying koopas are not flying, they are supposed to be (they fly through tiles also, in predetermined path)
-
 The game over for mario and luigi should have animation frames, yet are lacking, they are static.
 
 level 2 platform graphics are incorrect.

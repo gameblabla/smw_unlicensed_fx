@@ -16,6 +16,43 @@ BOSSREF=Path(os.environ.get('BOSSREF',str(PROJECT/'assets/reference/boss')))
 # fabricating extra bottom rows to reach 240 lines.
 CLOUD_BG_Y16_SLOTS={1,2,4}
 
+# The Mega Drive background plane is 64 cells wide and is loaded as two 32x32
+# maps: the descriptor writing to ...000 fills columns 0..31, the one writing
+# to ...040 fills columns 32..63 (32 cells = 0x40 bytes into the row).  Using
+# only the first map and repeating it every 32 cells, as r12m did, dropped
+# every cloud and hill that lives in the right half and cut in two the ones
+# that straddle the seam.
+BG_PLANE_W=64
+
+# Mega Drive display height in cells (V28 = 224 lines).  Anything the source
+# maps hold below this was never on screen.
+MD_VISIBLE_ROWS=28
+
+
+def row_is_empty(words,row):
+    return not any(w&0x7FF for w in words[row*32:row*32+32])
+
+
+def background_plane_halves(level_dir):
+    """The level's two background maps, left half first.
+
+    Falls back to using one map for both halves when the level loads the same
+    map twice, which is what several later slots do.
+    """
+    manifest=json.loads((level_dir/'manifest.json').read_text())
+    layers=manifest.get('extra_layers',[])
+    if not layers: return None
+    def half(suffix):
+        for i,l in enumerate(layers):
+            if l['vram_destination'].endswith(suffix):
+                f=next(level_dir.glob(f'extra_layer_{i:02d}_ROM_*_words_be.bin'))
+                return ba.read_words_be(f)
+        return None
+    left=half('000'); right=half('040')
+    if left is None: return None
+    return left,(right if right is not None else left)
+
+
 def b16(r,o): return int.from_bytes(r[o:o+2],'big')
 def b32(r,o): return int.from_bytes(r[o:o+4],'big')
 
@@ -75,6 +112,12 @@ def build_sets(stage_manifest):
                 # Mode-2 maps can contain the full 32 source rows. Ordinary
                 # V28 maps are 28 rows and extend their last row through 240.
                 sy=y if src_h>=30 else min(y,src_h-1)
+                # The Mega Drive only ever showed rows 0..27 (V28).  Where a
+                # 32-row map leaves the rows past that empty, the PC-FX's two
+                # extra rows would show the background straight through under
+                # the ground, so continue the last displayed row instead.
+                if y>=MD_VISIBLE_ROWS and sy>=MD_VISIBLE_ROWS and row_is_empty(words,sy):
+                    sy=MD_VISIBLE_ROWS-1
                 for x in range(32): segbat.append(ba.append_genesis_word(words[sy*32+x],vram,tiles,lookup))
             bat.extend(segbat)
             cf=next(sd.glob('collision_ROM_*.bin')).read_bytes(); collisions.extend(cf[:1024])
@@ -82,10 +125,10 @@ def build_sets(stage_manifest):
         bgs={}
         for slot in sx['level_slots']:
             ld=KIT/f'graphics/levels/level_{slot:02d}'; vv=(ld/'assembled_vram.bin').read_bytes()
-            fs=sorted(ld.glob('extra_layer_00_ROM_*_words_be.bin'))
-            if fs:
-                ww=ba.read_words_be(fs[0]); bb=[]
-                src_h=max(1,len(ww)//32)
+            halves=background_plane_halves(ld)
+            if halves:
+                left,right=halves; bb=[]
+                src_h=max(1,len(left)//32)
                 for y in range(30):
                     if slot in CLOUD_BG_Y16_SLOTS and src_h>=28:
                         # Preserve the actual 224-line source (rows 0..27) and
@@ -94,8 +137,9 @@ def build_sets(stage_manifest):
                         sy=0 if y<2 else min(y-2,27)
                     else:
                         sy=y if src_h>=30 else min(y,src_h-1)
-                    for x in range(32): bb.append(ba.append_genesis_word(ww[sy*32+x],vv,tiles,lookup))
-            else: bb=[0]*(32*30)
+                    for half in (left,right):
+                        for x in range(32): bb.append(ba.append_genesis_word(half[sy*32+x],vv,tiles,lookup))
+            else: bb=[0]*(BG_PLANE_W*30)
             bgs[slot]=bb
         tw=[]
         for t in tiles: tw.extend(ba.encode_bg_tile(t))

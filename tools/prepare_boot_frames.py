@@ -59,6 +59,7 @@ def stabilize_partial_title(im):
     # Any visible wall cell should already use its final settled graphic.
     for ty in range(16,30):
         for tx in range(32):
+            if (tx,ty) in PAIR_CELLS: continue
             box=(tx*8,ty*8,tx*8+8,ty*8+8)
             cell=im.crop(box)
             if any(px!=(0,0,0) for px in cell.getdata()):
@@ -87,12 +88,32 @@ def stabilize_bottom(im):
     return out
 
 
-for path in sorted(SRC.glob('f*.png')):
-    n=int(path.stem[1:])
-    if n==432:
-        im=Image.open(SRC/'f0431.png').convert('RGB')
-    else:
-        im=Image.open(path).convert('RGB')
+# 8x8 cells covered by the baked Mario/Luigi pair once it has come to rest
+# (source bounding box x 102..157, y 162..200).  From frame 348 the pair no
+# longer moves, so it is kept exactly as the Mega Drive drew it instead of
+# being cut out and redrawn with sprites: the wall closes over and behind it
+# cell for cell, which no reconstruction of the hidden cells can reproduce.
+PAIR_CELLS={(tx,ty) for ty in range(20,26) for tx in range(12,20)}
+
+def mean_luma(im):
+    g=im.convert('L')
+    return sum(g.getdata())/(g.width*g.height)
+
+
+# A capture drop-out (a black frame between two lit ones) is encoded by
+# build_boot_exact.py as a full-screen 800-tile CHR rewrite, which does not fit
+# in one PC-FX VBlank and shows up as a flicker/tearing burst.  Refuse to build
+# from such a capture; tools/recapture_boot_frames.py repairs it from the ROM.
+frames={int(p.stem[1:]):Image.open(p).convert('RGB') for p in sorted(SRC.glob('f*.png'))}
+order=sorted(frames)
+dropouts=[n for n in order[1:-1]
+          if mean_luma(frames[n])<min(mean_luma(frames[n-1]),mean_luma(frames[n+1]))-20]
+if dropouts:
+    raise SystemExit('capture drop-outs at %s; run tools/recapture_boot_frames.py' % dropouts)
+
+for n in order:
+    path=SRC/f'f{n:04d}.png'
+    im=frames[n]
 
     # 60..347 contains only the moving character/coin composition over black.
     # Render those objects with VDC sprites instead of repeatedly rewriting CHR.
@@ -101,14 +122,6 @@ for path in sorted(SRC.glob('f*.png')):
     else:
         im=clean_generic_overscan(im)
 
-    # Once the head wall begins, the character pair remains in a clean black
-    # central opening until the dual-VDC title sequence takes over at frame 421.
-    # Remove only that baked pair so runtime sprites can occupy it cleanly.
-    if 348 <= n <= 420:
-        px=im.load()
-        for y in range(100,208):
-            for x in range(40,220):
-                px[x,y]=(0,0,0)
 
     if 400 <= n <= 600:
         im=clean_title_top(im)
