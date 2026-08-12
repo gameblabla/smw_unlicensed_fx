@@ -1982,17 +1982,6 @@ static void update_play(u16 btn, u16 pressed)
     }
     if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;}
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
-    if (!g_in_boss && g_current_level==2 && g_game_fade_level==16 && (g_state_frame&7)==0) {
-        /* The castle lava uses a four-step colour chase in the MD VDP.  Cycle
-           the three hot entries without rewriting the whole stage palette. */
-        int phase=(g_state_frame>>3)&3;
-        static const unsigned char lava_idx[4]={9,10,11,10};
-        int a=lava_idx[phase],b=lava_idx[(phase+1)&3],c=lava_idx[(phase+2)&3];
-        tetsu_set_palette(49,g_level->palette[48+a]);
-        tetsu_set_palette(50,g_level->palette[48+b]);
-        tetsu_set_palette(51,g_level->palette[48+c]);
-    }
-
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
         g_vy+=64;
