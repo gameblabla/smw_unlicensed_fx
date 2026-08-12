@@ -570,7 +570,8 @@ static void king_title_begin(void)
     for(i=0;i<256;++i)tetsu_set_palette((u16)i,g_king_title_palette[i]);
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,VDC_CR_SB);
     tetsu_set_vdc_palette_split();
-    tetsu_set_priorities(0,1,2,0,0,0,0);
+    /* The walking pair must remain above every newly revealed KING tile. */
+    tetsu_set_priorities(0,3,2,0,0,0,0);
     tetsu_set_video_mode(TETSU_LINES_262,0,TETSU_DOTCLOCK_5MHz,TETSU_COLORS_256,TETSU_COLORS_16,0,1,1,0,0,0,0);
     king_title_upload_rect_page(0,0,0,256,256);
     king_title_upload_rect_page(1,0,0,256,256);g_king_title_active=1;
@@ -2259,11 +2260,12 @@ static void draw_boot_motion(unsigned f)
         else if (sf<238) walk=1;
         else            walk=3;
     } else if (sf<342) {
-        mx=96; lx=132; walk=4;
+        mx=96; lx=128; walk=4;
         if (sf<=294) py=153-(int)(sf-246);
         else         py=105+(int)(sf-294);
     } else {
-        mx=96; lx=132; py=153; walk=1;
+        /* Their 32-pixel sprites meet exactly, matching the completed pose. */
+        mx=96; lx=128; py=153; walk=1;
     }
 
     fade=(sf<108)?(int)((sf-60)*16/48):16;
