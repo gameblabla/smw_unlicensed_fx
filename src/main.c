@@ -46,8 +46,13 @@ extern void pcfx_tetsu_wait_frame(void);
 #define FRONT_TILE_BASE_WORD 0xD000
 
 #define PLAYER_BASE_WORD 0x4800
+/* Boot-only character banks live below the dual-title CHR area and do not
+   overlap each other.  r12k-r12m incorrectly reused PLAYER_BASE_WORD and
+   LUIGI_BASE_WORD; Luigi's 0x1E00-word upload at 0x4000 overwrote Mario at
+   0x4800, which made early Mario frames fetch Luigi patterns. */
+#define BOOT_MARIO_BASE_WORD 0x1000
+#define BOOT_LUIGI_BASE_WORD 0x3000
 #define THROW_BASE_WORD  0x6600
-#define LUIGI_BASE_WORD  0x4000
 #define MENU_MARIO_BASE_WORD 0x8400
 #define MENU_LUIGI_BASE_WORD 0x8A00
 #define PUSH_BASE_WORD   0x5E00
@@ -71,6 +76,13 @@ extern void pcfx_tetsu_wait_frame(void);
 
 #define PLAYER_FRAME_WORDS_LOCAL 384
 #define PLAYER_STRIP_WORDS 128
+#define BOOT_PLAYER_BANK_WORDS (PLAYER_FRAME_COUNT * PLAYER_FRAME_WORDS_LOCAL)
+#if (BOOT_MARIO_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > BOOT_LUIGI_BASE_WORD
+#error "boot Mario/Luigi VRAM banks overlap"
+#endif
+#if (BOOT_LUIGI_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > PUSH_BASE_WORD
+#error "boot Luigi bank overlaps title sprite assets"
+#endif
 #define HUD_CELL_WORDS 64
 #define ENEMY_VARIANT_WORDS ENEMY_VARIANT_VRAM_WORDS
 #define BOSS_BASE_WORD 0xB000
@@ -558,7 +570,12 @@ static void boot_dual_apply(unsigned source_frame)
     else if (source_frame==427) { vdc_set_scroll(BACK_CHIP,256,0); set_boot_visible(BACK_CHIP); build_frame429_step(); }
     else if (source_frame==428) { vdc_set_scroll(FRONT_CHIP,256,256); set_boot_visible(FRONT_CHIP); build_frame429_step(); }
     else if (source_frame>=429 && source_frame<=431) { vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP); }
-    else if (source_frame==432) set_boot_visible(-1);
+    else if (source_frame==432) {
+        /* The source capture's isolated blank refresh is intentionally held as
+           frame 431.  Do not disable both VDCs here: that caused the visible
+           one-frame flash in r12k-r12m. */
+        vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP);
+    }
     else if (source_frame==433) { vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP); }
     else if (source_frame>=434 && source_frame<=600) { set_boot_visible(BACK_CHIP); boot_apply_title_delta(source_frame); }
 }
@@ -711,19 +728,12 @@ static void set_sprite_entry(u16 *satb, int index, int x, int y, u16 addr, u16 c
 static void upload_front_sprites(void)
 {
     int i;
-    vdc_set_vram_write(FRONT_CHIP,PLAYER_BASE_WORD);
+    /* Opening animation uses dedicated, non-overlapping character banks.
+       Gameplay/death graphics are uploaded later by upload_game_sprites(). */
+    vdc_set_vram_write(FRONT_CHIP,BOOT_MARIO_BASE_WORD);
     for (i=0;i<PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL;++i)
         vdc_vram_write(FRONT_CHIP,g_player_frame_words[i]);
-    /* Throw metasprite: 32x32 left block followed by a 16x32 right block.
-       HuC6270 16x32 sprites fetch their lower cell at pattern +2, so the
-       right-hand block needs one 16x16 pattern-sized hole in VRAM. */
-    vdc_set_vram_write(FRONT_CHIP,THROW_BASE_WORD);
-    for (i=0;i<256;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,(u16)(THROW_BASE_WORD+256));
-    for (i=256;i<320;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,(u16)(THROW_BASE_WORD+384));
-    for (i=320;i<384;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,LUIGI_BASE_WORD);
+    vdc_set_vram_write(FRONT_CHIP,BOOT_LUIGI_BASE_WORD);
     for (i=0;i<PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL;++i)
         vdc_vram_write(FRONT_CHIP,g_luigi_frame_words[i]);
     vdc_set_vram_write(FRONT_CHIP,PUSH_BASE_WORD);
@@ -2115,8 +2125,8 @@ static void draw_boot_motion(unsigned f)
     if (fade<0) fade=0; if (fade>16) fade=16;
     set_front_sprite_fade(fade);
 
-    add_front_player(satb,&n,mx,py,walk,PLAYER_BASE_WORD,1);
-    add_front_player(satb,&n,lx,py,walk,LUIGI_BASE_WORD,-1);
+    add_front_player(satb,&n,mx,py,walk,BOOT_MARIO_BASE_WORD,1);
+    add_front_player(satb,&n,lx,py,walk,BOOT_LUIGI_BASE_WORD,-1);
 
     /* Coin/moon stays fixed until frame 276, then exits up-left at the exact
        captured -1x/-2y cadence.  Palette line 14 is reserved for it. */
