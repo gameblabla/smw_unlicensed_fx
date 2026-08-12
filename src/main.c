@@ -8,7 +8,7 @@
  *   TETSU  : 262-line, 5 MHz dot clock
  *   VDC0   : Mega Drive Plane B analogue (background/parallax)
  *   VDC1   : Mega Drive Plane A analogue + sprites/HUD
- *   KING/RAINBOW unused; audio is stubbed.
+ *   KING BG0: title-wall software framebuffer only; audio is stubbed.
  *
  * Source geometry is not vertically centered. The MD V28 active picture starts
  * at the native raster position; the PC-FX BATs and metasprite anchors use the
@@ -18,9 +18,12 @@
 #include <pcfx/vdc.h>
 #include <pcfx/tetsu.h>
 #include <pcfx/contrlr.h>
+#include <pcfx/king.h>
+#include <string.h>
 #include "assets_generated.h"
 #include "boot_exact.h"
 #include "boot_dual.h"
+#include "king_title.h"
 #include "audio_stub.h"
 #include "game_levels_generated.h"
 
@@ -251,10 +254,12 @@ static int g_throw_timer;
 static int g_camera_hold;
 static int g_prev_body_y;
 static unsigned g_boot_dual_load_pos;
-static unsigned g_boot_frame429_build_pos;
 static unsigned g_menu_preload_pos;
 static int g_menu_preloaded;
 static u16 g_title_exact_palette[256];
+static unsigned char g_king_title_fb[256*256];
+static int g_king_title_active;
+static int g_king_title_page;
 
 static void preload_menu_step(void);
 static int g_fireball_ammo;
@@ -515,62 +520,102 @@ static void set_boot_visible(int chip)
     }
 }
 
-static void boot_dual_preload_step(unsigned source_frame)
+static void king_title_microprogram(void)
 {
-    /* Seven complete 32x30 BATs are pre-positioned in the unused quadrants of
-       the two 64x64 VDC maps.  The costly 421..428 full-screen alternation is
-       therefore just a CR + scroll change, not a bulk upload. */
-    const unsigned total=(unsigned)BOOT_DUAL_BACK_TILE_WORDS+
-                         (unsigned)BOOT_DUAL_BACK_PRE_WORDS+
-                         (unsigned)BOOT_DUAL_FRONT_TILE_WORDS+
-                         (unsigned)BOOT_DUAL_FRONT_PRE_WORDS;
-    unsigned left,pos,n,i;
-    if (source_frame<30 || g_boot_dual_load_pos>=total) return;
-    left=128;
-    while (left && g_boot_dual_load_pos<total) {
-        pos=g_boot_dual_load_pos;
-        if (pos<BOOT_DUAL_BACK_TILE_WORDS) {
-            n=BOOT_DUAL_BACK_TILE_WORDS-pos; if (n>left) n=left;
-            vdc_set_vram_write(BACK_CHIP,(u16)(BOOT_DUAL_BACK_BASE_WORD+pos));
-            for (i=0;i<n;++i) vdc_vram_write(BACK_CHIP,g_boot_dual_back_tiles[pos+i]);
-        } else if ((pos-=BOOT_DUAL_BACK_TILE_WORDS)<BOOT_DUAL_BACK_PRE_WORDS) {
-            n=BOOT_DUAL_BACK_PRE_WORDS-pos; if (n>left) n=left;
-            for (i=0;i<n;++i) {
-                unsigned bi=pos+i,screen=bi/960,ci=bi%960;
-                static const unsigned rb[3]={32,32,0};
-                static const unsigned cb[3]={0,32,32};
-                vdc_set_vram_write(BACK_CHIP,(u16)((rb[screen]+(ci>>5))*BG_BAT_W+cb[screen]+(ci&31)));
-                vdc_vram_write(BACK_CHIP,g_boot_dual_back_pre[bi]);
-            }
-        } else if ((pos-=BOOT_DUAL_BACK_PRE_WORDS)<BOOT_DUAL_FRONT_TILE_WORDS) {
-            n=BOOT_DUAL_FRONT_TILE_WORDS-pos; if (n>left) n=left;
-            vdc_set_vram_write(FRONT_CHIP,(u16)(BOOT_DUAL_FRONT_BASE_WORD+pos));
-            for (i=0;i<n;++i) vdc_vram_write(FRONT_CHIP,g_boot_dual_front_tiles[pos+i]);
-        } else {
-            n=BOOT_DUAL_FRONT_PRE_WORDS-(pos-=BOOT_DUAL_FRONT_TILE_WORDS); if (n>left) n=left;
-            for (i=0;i<n;++i) {
-                unsigned bi=pos+i,screen=bi/960,ci=bi%960;
-                static const unsigned rb[4]={0,0,32,32};
-                static const unsigned cb[4]={0,32,0,32};
-                vdc_set_vram_write(FRONT_CHIP,(u16)((rb[screen]+(ci>>5))*FG_BAT_W+cb[screen]+(ci&31)));
-                vdc_vram_write(FRONT_CHIP,g_boot_dual_front_pre[bi]);
-            }
-        }
-        g_boot_dual_load_pos+=n; left-=n;
+    u16 mp[16]; int i;
+    for(i=0;i<16;++i)mp[i]=(u16)(KING_CODE_BG0_CG_0+(i&7));
+    king_write_microprogram(mp,0,16);
+}
+
+static void tetsu_set_vdc_palette_split(void)
+{
+    /* Register 4 is byte-swapped palette offsets.  0x80 in the sprite byte
+       selects VCE entry 256, keeping VDC sprites out of KING's 0..255. */
+    __asm__ volatile ("out.h %0, 0x300[r0]" : : "r"(4));
+    __asm__ volatile ("out.h %0, 0x304[r0]" : : "r"(0x8000));
+}
+
+static void king_title_upload_rect_page(int page,int x,int y,int w,int h)
+{
+    int yy,xx;
+    x&=~1; w=(w+1)&~1;
+    for(yy=0;yy<h;++yy){
+        king_set_kram_write((u32)(page*32768+(y+yy)*128+x/2),1);
+        for(xx=0;xx<w;xx+=2)
+            king_kram_write((u16)((g_king_title_fb[(y+yy)*256+x+xx]<<8)|g_king_title_fb[(y+yy)*256+x+xx+1]));
     }
 }
 
-static void build_frame429_step(void)
+static void king_title_present_rect(int x,int y,int w,int h)
 {
-    unsigned i,n=120;
-    if (g_boot_frame429_build_pos>=960) return;
-    if (g_boot_frame429_build_pos+n>960) n=960-g_boot_frame429_build_pos;
-    for (i=0;i<n;++i) {
-        unsigned ci=g_boot_frame429_build_pos+i;
-        vdc_set_vram_write(BACK_CHIP,(u16)((ci>>5)*BG_BAT_W+(ci&31)));
-        vdc_vram_write(BACK_CHIP,g_boot_dual_frame429[ci]);
-    }
-    g_boot_frame429_build_pos+=n;
+    int next=g_king_title_page^1;
+    king_title_upload_rect_page(next,x,y,w,h);
+    king_set_bat_cg_addr(KING_BG0,0,(u32)(next*32));
+    g_king_title_page=next;
+    /* Keep both pages coherent so the next dirty update can stay tile-local. */
+    king_title_upload_rect_page(next^1,x,y,w,h);
+}
+
+static void king_title_begin(void)
+{
+    int i;
+    for(i=0;i<256*256;++i)g_king_title_fb[i]=KING_TITLE_BLACK;
+    king_init(); king_set_kram_pages(0,0,0,0);
+    king_set_bg_mode(KING_BGMODE_256_PAL,KING_BGMODE_NONE,KING_BGMODE_NONE,KING_BGMODE_NONE);
+    king_set_bg_prio(KING_BGPRIO_3,KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,0);
+    king_set_bg_size(KING_BG0,KING_BGSIZE_256,KING_BGSIZE_256,KING_BGSIZE_256,KING_BGSIZE_256);
+    g_king_title_page=0;
+    king_set_bat_cg_addr(KING_BG0,0,0); king_set_scroll(KING_BG0,0,0);
+    king_title_microprogram(); king_enable_microprogram();
+    for(i=0;i<256;++i)tetsu_set_palette((u16)i,g_king_title_palette[i]);
+    vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,VDC_CR_SB);
+    tetsu_set_vdc_palette_split();
+    tetsu_set_priorities(0,1,2,0,0,0,0);
+    tetsu_set_video_mode(TETSU_LINES_262,0,TETSU_DOTCLOCK_5MHz,TETSU_COLORS_256,TETSU_COLORS_16,0,1,1,0,0,0,0);
+    king_title_upload_rect_page(0,0,0,256,256);
+    king_title_upload_rect_page(1,0,0,256,256);g_king_title_active=1;
+}
+
+static void king_title_draw_block(int index)
+{
+    int col=index%6,row=index/6,x=5+col*41,y=row*41,xx,yy;
+    const unsigned char *src=((row+col)&1)?g_king_luigi_block:g_king_mario_block;
+    if(row>=6)return;
+    for(yy=0;yy<41;++yy)for(xx=0;xx<41;++xx)g_king_title_fb[(y+yy)*256+x+xx]=src[yy*41+xx];
+    king_title_present_rect(x,y,42,41);
+}
+
+static void king_title_show_final(void)
+{
+    int y;
+    for(y=0;y<240;++y)memcpy(&g_king_title_fb[y*256],&g_king_title_final[y*256],256);
+    king_title_present_rect(0,0,256,240);
+}
+
+static void king_title_set_prompt(int visible)
+{
+    int y;const unsigned char *src=visible?g_king_title_push:g_king_title_final;
+    for(y=136;y<154;++y)memcpy(&g_king_title_fb[y*256],&src[y*256],256);
+    king_title_present_rect(0,136,256,18);
+}
+
+static void king_title_end(void)
+{
+    if(!g_king_title_active)return;
+    king_disable_microprogram();king_set_bg_mode(KING_BGMODE_NONE,KING_BGMODE_NONE,KING_BGMODE_NONE,KING_BGMODE_NONE);
+    g_king_title_active=0;init_video();
+}
+
+static void boot_dual_preload_step(unsigned source_frame)
+{
+    unsigned i,n;
+    if (source_frame<30 || g_boot_dual_load_pos>=BOOT_DUAL_BACK_TILE_WORDS) return;
+    n=BOOT_DUAL_BACK_TILE_WORDS-g_boot_dual_load_pos;
+    if (n>128) n=128;
+    vdc_set_vram_write(BACK_CHIP,(u16)(BOOT_DUAL_BACK_BASE_WORD+g_boot_dual_load_pos));
+    for (i=0;i<n;++i)
+        vdc_vram_write(BACK_CHIP,g_boot_dual_back_tiles[g_boot_dual_load_pos+i]);
+    g_boot_dual_load_pos+=n;
 }
 
 static void boot_apply_title_delta(unsigned source_frame)
@@ -587,27 +632,17 @@ static void boot_apply_title_delta(unsigned source_frame)
 
 static void boot_dual_apply(unsigned source_frame)
 {
-    /* Frame positions: VDC0 BL=422, BR=424, TR=427; VDC1 TL=421,
-       TR=423, BL=426, BR=428.  Once VDC0 TL is no longer needed for frame
-       420, frame429 is built there in eight 120-cell slices while another
-       quadrant/VDC is visible. */
-    if (source_frame==421) { vdc_set_scroll(FRONT_CHIP,0,0); set_boot_visible(FRONT_CHIP); build_frame429_step(); }
-    else if (source_frame==422) { vdc_set_scroll(BACK_CHIP,0,256); set_boot_visible(BACK_CHIP); build_frame429_step(); }
-    else if (source_frame==423) { vdc_set_scroll(FRONT_CHIP,256,0); set_boot_visible(FRONT_CHIP); build_frame429_step(); }
-    else if (source_frame==424) { vdc_set_scroll(BACK_CHIP,256,256); set_boot_visible(BACK_CHIP); build_frame429_step(); }
-    else if (source_frame==425) { vdc_set_scroll(BACK_CHIP,256,256); set_boot_visible(BACK_CHIP); build_frame429_step(); }
-    else if (source_frame==426) { vdc_set_scroll(FRONT_CHIP,0,256); set_boot_visible(FRONT_CHIP); build_frame429_step(); }
-    else if (source_frame==427) { vdc_set_scroll(BACK_CHIP,256,0); set_boot_visible(BACK_CHIP); build_frame429_step(); }
-    else if (source_frame==428) { vdc_set_scroll(FRONT_CHIP,256,256); set_boot_visible(FRONT_CHIP); build_frame429_step(); }
-    else if (source_frame>=429 && source_frame<=431) { vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP); }
-    else if (source_frame==432) {
-        /* The source capture's isolated blank refresh is intentionally held as
-           frame 431.  Do not disable both VDCs here: that caused the visible
-           one-frame flash in r12k-r12m. */
+    if (source_frame==433) {
+        unsigned ci;
+        /* The exact stream has already completed the visible wall.  Switch
+           its identical image to the compact title pattern library once. */
+        for (ci=0;ci<960;++ci) {
+            vdc_set_vram_write(BACK_CHIP,(u16)((ci>>5)*BG_BAT_W+(ci&31)));
+            vdc_vram_write(BACK_CHIP,g_boot_dual_frame429[ci]);
+        }
         vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP);
     }
-    else if (source_frame==433) { vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP); }
-    else if (source_frame>=434 && source_frame<=600) { set_boot_visible(BACK_CHIP); boot_apply_title_delta(source_frame); }
+    else if (source_frame>=434 && source_frame<=600) { vdc_set_scroll(BACK_CHIP,0,0); set_boot_visible(BACK_CHIP); boot_apply_title_delta(source_frame); }
 }
 
 static void draw_boot_motion(unsigned f);
@@ -627,7 +662,7 @@ static void boot_exact_apply(unsigned frame)
         g_title_exact_palette[pi]=value;
     }
     n=*p++;
-    if (source_frame>=421) {
+    if (source_frame>=433) {
         boot_dual_apply(source_frame);
         return;
     }
@@ -656,11 +691,11 @@ static void set_baked_title_prompt(int visible)
     if (g_prompt_visible==visible) return;
     if (g_prompt_visible<0) {
         /* Source frame 600 is the settled no-PUSH title. */
-        if (visible) apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,0);
+        if (visible) apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,32);
     } else if (visible) {
-        apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,0);
+        apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_on,BOOT_DUAL_BLINK_ON_WORDS,32);
     } else {
-        apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_off,BOOT_DUAL_BLINK_OFF_WORDS,0);
+        apply_bat_pairs(BACK_CHIP,g_boot_dual_blink_off,BOOT_DUAL_BLINK_OFF_WORDS,32);
     }
     g_prompt_visible=visible;
 }
@@ -2173,12 +2208,12 @@ static void add_front_player(u16 *satb, int *n, int x, int y, int frame, u16 bas
 
 static void set_front_sprite_fade(int level)
 {
-    int i;
+    int i,base=g_king_title_active?256:0;
     /* Keep opening sprites completely separate from the exact-title BG
        palettes: line 15 = Mario/Luigi, line 14 = moon/coin. */
     for (i=0;i<16;++i) {
-        tetsu_set_palette((u16)(240+i),fade_yuv(g_player_palette[i],level));
-        tetsu_set_palette((u16)(224+i),fade_yuv(g_coin_palette[i],level));
+        tetsu_set_palette((u16)(base+240+i),fade_yuv(g_player_palette[i],level));
+        tetsu_set_palette((u16)(base+224+i),fade_yuv(g_coin_palette[i],level));
     }
 }
 
@@ -2270,7 +2305,7 @@ static void show_menu_back(int choice)
             vdc_vram_write(BACK_CHIP,relocate_bat(e,baseidx));
         }
     }
-    vdc_set_scroll(BACK_CHIP,0,256);
+    vdc_set_scroll(BACK_CHIP,0,0);
 }
 
 static void menu_overlay_setup(void)
@@ -2316,13 +2351,14 @@ static void draw_menu_people(int walking)
 
 static void enter_boot(void)
 {
+    king_title_end();
     show_black();
     upload_front_sprites();
     boot_exact_setup();
     g_boot_dual_load_pos=0;
-    g_boot_frame429_build_pos=0;
     g_menu_preload_pos=0;
     g_menu_preloaded=0;
+    g_king_title_active=0;
     g_state=STATE_BOOT;
     g_state_frame=0;
     g_transition_panel=-1;
@@ -2338,10 +2374,10 @@ static void enter_title_fade(void)
        touching palettes.  r7 faded using the separately converted static
        title palette, whose palette-line assignment does not match the exact
        frame stream and produced the black/checker corruption on RUN. */
-    set_boot_visible(BACK_CHIP);
-    vdc_set_scroll(BACK_CHIP,0,0);
-    vdc_set_scroll(FRONT_CHIP,0,0);
-    clear_front_sprites();
+    if(!g_king_title_active){
+        set_boot_visible(BACK_CHIP);vdc_set_scroll(BACK_CHIP,0,0);
+        vdc_set_scroll(FRONT_CHIP,0,0);clear_front_sprites();
+    }
     g_state=STATE_TITLE_FADE;
     g_state_frame=0;
 }
@@ -2363,7 +2399,13 @@ static void update_frontend(u16 pressed)
     if (g_state==STATE_BOOT) {
         if (g_state_frame<BOOT_EXACT_FRAME_COUNT) {
             /* One PC-FX frame for every captured Mega Drive frame 12..600. */
-            boot_exact_apply(g_state_frame);
+            unsigned sf=g_state_frame+BOOT_EXACT_FIRST_MD_FRAME;
+            if(sf==348)king_title_begin();
+            if(sf>=348&&sf<420){
+                if((sf&1)==0)king_title_draw_block((int)((sf-348)/2));
+                draw_boot_motion(sf);
+            }else if(sf==420)king_title_show_final();
+            else if(sf<348)boot_exact_apply(g_state_frame);
         } else {
             int vis=(int)(((g_state_frame-BOOT_EXACT_FRAME_COUNT)/60)&1)!=0;
             if (g_state_frame==BOOT_EXACT_FRAME_COUNT) {
@@ -2371,9 +2413,9 @@ static void update_frontend(u16 pressed)
                    Do not reload/recenter it: that one-frame replacement was
                    the idle title glitch in r6. */
                 g_prompt_visible=0;
-                set_boot_visible(BACK_CHIP);
+                if(!g_king_title_active)set_boot_visible(BACK_CHIP);
             }
-            set_baked_title_prompt(vis);
+            if(g_king_title_active)king_title_set_prompt(vis);else set_baked_title_prompt(vis);
             if (pressed&(JOY_RUN|JOY_I|JOY_II)) {
                 enter_title_fade(); return;
             }
@@ -2383,10 +2425,11 @@ static void update_frontend(u16 pressed)
            begins returning after ~760 and is fully bright at ~840. */
         if (g_state_frame<90) {
             int level=16-(int)(g_state_frame*16/90);
-            set_title_exact_palette_fade(level);
-            clear_front_sprites();
+            if(g_king_title_active){int i;for(i=0;i<256;++i)tetsu_set_palette((u16)i,fade_yuv(g_king_title_palette[i],level));}
+            else {set_title_exact_palette_fade(level);clear_front_sprites();}
         } else if (g_state_frame<110) {
             if (g_state_frame==90) {
+                king_title_end();
                 /* Stage menu CHR/BAT only after the title has reached black.
                    Writing the high VDC0 pattern area during the live reveal
                    caused the reported one-frame title corruption. */

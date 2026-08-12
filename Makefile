@@ -16,7 +16,7 @@ LDFLAGS := -L$(V810GCC)/lib -L$(V810GCC)/$(PREFIX)/lib \
            -L$(V810GCC)/lib/gcc/$(PREFIX)/4.9.4 \
            $(V810GCC)/$(PREFIX)/lib/crt0.o --gc-sections
 LIBS := -lpcfx -lc -lsim -lgcc
-SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/game_levels_generated.c
+SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/king_title.c src/audio_stub.c src/game_levels_generated.c
 ASM_SRCS := src/pcfx_tetsu_wait.S
 OBJS := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRCS)) $(patsubst src/%.S,$(OBJDIR)/%.o,$(ASM_SRCS))
 ELF := $(OBJDIR)/$(TARGET).elf
@@ -30,6 +30,7 @@ assets:
 	python3 tools/build_assets.py --kit $(KIT) --rom $(ROM) --project .
 	python3 tools/build_boot_exact.py --frames assets/derived/boot_exact_fixed --project . --first 12 --last 600
 	python3 tools/build_boot_dual.py
+	python3 tools/build_king_title.py
 	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) python3 tools/build_full_game.py
 $(OBJDIR)/%.o: src/%.c
 	@mkdir -p $(dir $@)
