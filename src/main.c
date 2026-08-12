@@ -169,7 +169,6 @@ typedef struct {
     unsigned char defeated;
     unsigned char flying;
     unsigned char flight_phase;
-    short home_y;
 } Enemy;
 
 typedef struct {
@@ -1071,6 +1070,16 @@ static const signed char g_stomp_bounce_dy[18]={
     -4,-4,-3,-3,-3,-2,-2,-1,-1,0,1,1,2,2,3,3,4,4
 };
 
+/* Exact state-18 flying-enemy path table at Mega Drive ROM $C832. Handler
+   $B794 subtracts one pixel from X, adds one signed entry to Y, then wraps
+   the index before 58. The entries sum to zero, so the patrol never drifts. */
+static const signed char g_flying_koopa_dy[58]={
+    -4,-4,-4,-3,-3,-3,-3,-2,-2,-2,-2,-1,-1,-1, 0,
+     1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
+     4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 0,-1,
+    -1,-1,-2,-2,-2,-2,-3,-3,-3,-3,-4,-4,-4
+};
+
 static void update_camera(void)
 {
     if(g_in_boss){g_camera_x=0;g_camera_tile=0;vdc_set_scroll(FRONT_CHIP,0,0);vdc_set_scroll(BACK_CHIP,0,0);return;}
@@ -1182,16 +1191,14 @@ static void init_objects(void)
         for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){g_gems[i].x=g_level->gems[i*2];g_gems[i].y=g_level->gems[i*2+1];g_gems[i].active=1;}
         for(i=0;i<g_level->enemy_count && i<MAX_ENEMIES;++i){
             const short *e=&g_level->enemies[i*7];
-            int gi;
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)e[1]<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
-            gi=g_level->variant_ids[g_enemies[i].variant];
-            /* Graphics family $14 is the winged Koopa family.  Earlier
-               generated records discarded this identity and gravity turned
-               every one into a ground walker. */
-            g_enemies[i].flying=(gi==2||gi==8||gi==9);
-            g_enemies[i].home_y=e[1];g_enemies[i].flight_phase=(unsigned char)(i*23);
+            /* Record word 9 is the original handler state. State 18 dispatches
+               to $B794 (flying Koopas); state 17 dispatches to $B7D2 and is
+               used by grounded enemies, including every Goomba variant. */
+            g_enemies[i].flying=(e[3]==18);
+            g_enemies[i].flight_phase=0;
         }
     }
     init_moving_platforms();
@@ -1440,12 +1447,12 @@ static void update_enemies(void)
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
 
         if (e->flying) {
-            int ph=(e->flight_phase+g_state_frame)&127;
-            int wave=(ph<32)?ph:(ph<64?64-ph:(ph<96?64-ph:ph-128));
-            e->x+=e->vx;
-            e->y=(s32)(e->home_y+wave)<<FIX_SHIFT;
+            e->x-=FIX_ONE;
+            e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
+            if(++e->flight_phase>=58)e->flight_phase=0;
             x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
-            /* Predetermined patrols ignore stage collision by design. */
+            /* $B794 never calls the terrain probes: the predetermined patrol
+               deliberately passes through stage tiles. */
             goto enemy_attack_checks;
         }
 
