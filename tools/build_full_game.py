@@ -390,10 +390,11 @@ def make_crate_walk_frames(r):
     return frames,masks
 
 def build_enemy_variants(r,levels):
-    # Graphics family 0 is the shared Goomba/Koopa family. Its source table
-    # contains two walking poses only; selector 3 is not a death/hit image.
-    # All other runtime enemy families provide a third impact pose.
-    no_hit_frame_gfx={0}
+    # The Goomba/Koopa graphics families have two walking poses only.
+    # Selector 3 in these tables is not a death/hit image, so never advertise
+    # it to the renderer as one. Family 0 is the later shared variant; 16--20
+    # are the normal early-game colour/species families from the ROM tables.
+    no_hit_frame_gfx={0,16,17,18,19,20}
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text()); byid={m['id']:m for m in allm}
     keys=[]
     for lev in levels:
