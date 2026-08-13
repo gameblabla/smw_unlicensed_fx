@@ -251,6 +251,54 @@ def build_player_death(kit):
     return encode_sprite_32x32(left)+encode_sprite_16x32(right)
 
 
+def build_reference_player_assets(project):
+    """Pack separate in-game down and continue-room pose banks.
+
+    The supplied sheet contains two different graphics groups: the down pose
+    used during play, and the two wrapped poses used by the continue/game-over
+    room.  Keep those groups in distinct VRAM banks so the gameplay pose can
+    never become one of the continue animation frames.
+    """
+    sheet=Image.open(project/'marioandluigisprites.png').convert('RGBA')
+    transparent=(112,174,202,255)
+    down_boxes=(
+        (166,76,198,116),
+        (166,192,198,232),
+    )
+    continue_boxes=(
+        ((166,134,198,174),(199,134,231,174)),
+        ((166,250,198,290),(199,250,231,290)),
+    )
+    colors=[]
+    all_boxes=list(down_boxes)+[box for row in continue_boxes for box in row]
+    for box in all_boxes:
+        for rgba in sheet.crop(box).getdata():
+            if rgba==transparent or rgba[3]==0: continue
+            rgb=rgba[:3]
+            if rgb not in colors: colors.append(rgb)
+    if len(colors)>15:
+        raise RuntimeError(f'reference player union needs {len(colors)} colors')
+    palette=[rgb_to_yuv(0,0,0)]+[rgb_to_yuv(*c) for c in colors]
+
+    def pack_one(box):
+        crop=sheet.crop(box)
+        canvas=[[0]*32 for _ in range(48)]
+        for y in range(40):
+            for x in range(32):
+                rgba=crop.getpixel((x,y))
+                if rgba==transparent or rgba[3]==0: continue
+                canvas[y][x]=colors.index(rgba[:3])+1
+        return encode_sprite_32x48(canvas)
+
+    def pack_row(row):
+        words=[]
+        for box in row:
+            words.extend(pack_one(box))
+        return words
+
+    return palette,pack_one(down_boxes[0]),pack_one(down_boxes[1]),pack_row(continue_boxes[0]),pack_row(continue_boxes[1])
+
+
 def build_coin_frames(frontdir):
     imgs=[Image.open(frontdir/f'coin_{f}.png').convert('RGB') for f in (120,180,240,300)]
     colors=[BLACK]
@@ -495,30 +543,20 @@ def build_stage_assets(kit,rom):
     for t in btiles: bg_words.extend(encode_bg_tile(t))
     bg=dict(width=64,height=64,palette=palette,tile_words=bg_words,bat=bbat,tile_count=len(btiles))
 
-    # Runtime HUD is retained as sprite cells.  Hearts and the fireball digit
-    # are emitted separately below so the C runtime can reflect live state.
-    hud=[[0]*112 for _ in range(32)]
-    def blit_hud(base,w,h,sx,sy):
-        for tx in range(w):
-            for ty in range(h):
-                pix=tilepix(live_vram,base+tx*h+ty)
-                dx=sx+tx*8; dy=(sy-200)+ty*8
-                for yy in range(8):
-                    for xx in range(8):
-                        xx2=dx+xx; yy2=dy+yy
-                        if 0<=xx2<112 and 0<=yy2<32 and pix[yy*8+xx]: hud[yy2][xx2]=pix[yy*8+xx]
-    for base,w,h,sx,sy in [(189,2,2,80,200),(1873,3,2,8,200),(1796,1,1,32,208)]:
-        blit_hud(base,w,h,sx,sy)
-    # The source HUD capture bakes the initial reserve-life digit '4' into
-    # x=32..39/y=8..15.  Keep the Mario icon and multiplication sign, but
-    # clear that digit so the runtime can draw the true reserve count.
-    for yy in range(8,16):
-        for xx in range(32,40): hud[yy][xx]=0
-    hud_words=[];hud_mask=[]
-    for cy in range(2):
-        for cx in range(7):
-            cell=[[hud[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
-            hud_mask.append(1 if any(any(r) for r in cell) else 0); hud_words.extend(encode_sprite_cell(cell))
+    # Exact live SAT components, converted one-for-one to VDC sprites.  The
+    # Mega Drive emits the life icon/x as one 24x16 object and the projectile
+    # icon as one 16x16 object; counters/hearts are separate objects below.
+    # Keeping those object boundaries avoids the old 7x2 tile-shaped HUD sheet
+    # inheriting arena palette/position artifacts.
+    hud_life_canvas=[[0]*32 for _ in range(16)]
+    blit_gen_tiles_to_canvas(live_vram,1873,3,2,hud_life_canvas)
+    hud_life_words=[]
+    for cellx in range(2):
+        hud_life_words.extend(encode_sprite_cell(
+            [[hud_life_canvas[y][cellx*16+x] for x in range(16)] for y in range(16)]))
+    hud_fire_canvas=[[0]*16 for _ in range(16)]
+    blit_gen_tiles_to_canvas(live_vram,189,2,2,hud_fire_canvas)
+    hud_fire_words=encode_sprite_cell(hud_fire_canvas)
 
     # The game uses tile 1869 as one heart and tiles 1792..1801 as digits 0..9.
     # Keep these as independent 16x16 VDC cells so health/ammo are not baked.
@@ -536,7 +574,7 @@ def build_stage_assets(kit,rom):
     fireball_words=build_object_sprite(level_vram,1860,3,3)
     enemy_pal,enemy_words=build_enemy_assets(rom,kit)
     crates,gems,enemies=extract_stage_object_tables(rom)
-    return fg,bg,bytes(collision),palette[:16],player_words,luigi_words,death_words,hud_words,hud_mask,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies
+    return fg,bg,bytes(collision),palette[:16],player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies
 
 
 
@@ -544,8 +582,8 @@ def build_continue_assets(kit):
     """Reconstruct the Mega Drive CONTINUE room from scene ADR_14FA.
 
     Background comes from the extracted 32x28 scene map.  Static metasprites
-    302/305/308/320/429 are composited into it; the large 0..9 glyph remains a
-    VDC1 sprite so the 9->0 countdown can update without touching the BAT.
+    308/320/429 are composited into it; the Mario/Luigi objects are live VDC1
+    sprites so their two-frame animation can update without touching the BAT.
     """
     sd=kit/'graphics/static_assets/gameplay'
     bg=Image.open(sd/'plane_A_initial.png').convert('RGB').resize((256,224),Image.Resampling.NEAREST)
@@ -580,7 +618,10 @@ def build_continue_assets(kit):
     # Metasprite 308 (the 184px GAME OVER line) spans x=-96..87 relative
     # to its object.  x=132 places its actual bounds at 36..219, centered in
     # the 256px raster; the old x=112 was visibly twenty pixels left.
-    objects={302:(72,48),305:(152,48),308:(132,112),429:(88,144),320:(128,192)}
+    # 302/305 are the animated Mario/Luigi continue-room characters.  Leave
+    # them out of the baked background; draw_continue_digit() emits their
+    # current pose as VDC1 sprites on every frame.
+    objects={308:(132,112),429:(88,144),320:(128,192)}
     for mid,(x,y) in objects.items(): draw_meta_rgb(canvas,mid,x,y)
     bgasset=pack_bg_rgb(canvas)
 
@@ -645,7 +686,8 @@ def main():
     push_pal,push_words=build_simple_sprite_image(frontdir/'push_start_sprite.png')
     star_pal,star_words=build_simple_sprite_image(frontdir/'menu_star_sprite.png')
     menu_m_pal,menu_m_words,menu_l_pal,menu_l_words=build_menu_character_assets(frontdir,kit)
-    fg,bg,collision,player_pal,player_words,luigi_words,death_words,hud_words,hud_mask,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies=build_stage_assets(kit,rom)
+    reference_player_pal,player_down_words,luigi_down_words,continue_mario_words,continue_luigi_words=build_reference_player_assets(p)
+    fg,bg,collision,player_pal,player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies=build_stage_assets(kit,rom)
     continue_bg,continue_digit_pal,continue_digit_words=build_continue_assets(kit)
     fronts.append(('continue_base',continue_bg))
 
@@ -662,9 +704,14 @@ extern const unsigned short g_menu_star_sprite_words[128];
 extern const unsigned short g_menu_mario_palette[16];
 extern const unsigned short g_menu_mario_words[1536];
 extern const unsigned short g_menu_luigi_palette[16];
-extern const unsigned short g_menu_luigi_words[384];\nextern const unsigned short g_hud_sprite_words[896];\nextern const unsigned char g_hud_cell_mask[14];\nextern const unsigned short g_hud_heart_words[64];\nextern const unsigned short g_hud_digit_words[640];
+extern const unsigned short g_menu_luigi_words[384];\nextern const unsigned short g_hud_life_words[128];\nextern const unsigned short g_hud_fire_words[64];\nextern const unsigned short g_hud_heart_words[64];\nextern const unsigned short g_hud_digit_words[640];
 extern const unsigned short g_continue_digit_palette[16];
 extern const unsigned short g_continue_digit_words[2560];
+extern const unsigned short g_continue_player_palette[16];
+extern const unsigned short g_player_down_words[384];
+extern const unsigned short g_luigi_down_words[384];
+extern const unsigned short g_continue_mario_words[768];
+extern const unsigned short g_continue_luigi_words[768];
 extern const unsigned short g_crate_sprite_words[256];\nextern const unsigned short g_gem_sprite_words[192];\nextern const unsigned short g_fireball_sprite_words[256];\nextern const unsigned short g_enemy_palette[16];\nextern const unsigned short g_enemy_sprite_words[15360];\nextern const short g_crate_spawns[];\nextern const short g_gem_spawns[];\nextern const short g_enemy_spawns[];\n#define PLAYER_FRAME_COUNT 20\n#define PLAYER_FRAME_WORDS 384\n#define CRATE_SPAWN_COUNT %d\n#define GEM_SPAWN_COUNT %d\n#define ENEMY_SPAWN_COUNT %d\n#define LEVEL_WIDTH_TILES 416\n#define LEVEL_HEIGHT_TILES 32\n#define LEVEL_COLLISION_HEIGHT 32\n#define LEVEL_BG_WIDTH_TILES 64\n#define LEVEL_BG_HEIGHT_TILES 64\n#endif\n'''%(len(crates),len(gems),len(enemies)))
     with c.open('w') as f:
         f.write('#include "assets_generated.h"\n\n')
@@ -673,9 +720,10 @@ extern const unsigned short g_crate_sprite_words[256];\nextern const unsigned sh
             f.write(f'const BgAsset g_{nm}_asset = {{{a0["width"]}, {a0["height"]}, {a0["tile_count"]}, g_{nm}_palette, g_{nm}_tile_words, g_{nm}_bat}};\n\n')
         emit_u8(f,'g_level_collision',collision)
         emit_u16(f,'g_player_palette',player_pal); emit_u16(f,'g_player_frame_words',player_words); emit_u16(f,'g_luigi_frame_words',luigi_words); emit_u16(f,'g_player_death_words',death_words); emit_u16(f,'g_coin_palette',coin_pal); emit_u16(f,'g_coin_sprite_words',coin_words); emit_u16(f,'g_push_palette',push_pal); emit_u16(f,'g_push_sprite_words',push_words); emit_u16(f,'g_menu_star_palette',star_pal); emit_u16(f,'g_menu_star_sprite_words',star_words); emit_u16(f,'g_menu_mario_palette',menu_m_pal); emit_u16(f,'g_menu_mario_words',menu_m_words); emit_u16(f,'g_menu_luigi_palette',menu_l_pal); emit_u16(f,'g_menu_luigi_words',menu_l_words)
-        emit_u16(f,'g_hud_sprite_words',hud_words); emit_u8(f,'g_hud_cell_mask',hud_mask)
+        emit_u16(f,'g_hud_life_words',hud_life_words); emit_u16(f,'g_hud_fire_words',hud_fire_words)
         emit_u16(f,'g_hud_heart_words',hud_heart_words); emit_u16(f,'g_hud_digit_words',hud_digit_words)
         emit_u16(f,'g_continue_digit_palette',continue_digit_pal); emit_u16(f,'g_continue_digit_words',continue_digit_words)
+        emit_u16(f,'g_continue_player_palette',reference_player_pal); emit_u16(f,'g_player_down_words',player_down_words); emit_u16(f,'g_luigi_down_words',luigi_down_words); emit_u16(f,'g_continue_mario_words',continue_mario_words); emit_u16(f,'g_continue_luigi_words',continue_luigi_words)
         emit_u16(f,'g_crate_sprite_words',crate_words); emit_u16(f,'g_gem_sprite_words',gem_words); emit_u16(f,'g_fireball_sprite_words',fireball_words)
         emit_u16(f,'g_enemy_palette',enemy_pal); emit_u16(f,'g_enemy_sprite_words',enemy_words)
         emit_s16_records(f,'g_crate_spawns',crates); emit_s16_records(f,'g_gem_spawns',gems); emit_s16_records(f,'g_enemy_spawns',enemies)

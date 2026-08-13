@@ -8,7 +8,7 @@
  *   TETSU  : 262-line, 5 MHz dot clock
  *   VDC0   : Mega Drive Plane B analogue (background/parallax)
  *   VDC1   : Mega Drive Plane A analogue + sprites/HUD
- *   KING/RAINBOW unused; audio is stubbed.
+ *   KING/RAINBOW unused; sound effects are stubbed and music is Red Book CD-DA.
  *
  * Source geometry is not vertically centered. The MD V28 active picture starts
  * at the native raster position; the PC-FX BATs and metasprite anchors use the
@@ -22,6 +22,7 @@
 #include "boot_exact.h"
 #include "boot_dual.h"
 #include "audio_stub.h"
+#include "music.h"
 #include "game_levels_generated.h"
 
 extern void pcfx_tetsu_wait_frame(void);
@@ -61,6 +62,8 @@ extern void pcfx_tetsu_wait_frame(void);
 #define STAR_BASE_WORD   0x5F80
 #define COIN_BASE_WORD   0x6000
 #define HUD_BASE_WORD    0x6A00
+#define HUD_LIFE_BASE_WORD HUD_BASE_WORD
+#define HUD_FIRE_BASE_WORD (HUD_BASE_WORD + 128)
 #define CRATE_BASE_WORD  0x6800
 #define GEM_BASE_WORD    0x6900
 #define ENEMY_BASE_WORD  0x7400
@@ -73,10 +76,17 @@ extern void pcfx_tetsu_wait_frame(void);
 #define CONTINUE_TILE_BASE_WORD 0x2000
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
 #define CONTINUE_DIGIT_BASE_WORD 0xA000
+#define GAMEPLAY_DOWN_MARIO_BASE_WORD 0x8C00
+#define GAMEPLAY_DOWN_LUIGI_BASE_WORD (GAMEPLAY_DOWN_MARIO_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
+#define CONTINUE_PLAYER_BASE_WORD (GAMEPLAY_DOWN_LUIGI_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
+#define CONTINUE_LUIGI_BASE_WORD (CONTINUE_PLAYER_BASE_WORD + 2 * PLAYER_FRAME_WORDS_LOCAL)
+#define CONTINUE_PLAYER_SPR_PAL 14
+#define CONTINUE_PLAYER_FRAME_TICKS 8
 #define SATB_BASE0       0xF000
 #define SATB_BASE1       0xF200
 
 #define PLAYER_FRAME_WORDS_LOCAL 384
+#define CONTINUE_PLAYER_FRAME_COUNT 2
 #define PLAYER_STRIP_WORDS 128
 #define BOOT_PLAYER_BANK_WORDS (PLAYER_FRAME_COUNT * PLAYER_FRAME_WORDS_LOCAL)
 #if (BOOT_MARIO_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > BOOT_LUIGI_BASE_WORD
@@ -85,17 +95,25 @@ extern void pcfx_tetsu_wait_frame(void);
 #if (BOOT_LUIGI_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > PUSH_BASE_WORD
 #error "boot Luigi bank overlaps title sprite assets"
 #endif
-#define HUD_CELL_WORDS 64
 #define ENEMY_VARIANT_WORDS ENEMY_VARIANT_VRAM_WORDS
 #define BOSS_BASE_WORD 0x7400
 #define BOSS_FLAME_BASE_WORD (BOSS_BASE_WORD + BOWSER_FRAME_WORDS * BOWSER_FRAME_COUNT)
-#define BOSS_AUX_BASE_WORD 0xC500
+#define BOWSER_SPECIAL_FRAME_WORDS (7*6*64)
+#define BOSS_SPECIAL_BASE_WORD (BOSS_FLAME_BASE_WORD+384)
+#define BOSS_AUX_BASE_WORD 0xE000
 #define BOSS_RING_BASE_WORD BOSS_AUX_BASE_WORD
 #define BOSS_HAMMER_BASE_WORD (BOSS_AUX_BASE_WORD+256)
 #define BOSS_POT_BASE_WORD (BOSS_AUX_BASE_WORD+512)
 #define BOSS_BELL_BASE_WORD (BOSS_AUX_BASE_WORD+768)
+#define BOSS_BOMB_BASE_WORD (BOSS_AUX_BASE_WORD+1024)
+#define BOSS_CRATE4_BASE_WORD (BOSS_AUX_BASE_WORD+1536)
+#define BOSS13_PLATFORM_BASE_WORD (BOSS_AUX_BASE_WORD+1792)
+#define BOSS_WATER_BASE_WORD (BOSS_AUX_BASE_WORD+2304)
 #define BOSS_AUX_SPR_PAL 12
 #define BOSS_ITEM_SPR_PAL 11
+#define BOSS13_PLATFORM_SPR_PAL 10
+#define BOSS_WATER_SPR_PAL 15
+#define BOSS_SPR_PAL_AUX 9
 #define PLAYER_SPR_PAL 13
 #define BOSS_SPR_PAL 14
 #define BOSS_HURT_FRAMES 30
@@ -239,6 +257,7 @@ static int g_camera_x;
 static int g_camera_tile;
 static int g_satb_page;
 static int g_player_anim_clock;
+static int g_player_down;
 static int g_lift_timer;
 static int g_carry_index;
 static int g_gem_count;
@@ -276,8 +295,33 @@ static s32 g_boss_x,g_boss_y,g_boss_vx,g_boss_vy;
 static int g_boss_hp,g_boss_timer,g_boss_invuln,g_boss_defeated;
 static int g_boss_class,g_boss_phase,g_boss_face=1,g_boss_ground_y;
 static int g_boss_action,g_boss_action_timer,g_boss_action_dir;
+static int g_boss_script_index;
 static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx,g_boss_shot_vy;
 static int g_boss_shot_active;
+static unsigned g_boss_drop_rng;
+static int g_boss_random_drop_timer;
+
+/* Boss 3's handler at MD $806A is a byte-pair action script.  The first byte
+   selects the movement state and the second is the source direction flag.
+   Keep the recovered data here instead of approximating it with a velocity
+   pattern; the direction flag is also the value used by the original sprite
+   selector. */
+static const unsigned char g_boss8_arc[45]={
+    1,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3,
+    3,4,4,4,4,4,4,4,4,4,4,3,3,3,3,3,
+    3,2,2,2,2,2,1,1,1,1,1,1,0x88
+};
+static const unsigned char g_boss8_script[]={
+    1,0, 8,1, 2,1, 8,0, 1,0, 2,1, 1,0, 8,1,
+    2,1, 8,0, 3,0, 3,1, 1,0, 2,1, 8,0, 1,0,
+    2,1, 8,0, 1,0, 4,1, 4,0, 2,1, 1,0, 2,1,
+    8,0, 6,0, 4,0, 8,1, 4,1, 1,0, 2,1, 1,0,
+    3,1, 8,0, 1,0, 8,0, 2,1, 1,0, 7,0, 8,0,
+    3,0, 3,1, 1,0, 8,1, 2,1, 1,0, 7,0, 8,0,
+    3,0, 2,1, 1,0, 2,1, 1,0, 2,1, 4,0, 8,1,
+    2,1, 6,0, 4,0, 7,0, 8,0, 1,0, 2,1, 1,0,
+    8,1, 2,1, 0x88
+};
 
 static Crate g_crates[MAX_CRATES];
 static Gem g_gems[MAX_GEMS];
@@ -289,6 +333,7 @@ static int g_on_moving_platform=-1;
 static int g_drop_platform_timer;
 static int g_debug_mode;
 static int g_crate_hide;
+static int g_paused;
 
 static void enter_menu(void);
 static void enter_boot(void);
@@ -622,6 +667,7 @@ static void upload_game_sprites(void)
        stages use source palette line 0 directly; every generated level carries
        the same Mario/object colors there. */
     for (i=0;i<16;++i) tetsu_set_palette((u16)(PLAYER_SPR_PAL*16+i),g_player_palette[i]);
+    for (i=0;i<16;++i) tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),g_continue_player_palette[i]);
 
     vdc_set_vram_write(FRONT_CHIP, PLAYER_BASE_WORD);
     for (i=0;i<PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL;++i) vdc_vram_write(FRONT_CHIP,g_player_frame_words[i]);
@@ -631,14 +677,26 @@ static void upload_game_sprites(void)
     for (i=256;i<320;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
     vdc_set_vram_write(FRONT_CHIP,(u16)(THROW_BASE_WORD+384));
     for (i=320;i<384;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,HUD_BASE_WORD); for(i=0;i<896;++i)vdc_vram_write(FRONT_CHIP,g_hud_sprite_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,CONTINUE_PLAYER_BASE_WORD);
+    for (i=0;i<768;++i) vdc_vram_write(FRONT_CHIP,g_continue_mario_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,CONTINUE_LUIGI_BASE_WORD);
+    for (i=0;i<768;++i) vdc_vram_write(FRONT_CHIP,g_continue_luigi_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,GAMEPLAY_DOWN_MARIO_BASE_WORD);
+    for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_player_down_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,GAMEPLAY_DOWN_LUIGI_BASE_WORD);
+    for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_luigi_down_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,HUD_LIFE_BASE_WORD); for(i=0;i<128;++i)vdc_vram_write(FRONT_CHIP,g_hud_life_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,HUD_FIRE_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_fire_words[i]);
     vdc_set_vram_write(FRONT_CHIP,CRATE_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_crate_sprite_words[i]);
+    /* Level 3 uses the same supplied pot object as boss 3, while the later
+       boss rooms upload their complete auxiliary bank in start_boss(). */
+    vdc_set_vram_write(FRONT_CHIP,BOSS_POT_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);
     vdc_set_vram_write(FRONT_CHIP,GEM_BASE_WORD); for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,g_gem_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,FIREBALL_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_fireball_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_HEART_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_heart_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_DIGIT_BASE_WORD); for(i=0;i<640;++i)vdc_vram_write(FRONT_CHIP,g_hud_digit_words[i]);
-    if ((!g_in_boss && (g_current_level==1 || g_current_level==5)) || (g_in_boss&&g_boss_class==3)) {
-        const u16 *platform_words=(g_current_level==5||g_in_boss)?g_level6_platform_words:g_level2_platform_words;
+    if (!g_in_boss && (g_current_level==1 || g_current_level==5)) {
+        const u16 *platform_words=(g_current_level==5)?g_level6_platform_words:g_level2_platform_words;
         vdc_set_vram_write(FRONT_CHIP,PLATFORM_BASE_WORD);
         for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,platform_words[i]);
     }
@@ -667,9 +725,25 @@ static void set_game_palette_fade(int level)
     const unsigned short *pal = g_in_boss ? (bv?bv->bg_palette:br->palette) : g_level->palette;
     for(i=0;i<256;++i)tetsu_set_palette((u16)i,fade_yuv(pal[i],level));
     for(i=0;i<16;++i)tetsu_set_palette((u16)(PLAYER_SPR_PAL*16+i),fade_yuv(g_player_palette[i],level));
-    if(g_in_boss){ const unsigned short *sp=bv?bv->sprite_palette:g_bowser_palette;for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_SPR_PAL*16+i),fade_yuv(sp[i],level)); }
+    for(i=0;i<16;++i)tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
+    if(g_in_boss){
+        if(bv){
+            for(j=0;j<bv->palette_count;++j){
+                int line=j?BOSS_SPR_PAL_AUX:BOSS_SPR_PAL;
+                for(i=0;i<16;++i)tetsu_set_palette((u16)(line*16+i),fade_yuv(bv->sprite_palettes[j*16+i],level));
+            }
+        }else for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_SPR_PAL*16+i),fade_yuv(g_bowser_palette[i],level));
+    }
     if(g_in_boss&&g_boss_class>0)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_AUX_SPR_PAL*16+i),fade_yuv(g_final_aux_palette[i],level));
-    if(g_in_boss&&g_boss_class>0)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_item_palette[i],level));
+    if(g_in_boss&&g_boss_class>0){
+        const unsigned short *item_pal=g_boss_pot_palette;
+        if(g_boss_class==3)item_pal=g_boss_bomb_palette;
+        else if(g_boss_class==2)item_pal=g_boss_crate4_palette;
+        else if(g_boss_class==4)item_pal=g_boss_bell_palette;
+        for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(item_pal[i],level));
+    }
+    if(g_in_boss&&g_boss_class==1)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_WATER_SPR_PAL*16+i),fade_yuv(g_boss_water_palette[i],level));
+    if(g_in_boss&&g_boss_class==3)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS13_PLATFORM_SPR_PAL*16+i),fade_yuv(g_boss13_platform_palette[i],level));
     else if(g_level){
         for(i=0;i<g_level->variant_count;++i){
             const EnemyVariantData *v=&g_enemy_variants[g_level->variant_ids[i]]; int line=-1;
@@ -679,6 +753,11 @@ static void set_game_palette_fade(int level)
             for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),fade_yuv(v->palette[j],level));
         }
     }
+    /* World 3's stage crates (levels 7, 8 and 9; zero-based slots 6..8) are
+       the same pot object used by boss 3. Keep their supplied purple/grey
+       palette on a dedicated sprite line. */
+    if(!g_in_boss&&g_current_level>=6&&g_current_level<=8)
+        for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_pot_palette[i],level));
     g_game_fade_level=level;
 }
 
@@ -767,6 +846,14 @@ static int solid_ceiling(int x, int y)
 
 static int player_body_x(void) { return (int)(g_player_x >> FIX_SHIFT) + PLAYER_BODY_XOFF; }
 static int player_body_y(void) { return (int)(g_player_y >> FIX_SHIFT) + PLAYER_BODY_YOFF; }
+
+/* The first two arenas retain the six-pixel raster lead from their captured
+   Mega Drive room plane.  Bowser's extracted poses include that lead, whereas
+   Mario and the generic crate metasprites do not. */
+static int bowser_room_object_y_offset(void)
+{
+    return (g_in_boss && g_boss_class == 0) ? -6 : 0;
+}
 
 static int crate_at_side(int bx, int by, int moving_right)
 {
@@ -873,7 +960,8 @@ static void resolve_player_vertical(s32 next_y)
         for (i=0;i<g_moving_platform_count && g_drop_platform_timer==0;++i) {
             MovingPlatform *p=&g_moving_platforms[i];
             int px=(int)(p->x>>FIX_SHIFT), top=(int)(p->y>>FIX_SHIFT);
-            if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+MOVING_PLATFORM_W) continue;
+            int platform_w=(g_in_boss&&g_boss_class==3)?64:MOVING_PLATFORM_W;
+            if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+platform_w) continue;
             if (old_bottom<=top+2 && new_bottom+1>=top && top<best_top) {
                 best_top=top;
                 best_platform=i;
@@ -1075,7 +1163,9 @@ static void update_crates(void)
         if (!c->active) continue;
         if (c->carried) {
             c->x=g_player_x+(s32)4*FIX_ONE;
-            c->y=g_player_y+(s32)(g_crate_hide?18:-13)*FIX_ONE;
+            /* The disguised 24px crate rests on Mario's standing surface
+               (anchor + 24), rather than floating six pixels above it. */
+            c->y=g_player_y+(s32)(g_crate_hide?24:-13)*FIX_ONE;
             c->vx=c->vy=0;
             c->thrown=0;
             continue;
@@ -1258,6 +1348,9 @@ static void begin_player_death(void)
     g_hurt_pending_death=0;
     g_vx=0;
     g_vy=-(6*FIX_ONE+FIX_ONE/2);
+    /* A retry must begin its level cue at index 00, never at the position the
+       player died.  Start the fade while the death animation is still shown. */
+    music_stop_for_transition();
     Play_Sound_Sample(5,0,0);
 }
 
@@ -1413,13 +1506,37 @@ static int current_player_frame(void)
     return 3;
 }
 
+static int later_boss_frame(const BossVisualData *v)
+{
+    int frame,t=g_boss_timer;
+    /* Frame groups follow the source sheet order.  Each handler's locomotion
+       cadence comes from its recovered 44/64/80/160-frame state timing; the
+       trailing poses are attack states and are selected while its projectile
+       object is live. */
+    switch(g_boss_class){
+    case 1: /* Pig strip: walk 0/1, spin 2/3/4, hurt 5, death 6. */
+        if(g_boss_defeated)frame=6;
+        else if(g_boss_invuln>0)frame=5;
+        else if(g_boss_action==8)frame=-1; /* MD attack has no pig sprite. */
+        else if(g_boss_action==6||g_boss_action==7)
+            frame=2+(t/5)%3;
+        else frame=(g_boss_action==2||g_boss_action==4)?1:0;
+        break; /* Pig */
+    case 2: frame=(t/8)%3;break;                              /* ostrich */
+    case 3: frame=g_boss_shot_active?3+(t/8)%7:(t/8)%3;break; /* tank */
+    case 4: frame=g_boss_shot_active?3+(t/8)%2:(t/8)%3;break; /* mage */
+    default:frame=g_boss_shot_active?2+(t/8)%3:(t/8)%2;break; /* elephant */
+    }
+    return frame%v->frame_count;
+}
+
 static void draw_game_sprites(void)
 {
     static u16 satb[64 * 4];
     int i, n = 0;
     int frame = current_player_frame();
     int px = (int)(g_player_x >> FIX_SHIFT) - g_camera_x;
-    int py = (int)(g_player_y >> FIX_SHIFT);
+    int py = (int)(g_player_y >> FIX_SHIFT) + bowser_room_object_y_offset();
     u16 base = (u16)(g_satb_page ? SATB_BASE1 : SATB_BASE0);
     /* Every normal-level palette carries the original Mario/object colors in
        source line 0 (identical across all 19 level palettes).  r11 moved
@@ -1429,23 +1546,22 @@ static void draw_game_sprites(void)
     u16 player_pal=(u16)(g_in_boss?PLAYER_SPR_PAL:0);
     u16 pctrl = (u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | player_pal);
     u16 paddr = (u16)(PLAYER_BASE_WORD + (frame-1) * PLAYER_FRAME_WORDS_LOCAL);
+    if (g_player_down) {
+        paddr=(g_menu_choice==MENU_2P)?GAMEPLAY_DOWN_LUIGI_BASE_WORD:GAMEPLAY_DOWN_MARIO_BASE_WORD;
+        pctrl=(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | CONTINUE_PLAYER_SPR_PAL);
+    }
     int player_visible=1;
     int hud_yoff=(g_in_boss||(!g_in_boss&&g_current_level==2))?-16:0;
 
     for (i = 0; i < 64 * 4; ++i) satb[i] = 0;
 
-    /* Keep the HUD at the front of SATB so object-heavy screens cannot make
-       the live hearts/ammo counter disappear.  The static cells now contain
-       only the life icon/x4 and fireball icon; health/ammo are independent. */
-    for (i = 0; i < 14 && n < 64; ++i) {
-        if (g_hud_cell_mask[i]) {
-            int cx = i % 7, cy = i / 7;
-            set_sprite_entry(satb,n++,cx*16,209+hud_yoff+cy*16,
-                (u16)(HUD_BASE_WORD + i*HUD_CELL_WORDS),(u16)(VDC_SPR_PRIO_SP|player_pal));
-        }
-    }
-    /* Source HUD life icon and multiplication sign are static; the digit is
-       now live instead of the baked x4 from the runtime capture. */
+    /* Exact Mega Drive HUD object boundaries, emitted first in SATB so a busy
+       room cannot drop them: 24x16 life icon/x, 16x16 fire icon, then live
+       digits and individual heart sprites. */
+    set_sprite_entry(satb,n++,8,209+hud_yoff,HUD_LIFE_BASE_WORD,
+        (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|player_pal));
+    set_sprite_entry(satb,n++,80,209+hud_yoff,HUD_FIRE_BASE_WORD,
+        (u16)(VDC_SPR_PRIO_SP|player_pal));
     if (n<64) {
         int lives=g_lives; if (lives<0) lives=0; if (lives>9) lives=9;
         set_sprite_entry(satb,n++,32,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
@@ -1511,10 +1627,22 @@ static void draw_game_sprites(void)
         int sx, sy;
         if (!g_crates[i].active) continue;
         sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
-        sy = (int)(g_crates[i].y >> FIX_SHIFT);
+        sy = (int)(g_crates[i].y >> FIX_SHIFT) + bowser_room_object_y_offset();
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
-        {u16 addr=CRATE_BASE_WORD,pal=player_pal;if(g_in_boss){if(g_crates[i].extra==1){addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;}else if(g_crates[i].extra==2){addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;}else if(g_crates[i].extra==3){addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}}
-        set_sprite_entry(satb,n++,sx,sy,addr,(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_2 | pal));}
+        {u16 addr=CRATE_BASE_WORD,pal=player_pal; int width=2,height=2;
+        if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
+           (g_in_boss&&g_boss_class==1)){
+            addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
+        }else if(g_in_boss&&g_boss_class==2){
+            addr=BOSS_CRATE4_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;width=1;
+        }else if(g_in_boss&&g_boss_class==3){
+            addr=(u16)(BOSS_BOMB_BASE_WORD+((g_state_frame>>3)&1)*256);pal=BOSS_ITEM_SPR_PAL;
+        }else if(g_in_boss&&g_boss_class==4){
+            addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
+        }else if(g_in_boss&&g_boss_class>0){
+            addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;
+        }
+        set_sprite_entry(satb,n++,sx,sy,addr,(u16)(VDC_SPR_PRIO_SP | (width==2?VDC_SPR_X_WIDTH_2:0) | (height==2?VDC_SPR_Y_HEIGHT_2:0) | pal));}
     }
 
     /* Traversal-critical Level-2 moving platforms get SATB priority over
@@ -1523,9 +1651,13 @@ static void draw_game_sprites(void)
         int sx=(int)(g_moving_platforms[i].x>>FIX_SHIFT)-g_camera_x;
         int sy=(int)(g_moving_platforms[i].y>>FIX_SHIFT);
         if (sx<-MOVING_PLATFORM_W || sx>255 || sy<-MOVING_PLATFORM_H || sy>239) continue;
-        set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,
-            (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2));
-        if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),VDC_SPR_PRIO_SP);
+        if(g_in_boss&&g_boss_class==3){
+            set_sprite_entry(satb,n++,sx,sy,BOSS13_PLATFORM_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
+            if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(BOSS13_PLATFORM_BASE_WORD+256),(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
+        }else{
+            set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2));
+            if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),VDC_SPR_PRIO_SP);
+        }
     }
 
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
@@ -1553,25 +1685,34 @@ static void draw_game_sprites(void)
         u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
             const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];
-            int frame_words=v->cols*v->rows*64;
-            mask=g_boss_invuln?v->sprite_hit_mask:v->sprite_mask;
-            for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
-                int cell=cy*v->cols+cx,dx,dy=by+cy*16;if(!(mask&(1ULL<<cell)))continue;
-                dx=(g_boss_face<0)?(v->cols-1-cx)*16:cx*16;
-                set_sprite_entry(satb,n++,bx+dx,dy,
-                    (u16)(BOSS_BASE_WORD+(g_boss_invuln?frame_words:0)+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
+            int frame=later_boss_frame(v),frame_words=v->cols*v->rows*64;
+            if(frame>=0){
+                mask=v->sprite_masks[frame];
+                for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
+                    int cell=cy*v->cols+cx,dx,dy=by+cy*16,palette;if(!(mask&(1ULL<<cell)))continue;
+                    dx=(g_boss_face<0)?(v->cols-1-cx)*16:cx*16;
+                    palette=v->sprite_cell_palettes[frame*v->cols*v->rows+cell];
+                    set_sprite_entry(satb,n++,bx+dx,dy,(u16)(BOSS_BASE_WORD+frame*frame_words+cell*64),
+                        (u16)(VDC_SPR_PRIO_SP|(palette?BOSS_SPR_PAL_AUX:BOSS_SPR_PAL)|flip));
+                }
             }
         }else{
         /* The real capture has four distinct walk cells and a separate
            forward-leaning breath cell. State 3 is a solid fixed hurt pose;
            the Mega Drive does not flicker the boss during this pause. */
         if(g_boss_invuln>0)anim=8;
-        else if(g_boss_class==0&&(g_boss_action==1||g_boss_action==7||g_boss_action==9))
-            anim=(g_boss_action_timer<8)?4:(5+(((g_boss_action_timer-8)/8)&1));
+        else if(g_boss_class==0&&g_boss_action==6)anim=10;
+        else if(g_boss_class==0&&g_boss_action==5)anim=9;
         else anim=(g_boss_timer/10)&3;
-        by+=pose_y_offset[anim]-16;
-        mask=g_bowser_masks[anim];
-        for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(5-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOSS_BASE_WORD+anim*BOWSER_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        if(anim>=9){
+            int special=anim-9;
+            mask=g_bowser_special_masks[special];
+            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOSS_SPECIAL_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        }else{
+            by+=pose_y_offset[anim]-16;
+            mask=g_bowser_masks[anim];
+            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(5-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOSS_BASE_WORD+anim*BOWSER_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        }
         }
     }
 
@@ -1579,7 +1720,9 @@ static void draw_game_sprites(void)
         int sx=(int)(g_boss_shot_x>>FIX_SHIFT),sy=(int)(g_boss_shot_y>>FIX_SHIFT),cx,cy;
         u16 flip=(g_boss_shot_vx<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
-            if(g_boss_class==4||g_boss_class==5){
+            if(g_boss_class==1)set_sprite_entry(satb,n++,sx,sy,BOSS_WATER_BASE_WORD,
+                (u16)(VDC_SPR_PRIO_SP|BOSS_WATER_SPR_PAL));
+            else if(g_boss_class==4||g_boss_class==5){
                 int count=(g_boss_class==4)?3:4,k;
                 for(k=0;k<count&&n<64;++k)set_sprite_entry(satb,n++,sx-(g_boss_shot_vx<0?-k*18:k*18),sy-k*22,BOSS_RING_BASE_WORD,
                     (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS_AUX_SPR_PAL|flip));
@@ -1619,6 +1762,8 @@ static void set_continue_palette_fade(int level)
     int i;
     for (i=0;i<256;++i)
         tetsu_set_palette((u16)i,fade_yuv(g_continue_base_asset.palette[i],level));
+    for (i=0;i<16;++i)
+        tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
     /* Large countdown digit uses dedicated sprite palette line 15. */
     for (i=0;i<16;++i)
         tetsu_set_palette((u16)(240+i),fade_yuv(g_continue_digit_palette[i],level));
@@ -1628,9 +1773,15 @@ static void draw_continue_digit(void)
 {
     static u16 satb[64*4];
     int i,d=g_continue_digit;
+    int frame=(int)((g_state_frame/CONTINUE_PLAYER_FRAME_TICKS)%CONTINUE_PLAYER_FRAME_COUNT);
     for (i=0;i<64*4;++i) satb[i]=0;
     if (d<0) d=0; if (d>9) d=9;
-    set_sprite_entry(satb,0,116,152,(u16)(CONTINUE_DIGIT_BASE_WORD+d*256),
+    for (i=0;i<3;++i) {
+        u16 ctrl=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_1|CONTINUE_PLAYER_SPR_PAL);
+        set_sprite_entry(satb,i,72,48,(u16)(CONTINUE_PLAYER_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL+i*PLAYER_STRIP_WORDS),ctrl);
+        set_sprite_entry(satb,3+i,152,48,(u16)(CONTINUE_LUIGI_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL+i*PLAYER_STRIP_WORDS),ctrl);
+    }
+    set_sprite_entry(satb,6,116,152,(u16)(CONTINUE_DIGIT_BASE_WORD+d*256),
         (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|15));
     submit_front_satb(satb);
 }
@@ -1638,6 +1789,7 @@ static void draw_continue_digit(void)
 static void load_continue_hidden(void)
 {
     int x,y,i;
+    music_transition_to_continue();
     /* Never expose a half-loaded BAT/CHR set. Both VDC outputs remain disabled
        until the following TETSU frame boundary. */
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
@@ -1682,7 +1834,8 @@ static void start_boss(int fade_in)
     const unsigned short *bp;
     const BossVisualData *bv;
     const BossRoomData *br;
-    g_in_boss=1; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32;
+    g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32;
+    music_transition_to_boss();
     g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     clear_bat(BACK_CHIP,BG_BAT_WORDS);clear_bat(FRONT_CHIP,FG_BAT_WORDS);
@@ -1704,9 +1857,9 @@ static void start_boss(int fade_in)
     }
     upload_game_sprites();
     vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
-    if(bv)for(i=0;i<bv->cols*bv->rows*128;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
-    else{for(i=0;i<BOWSER_FRAME_WORDS*BOWSER_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);}
-    if(bv){vdc_set_vram_write(FRONT_CHIP,BOSS_AUX_BASE_WORD);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_ring_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_hammer_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_bell_words[i]);}
+    if(bv)for(i=0;i<bv->frame_count*bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
+    else{for(i=0;i<BOWSER_FRAME_WORDS*BOWSER_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);for(i=0;i<BOWSER_SPECIAL_FRAME_WORDS*2;++i)vdc_vram_write(FRONT_CHIP,g_bowser_special_words[i]);}
+    if(bv){vdc_set_vram_write(FRONT_CHIP,BOSS_AUX_BASE_WORD);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_ring_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_hammer_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_bell_words[i]);for(i=0;i<512;++i)vdc_vram_write(FRONT_CHIP,g_boss_bomb_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_crate4_words[i]);if(g_boss_class==3)for(i=0;i<512;++i)vdc_vram_write(FRONT_CHIP,g_boss13_platform_words[i]);if(g_boss_class==1){vdc_set_vram_write(FRONT_CHIP,BOSS_WATER_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_boss_water_words[i]);}}
     init_objects();
 
     /* Special-mode player spawn is the alternate table at ROM $1DC56.
@@ -1727,16 +1880,20 @@ static void start_boss(int fade_in)
     x=bv?bv->spawn_x:(int)bp[0]-128; y=bv?bv->spawn_y:(int)bp[1]-128;
     if(x<-96||x>256)x=172;
     if(y<-64||y>192)y=104;
+    /* Boss 4's supplied ostrich strip is authored 17 pixels below the old
+       capture origin. Move the actor itself so the visual, hitbox and sweep
+       all share the corrected Y axis. */
+    if(g_boss_class==2)y+=17;
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
-    g_boss_action=0;g_boss_action_timer=0;g_boss_action_dir=0;
+    g_boss_action=0;g_boss_action_timer=(g_boss_class==1)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
 
     /* Exact 1P HP table $6D6E: 8,8,10,10,12,12,12 for the seven bosses.
        $6D94 is also exported for the later two-player implementation. */
     g_boss_hp=(int)g_boss_hp_1p[g_current_level];
     if(g_boss_hp<=0)g_boss_hp=8;
-    g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_after_boss=0;
+    g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_boss_drop_rng=0x51F15EEDu;g_boss_random_drop_timer=72;g_after_boss=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);draw_game_sprites();
     g_state=STATE_STAGE_LOAD;g_state_frame=0;
 }
@@ -1757,6 +1914,53 @@ static void boss_fire_at_player(int speed)
     g_boss_shot_y=g_boss_y+(s32)36*FIX_ONE;
     g_boss_shot_vx=((g_player_x<g_boss_x)?-speed:speed)*FIX_ONE;
     g_boss_shot_vy=0;
+}
+
+static void boss_drop_water(void)
+{
+    if(g_boss_shot_active)return;
+    g_boss_shot_active=1;
+    /* Source metasprite 8 places the drop below the pig's top-left anchor. */
+    g_boss_shot_x=g_boss_x+(s32)9*FIX_ONE;
+    g_boss_shot_y=g_boss_y+(s32)71*FIX_ONE;
+    g_boss_shot_vx=0;
+    g_boss_shot_vy=2*FIX_ONE;
+}
+
+static unsigned boss_random(void)
+{
+    /* The MD handler samples the hardware RNG while selecting boss actions.
+       Keep a deterministic per-room stream so recordings are reproducible
+       while the bomb drops still vary instead of arriving on a fixed crate
+       cadence. */
+    g_boss_drop_rng^=g_boss_drop_rng<<13;
+    g_boss_drop_rng^=g_boss_drop_rng>>17;
+    g_boss_drop_rng^=g_boss_drop_rng<<5;
+    return g_boss_drop_rng;
+}
+
+static int boss_bomb_active(void)
+{
+    int i;
+    for(i=0;i<MAX_CRATES;++i)
+        if(g_crates[i].active&&g_crates[i].extra==3)return 1;
+    return 0;
+}
+
+static void boss_drop_bomb(void)
+{
+    int i,bx,by,x;
+    if(boss_bomb_active())return;
+    bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
+    x=bx+8+(int)(boss_random()%49)-24;
+    if(x<8)x=8;if(x>224)x=224;
+    for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
+        Crate *c=&g_crates[i];
+        c->active=1;c->carried=0;c->thrown=0;c->extra=3;c->flight_timer=0;
+        c->x=(s32)x<<FIX_SHIFT;c->y=(s32)(by+40)<<FIX_SHIFT;
+        c->vx=0;c->vy=FIX_ONE;
+        return;
+    }
 }
 
 static void update_boss_motion(void)
@@ -1810,14 +2014,109 @@ static void update_boss_motion(void)
         g_boss_vx=0;g_boss_vy=0;
         break;
     }
-    case 1: /* level 8: diagonal 44-frame traversals plus faster 4px dives */
-        if((t%44)==0){g_boss_phase=(g_boss_phase+1)&3;g_boss_vx=(g_boss_phase&1)?2*FIX_ONE:-2*FIX_ONE;g_boss_vy=(g_boss_phase&2)?FIX_ONE:-FIX_ONE;}
-        if((t%176)>=132){g_boss_vx=(g_boss_vx<0)?-4*FIX_ONE:4*FIX_ONE;g_boss_vy=4*FIX_ONE;}
-        g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
-        if(bx<40){g_boss_x=(s32)40<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;}if(bx>216){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}
-        if(by<72){g_boss_y=(s32)72<<FIX_SHIFT;g_boss_vy=FIX_ONE;}if(by>176){g_boss_y=(s32)176<<FIX_SHIFT;g_boss_vy=-FIX_ONE;}
-        g_boss_face=(g_boss_vx<0)?-1:1;if((t%104)==0)boss_fire_at_player(4);
+    case 1: { /* level 8/$806A: exact action script and spin phases */
+        int state,dir,step,duration,vx,vy;
+        const unsigned char *p;
+
+        /* The source object's init bit is represented by a negative timer.
+           Keeping the previous state through the transition preserves its
+           final pose for the frame in which the source resets that bit. */
+        if(g_boss_action_timer<0){
+            p=&g_boss8_script[g_boss_script_index*2];
+            if(p[0]==0x88){g_boss_script_index=0;p=g_boss8_script;}
+            g_boss_action=p[0];g_boss_action_dir=p[1];++g_boss_script_index;
+            g_boss_action_timer=0;g_boss_phase=0;
+            /* The cleaned strip is stored in the opposite base orientation
+               from the MD direction bit: dir 0 moves left and is unflipped. */
+            g_boss_face=g_boss_action_dir?-1:1;
+            if(g_boss_action==8)boss_drop_water();
+        }
+        state=g_boss_action;dir=g_boss_action_dir;
+        if(state==1){
+            g_boss_x-=(s32)2*FIX_ONE;g_boss_y-=(s32)FIX_ONE;
+            g_boss_vx=-2*FIX_ONE;g_boss_vy=-FIX_ONE;
+            ++g_boss_action_timer;
+            if(g_boss_action_timer>=44){
+                g_boss_y+=(s32)2*FIX_ONE;
+                if((int)(g_boss_x>>FIX_SHIFT)<=40){g_boss_x=(s32)40<<FIX_SHIFT;g_boss_action_timer=-1;}
+            }
+        }else if(state==2){
+            g_boss_x+=(s32)2*FIX_ONE;g_boss_y+=(s32)FIX_ONE;
+            g_boss_vx=2*FIX_ONE;g_boss_vy=FIX_ONE;
+            ++g_boss_action_timer;
+            if(g_boss_action_timer>=44){
+                g_boss_y-=(s32)2*FIX_ONE;
+                if((int)(g_boss_x>>FIX_SHIFT)>=216){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_action_timer=-1;}
+            }
+        }else if(state==3||state==4){
+            step=g_boss_action_timer;
+            if(step>=44){
+                if(state==3){
+                    if(dir){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_y=(s32)72<<FIX_SHIFT;}
+                    else{g_boss_x=(s32)40<<FIX_SHIFT;g_boss_y=(s32)176<<FIX_SHIFT;}
+                }else{
+                    if(dir){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_y=(s32)176<<FIX_SHIFT;}
+                    else{g_boss_x=(s32)40<<FIX_SHIFT;g_boss_y=(s32)72<<FIX_SHIFT;}
+                }
+                g_boss_action_timer=-1;
+            }else{
+                step=g_boss8_arc[step];
+                if(state==3){
+                    if(dir){g_boss_y-=(s32)step*FIX_ONE;g_boss_x+=(s32)4*FIX_ONE;g_boss_vx=4*FIX_ONE;g_boss_vy=-step*FIX_ONE;}
+                    else{g_boss_y+=(s32)step*FIX_ONE;g_boss_x-=(s32)4*FIX_ONE;g_boss_vx=-4*FIX_ONE;g_boss_vy=step*FIX_ONE;}
+                }else if(dir){
+                    g_boss_y+=(s32)step*FIX_ONE;g_boss_x+=(s32)4*FIX_ONE;g_boss_vx=4*FIX_ONE;g_boss_vy=step*FIX_ONE;
+                }else{
+                    g_boss_y-=(s32)step*FIX_ONE;g_boss_x-=(s32)4*FIX_ONE;g_boss_vx=-4*FIX_ONE;g_boss_vy=-step*FIX_ONE;
+                }
+                ++g_boss_action_timer;
+            }
+        }else if(state==6||state==7){
+            /* States 6 and 7 are the two source spin paths.  Their phases
+               deliberately do not change the direction flag; the MD keeps
+               the selected facing throughout each spin action. */
+            vx=vy=0;duration=0;
+            if(state==6){
+                switch(g_boss_phase){
+                case 0:vx=-4;vy=4;duration=28;break;
+                case 1:vx=-4;vy=-4;duration=20;break;
+                case 2:vx=4;vy=-4;duration=16;break;
+                default:vx=4;vy=4;duration=34;break;
+                }
+            }else{
+                switch(g_boss_phase){
+                case 0:vx=4;vy=4;duration=22;break;
+                case 1:vx=4;vy=-4;duration=24;break;
+                case 2:vx=-4;vy=-4;duration=6;break;
+                case 3:vx=-4;vy=4;duration=38;break;
+                case 4:vx=-4;vy=-4;duration=8;break;
+                case 5:vx=4;vy=-4;duration=28;break;
+                default:vx=4;vy=2;duration=22;break;
+                }
+            }
+            g_boss_vx=(s32)vx*FIX_ONE;g_boss_vy=(s32)vy*FIX_ONE;
+            g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;
+            ++g_boss_action_timer;
+            if(g_boss_action_timer>=duration){
+                g_boss_action_timer=0;++g_boss_phase;
+                if((state==6&&g_boss_phase>=4)||(state==7&&g_boss_phase>=7)){
+                    g_boss_x=(s32)216<<FIX_SHIFT;g_boss_y=(s32)72<<FIX_SHIFT;
+                    g_boss_action_timer=-1;g_boss_phase=0;
+                }
+            }
+        }else if(state==8){
+            /* The source creates its external effect once, then returns to
+               the common dispenser path after its 44-pixel rise.  The PC-FX
+               projectile is the equivalent visible effect. */
+            ++g_boss_action_timer;
+            if(g_boss_action_timer>=44)g_boss_action_timer=-1;
+        }else{
+            /* State 5 is the source's common/dispenser state. */
+            g_boss_vx=0;g_boss_vy=0;
+            ++g_boss_action_timer;
+        }
         break;
+    }
     case 2: /* level 10: whole-screen sweeps visible in $886E/$88A2 */
         if((t%160)==0){g_boss_phase^=1;g_boss_vx=g_boss_phase?2*FIX_ONE:-2*FIX_ONE;}
         g_boss_x+=g_boss_vx;bx=(int)(g_boss_x>>FIX_SHIFT);
@@ -1830,7 +2129,7 @@ static void update_boss_motion(void)
         int tx=(int)(g_moving_platforms[to].x>>FIX_SHIFT),ty=(int)(g_moving_platforms[to].y>>FIX_SHIFT)-64;
         if(q<48){bx=fx;by=fy;}
         else if(q<112){step=q-48;bx=fx+(tx-fx)*step/64;by=fy+(ty-fy)*step/64-(64-(iabs_i(step-32)*2));}
-        else{bx=tx;by=ty;if(q==120)boss_fire_at_player(4);}
+        else{bx=tx;by=ty;if(q==120)boss_drop_bomb();}
         g_boss_x=(s32)bx<<FIX_SHIFT;g_boss_y=(s32)by<<FIX_SHIFT;
         g_boss_face=(g_player_x<g_boss_x)?-1:1;
         break;
@@ -1863,7 +2162,9 @@ static void update_boss_motion(void)
         }
         g_boss_x+=g_boss_vx;bx=(int)(g_boss_x>>FIX_SHIFT);
         if(bx<8){g_boss_x=(s32)8<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;}if(bx>136){g_boss_x=(s32)136<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}
-        g_boss_y=(s32)49<<FIX_SHIFT;g_boss_face=(g_player_x<g_boss_x)?-1:1;
+        /* The elephant art has a 144px canvas; its feet sit on the room's
+           platform at y=16, not at the old 49px source-anchor position. */
+        g_boss_y=(s32)16<<FIX_SHIFT;g_boss_face=(g_player_x<g_boss_x)?-1:1;
         break;
     }
 }
@@ -1875,7 +2176,7 @@ static void update_boss_actor(void)
         /* Source HP-zero path at $16398 changes the boss state instead of
            erasing it. Keep the sprite visible while it launches/falls away. */
         g_boss_vy+=72;if(g_boss_vy>7*FIX_ONE)g_boss_vy=7*FIX_ONE;g_boss_y+=g_boss_vy;
-        if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;g_state=STATE_LEVEL_FADE;g_state_frame=0;}
+        if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();g_state=STATE_LEVEL_FADE;g_state_frame=0;}
         return;
     }
     if(g_boss_invuln>0)--g_boss_invuln;
@@ -1886,32 +2187,67 @@ static void update_boss_actor(void)
 #endif
         if(g_boss_invuln==0)update_boss_motion();
     }
+    /* Boss 5's $907E object path creates a bomb during its action cycle and
+       the handler also samples the source RNG for additional drops. */
+    if(g_boss_class==3&&g_boss_invuln==0){
+        if(g_boss_random_drop_timer>0)--g_boss_random_drop_timer;
+        if(g_boss_random_drop_timer<=0){
+            boss_drop_bomb();
+            g_boss_random_drop_timer=72+(int)(boss_random()&95);
+        }
+    }
     /* The source dispenser ($7958) waits while its previous crate object is
        live.  Do the same so unused ammunition cannot carpet the catwalk. */
-    if(g_boss_invuln==0&&(g_boss_timer%120)==1){
+    if(g_boss_class!=3&&g_boss_invuln==0&&(g_boss_timer%120)==1){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
         if(!any_crate)for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
                 g_crates[i].active=1;g_crates[i].carried=0;g_crates[i].thrown=0;
-                g_crates[i].extra=(g_boss_class==1)?1:(g_boss_class==4)?2:(g_boss_class==5)?3:0;
+                /* Later bosses always dispense their own throwable.  Zero is
+                   reserved for Bowser's ordinary wooden crate. */
+                g_crates[i].extra=(unsigned char)g_boss_class;
                 g_crates[i].x=(s32)(32+((g_boss_timer/120)%6)*32)<<FIX_SHIFT;
                 g_crates[i].y=(s32)-16*FIX_ONE;g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
         }
     }
-    if(g_boss_shot_active){int sx,sy;g_boss_shot_x+=g_boss_shot_vx;g_boss_shot_y+=g_boss_shot_vy;sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT)-16;if(sx<-40||sx>272||sy>240)g_boss_shot_active=0;else if(g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,sx+4,sy+4,24,24)){hurt_player();g_boss_shot_active=0;}}
+    if(g_boss_shot_active){
+        int sx,sy,py;
+        g_boss_shot_x+=g_boss_shot_vx;g_boss_shot_y+=g_boss_shot_vy;
+        sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT);
+        py=player_body_y()+bowser_room_object_y_offset();
+        if(g_boss_class==1){
+            if(sx<-16||sx>272||sy>240)g_boss_shot_active=0;
+            else if(g_invuln==0&&aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx,sy,7,16)){hurt_player();g_boss_shot_active=0;}
+        }else{
+            sy-=16;
+            if(sx<-40||sx>272||sy>240)g_boss_shot_active=0;
+            else if(g_invuln==0&&aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx+4,sy+4,24,24)){hurt_player();g_boss_shot_active=0;}
+        }
+    }
     bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
     /* $15D20 is used by the source boss collision path. Values vary sharply by
        boss class, so use them to tune the broad collision body rather than the
        old universal 56x68 rectangle. */
-    if(g_boss_class>0){const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];hitx=bx+8;hity=by+8;hitw=v->cols*16-16;hith=(g_boss_class==3)?56:v->rows*16-16;}
+    if(g_boss_class>0){
+        /* Art banks use full 112x96 source canvases so changing pose never
+           moves the origin.  Collision remains the recovered actor body,
+           not that transparent canvas. */
+        static const unsigned char hit_w[5]={48,64,80,112,96};
+        static const unsigned char hit_h[5]={64,80,56,64,80};
+        hitx=bx+8;hity=by+8;hitw=hit_w[g_boss_class-1];hith=hit_h[g_boss_class-1];
+    }
     else{hitx=bx+12;hity=by-8;hitw=72;hith=72;
         if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
         if(g_boss_hit_offsets[g_current_level*2+1]>0)hith=g_boss_hit_offsets[g_current_level*2+1];
-        if(hith<48)hith=64;if(hith>88)hith=88;}
+        if(hith<48)hith=64;if(hith>88)hith=88;
+        /* Bowser is perched on a one-way ledge.  The generic extracted body
+           started eight pixels too high, which let Mario touch it through
+           the ledge from below. */
+        hity+=8;hith-=8;}
     if(g_boss_invuln==0){
         for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
-        for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT);if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
-        if(!g_boss_defeated&&g_invuln==0&&aabb(player_body_x()+4,player_body_y()+5,8,PLAYER_BODY_H-10,hitx+4,hity+4,hitw-8,hith-8))hurt_player();
+        for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT)+bowser_room_object_y_offset();if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
+        if(!g_boss_defeated&&g_invuln==0&&aabb(player_body_x()+4,player_body_y()+bowser_room_object_y_offset()+5,8,PLAYER_BODY_H-10,hitx+4,hity+4,hitw-8,hith-8))hurt_player();
     }
 }
 
@@ -1919,7 +2255,8 @@ static void start_gameplay(int fade_in)
 {
     int ycrop;
     /* Every normal level is selected through the 19-entry reconstruction table. */
-    g_in_boss=0;
+    g_in_boss=0; g_paused=0;
+    music_transition_to_level(g_current_level);
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     init_level_ring();
@@ -1931,6 +2268,7 @@ static void start_gameplay(int fade_in)
     g_grounded=1;
     g_facing=1;
     g_player_anim_clock=0;
+    g_player_down=0;
     g_jump_active=0; g_jump_index=0;
     g_bounce_active=0; g_bounce_index=0;
     g_camera_hold=0;
@@ -1961,7 +2299,15 @@ static void update_play(u16 btn, u16 pressed)
         }
     }
     if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;}
+    /* START pauses active play only.  music_update() remains in the outer
+       frame loop, so the Red Book track continues without a fade or seek. */
+    if (g_player_mode==PMODE_NORMAL && (pressed&JOY_RUN)) {
+        g_paused^=1;
+        return;
+    }
+    if (g_paused) return;
     g_crate_hide=(g_carry_index>=0&&g_grounded&&(btn&JOY_DOWN))?1:0;
+    g_player_down=(g_carry_index<0&&g_grounded&&g_lift_timer==0&&g_throw_timer==0&&(btn&JOY_DOWN))?1:0;
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
@@ -2114,10 +2460,15 @@ static void update_play(u16 btn, u16 pressed)
        level slots 3,6,8,10,13,16,19 it sets FF00A8=1 and re-enters the level
        loader in boss mode. The PC-FX port keeps exactly that boss-bearing list. */
     if(!g_in_boss && (int)(g_player_x>>FIX_SHIFT)>=g_level_width_tiles*8-48){
-        g_after_boss=0; g_state=STATE_LEVEL_FADE; g_state_frame=0; return;
+        int next_level=g_current_level+1;
+        g_after_boss=0;
+        if(g_boss_level_flags[g_current_level]) music_stop_for_transition();
+        else music_prepare_level_transition(next_level);
+        g_state=STATE_LEVEL_FADE; g_state_frame=0; return;
     }
 
     if (pressed&JOY_SELECT) {
+        music_transition_to_title();
         show_black();
         load_menu_asset();
         enter_menu();
@@ -2295,6 +2646,7 @@ static void draw_menu_people(int walking)
 
 static void enter_boot(void)
 {
+    music_transition_to_title();
     show_black();
     upload_front_sprites();
     boot_exact_setup();
@@ -2401,6 +2753,7 @@ static void update_frontend(u16 pressed)
 #ifdef FORCE_LEVEL
             g_current_level=FORCE_LEVEL;
 #endif
+            music_stop_for_transition();
             g_state=STATE_MENU_WALK;
             g_state_frame=0;
             g_menu_mario_x=(s32)38*FIX_ONE;
@@ -2455,9 +2808,11 @@ static void update_frontend(u16 pressed)
             --g_continues;
             g_lives=4;
             Play_Sound_Sample(8,0,0);
+            music_stop_for_transition();
             g_continue_resume=1; g_state=STATE_CONTINUE_FADE; g_state_frame=0; return;
         }
         if (elapsed>=24+10*64) {
+            music_stop_for_transition();
             g_continue_resume=0; g_state=STATE_CONTINUE_FADE; g_state_frame=0; return;
         }
     } else if (g_state==STATE_CONTINUE_FADE) {
@@ -2492,6 +2847,7 @@ int main(void)
 {
     contrlr_pad_init(0);
     init_video();
+    music_init();
     enter_boot();
 
     for (;;) {
@@ -2503,6 +2859,7 @@ int main(void)
 
         if (g_state == STATE_PLAY) update_play(btn, pressed);
         else update_frontend(pressed);
+        music_update();
         ++g_state_frame;
     }
     return 0;
