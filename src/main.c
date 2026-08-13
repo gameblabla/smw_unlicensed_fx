@@ -1560,6 +1560,7 @@ static void draw_game_sprites(void)
     if (g_player_down) {
         paddr=(g_menu_choice==MENU_2P)?GAMEPLAY_DOWN_LUIGI_BASE_WORD:GAMEPLAY_DOWN_MARIO_BASE_WORD;
         pctrl=(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | CONTINUE_PLAYER_SPR_PAL);
+        py+=8;
     }
     int player_visible=1;
     int hud_yoff=(g_in_boss||(!g_in_boss&&g_current_level==2))?-16:0;
