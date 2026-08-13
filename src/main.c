@@ -1152,10 +1152,11 @@ static void init_objects(void)
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
-            /* Record word 9 is the original handler state. State 18 dispatches
-               to $B794 (flying Koopas); state 17 dispatches to $B7D2 and is
-               used by grounded enemies, including every Goomba variant. */
-            g_enemies[i].flying=(e[3]==18);
+            /* State 18 always dispatches to the red flying-Koopa handler.
+               Levels 7/8 additionally use their own airborne states; state
+               4 there is the stationary snake handler. */
+            g_enemies[i].flying=(e[3]==18 ||
+                ((g_current_level==6||g_current_level==7)&&e[3]!=4));
             g_enemies[i].flight_phase=0;
         }
     }

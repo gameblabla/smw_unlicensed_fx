@@ -17,7 +17,7 @@ LDFLAGS := -L$(V810GCC)/lib -L$(V810GCC)/$(PREFIX)/lib \
            -L$(V810GCC)/lib/gcc/$(PREFIX)/4.9.4 \
            $(V810GCC)/$(PREFIX)/lib/crt0.o --gc-sections
 LIBS := -lpcfx -lc -lsim -lgcc
-SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/game_levels_generated.c
+SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/music.c src/game_levels_generated.c
 ASM_SRCS := src/pcfx_tetsu_wait.S
 OBJS := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRCS)) $(patsubst src/%.S,$(OBJDIR)/%.o,$(ASM_SRCS))
 ELF := $(OBJDIR)/$(TARGET).elf
@@ -25,6 +25,10 @@ PROGRAM_BIN := $(OBJDIR)/$(TARGET).bin
 MAP := $(OBJDIR)/$(TARGET).map
 
 .PHONY: all disc clean assets editor apply-level-edits
+CDDA_TOOL := tools/build_cdda.py
+CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/forest.wav \
+             NEWMUSIC/graveyard.wav NEWMUSIC/nuclear\ dump.wav NEWMUSIC/staff.wav \
+             NEWMUSIC/street.wav NEWMUSIC/titlescreen.wav NEWMUSIC/world.wav
 all: disc
 assets:
 	KIT=$(KIT) python3 tools/prepare_boot_frames.py
@@ -48,7 +52,8 @@ $(PROGRAM_BIN): $(ELF)
 	$(OBJCOPY) -O binary $< $@
 out_ram.bin: $(PROGRAM_BIN)
 	$(BINCUT) out_ram.bin $(OBJDIR)/lbas_ram.h $(PROGRAM_BIN)
-disc: out_ram.bin cdlink.txt
+disc: out_ram.bin cdlink.txt $(CDDA_TOOL) $(CDDA_WAVS)
 	$(PCFX_CDLINK) cdlink.txt $(TARGET)
+	python3 $(CDDA_TOOL) --music-dir NEWMUSIC --output $(TARGET) --cue $(TARGET).cue --header src/cdda_tracks.h
 clean:
-	rm -rf $(OBJDIR) out_ram.bin $(TARGET).cue $(TARGET).bin
+	rm -rf $(OBJDIR) out_ram.bin $(TARGET).cue $(TARGET).bin $(TARGET)_*.bin

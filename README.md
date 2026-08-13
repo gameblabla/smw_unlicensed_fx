@@ -1,6 +1,6 @@
 # Super Mario Bros. (Mega Drive unlicensed) -> PC-FX reconstruction r12
 
-C reconstruction targeting PC-FX HuC6270 VDC hardware in TETSU 262-line / 5 MHz mode. Audio remains stubbed through the sample API; game graphics use VDC0/VDC1 rather than KING/Rainbow rendering.
+C reconstruction targeting PC-FX HuC6270 VDC hardware in TETSU 262-line / 5 MHz mode. Game graphics use VDC0/VDC1 rather than KING/Rainbow rendering; sound effects remain stubbed, while the score uses Red Book CD-DA.
 
 ## Revision 11: full level-data pass
 
@@ -70,6 +70,14 @@ With the PC-FX toolchain installed at `/opt/v810-gcc`:
 make clean
 make
 ```
+
+`make` converts the WAVs in `NEWMUSIC/` to 44.1 kHz stereo CD-DA tracks and
+appends them to `smb_pcfx.cue`. The track-number header is generated from the
+WAV names, so gameplay uses semantic names rather than a fragile file order.
+The source level loader's music table at `$65C0` maps to `world`, `forest`,
+`street`, `graveyard`, and `nuclear dump`; title/menu, boss and continue use
+their dedicated tracks. Music fades out and stops before level/death changes,
+then begins the incoming cue from zero after a short drive-settle delay.
 
 To regenerate the derived assets from the Mega Drive reconstruction kit and patched ROM:
 
