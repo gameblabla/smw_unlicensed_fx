@@ -100,11 +100,17 @@ extern void pcfx_tetsu_wait_frame(void);
 #endif
 #define ENEMY_VARIANT_WORDS ENEMY_VARIANT_VRAM_WORDS
 #define BOSS_BASE_WORD 0x7400
-#define BOSS_FLAME_BASE_WORD (BOSS_BASE_WORD + BOWSER_FRAME_WORDS * BOWSER_FRAME_COUNT)
 #define BOWSER_SPECIAL_FRAME_WORDS (7*6*64)
-#define BOSS_SPECIAL_BASE_WORD (BOSS_FLAME_BASE_WORD+384)
-#define BOWSER_SPECIAL_TELEPORT 0
-#define BOWSER_SPECIAL_BREATH 1
+#define BOWSER_HURT_BASE_WORD BOSS_BASE_WORD
+#define BOWSER_ANIM_BASE_WORD 0x7D00
+#define BOWSER_WALK_BASE_WORD 0xC800
+#define BOWSER_FLAME_BASE_WORD 0xDC00
+#define BOWSER_SPECIAL_FIRE 0
+#define BOWSER_SPECIAL_TELEPORT 2
+#define BOWSER_SPECIAL_RUN 5
+#define BOWSER_FIRE_FRAME_TICKS 7
+#define BOWSER_TELEPORT_FRAME_TICKS 3
+#define BOWSER_RUN_FRAME_TICKS 7
 #define BOSS_AUX_BASE_WORD 0xE000
 #define BOSS_RING_BASE_WORD BOSS_AUX_BASE_WORD
 #define BOSS_HAMMER_BASE_WORD (BOSS_AUX_BASE_WORD+256)
@@ -1702,27 +1708,37 @@ static void draw_game_sprites(void)
                 }
             }
         }else{
-        /* The real capture has four distinct walk cells and a separate
-           forward-leaning breath cell. State 3 is a solid fixed hurt pose;
-           the Mega Drive does not flicker the boss during this pause. */
+        /* The Genesis animation table at $71D2 selects two run frames at
+           seven ticks each, two fire frames at seven ticks each, and the
+           three teleport frames at three ticks each. Fire loops while its
+           projectile state is active; teleport is a single 9-tick sequence. */
+        int special=-1,t=g_boss_action_timer;
         if(g_boss_invuln>0)anim=8;
-        /* The generated special bank follows the source sheet order:
-           teleport first, then the breath pose.  Handler $7526's action 6
-           is the nine-frame relocation wind-up; once it completes, motion
-           advances to the next action and this falls back to a walk frame. */
-        else if(g_boss_class==0&&g_boss_action==6&&g_boss_action_timer<9)
-            anim=9+BOWSER_SPECIAL_TELEPORT;
-        else if(g_boss_class==0&&g_boss_action==5)
-            anim=9+BOWSER_SPECIAL_BREATH;
-        else anim=(g_boss_timer/10)&3;
-        if(anim>=9){
-            int special=anim-9;
-            mask=g_bowser_special_masks[special];
-            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOSS_SPECIAL_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        else if(g_boss_action==5){
+            if(t<1)t=1;
+            special=BOWSER_SPECIAL_FIRE+(((t-1)/BOWSER_FIRE_FRAME_TICKS)&1);
+            anim=9;
+        }else if(g_boss_action==6&&t>=1&&t<9){
+            special=BOWSER_SPECIAL_TELEPORT+(t-1)/BOWSER_TELEPORT_FRAME_TICKS;
+            if(special>BOWSER_SPECIAL_TELEPORT+2)special=BOWSER_SPECIAL_TELEPORT+2;
+            anim=9;
+        }else if(g_boss_action==3||g_boss_action==4){
+            if(t<1)t=1;
+            special=BOWSER_SPECIAL_RUN+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
+            anim=9;
         }else{
-            by+=pose_y_offset[anim]-16;
+            if(t<1)t=1;
+            /* Handler $7526 leaves actions 1/2 in graphics state 0. */
+            anim=((t-1)/BOWSER_RUN_FRAME_TICKS)&1;
+        }
+        if(anim>=9&&special>=0){
+            mask=g_bowser_special_masks[special];
+            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        }else{
             mask=g_bowser_masks[anim];
-            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(5-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOSS_BASE_WORD+anim*BOWSER_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+            by+=pose_y_offset[anim]-16;
+            u16 base=(anim==8)?BOWSER_HURT_BASE_WORD:(u16)(BOWSER_WALK_BASE_WORD+anim*BOWSER_FRAME_WORDS);
+            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(5-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
         }
         }
     }
@@ -1746,7 +1762,7 @@ static void draw_game_sprites(void)
         for(cy=0;cy<2&&n<64;++cy)for(cx=0;cx<3&&n<64;++cx){
             int cell=cy*3+cx,dx;if(!(g_bowser_flame_mask&(1u<<cell)))continue;
             dx=(g_boss_shot_vx<0)?(2-cx)*16:cx*16;
-            set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(BOSS_FLAME_BASE_WORD+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
+            set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(BOWSER_FLAME_BASE_WORD+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
         }
         }
     }
@@ -1867,9 +1883,22 @@ static void start_boss(int fade_in)
         for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(br->fg_bat[y*32+x],FG_TILE_BASE_INDEX));}
     }
     upload_game_sprites();
-    vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
-    if(bv)for(i=0;i<bv->frame_count*bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
-    else{for(i=0;i<BOWSER_FRAME_WORDS*BOWSER_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);for(i=0;i<BOWSER_SPECIAL_FRAME_WORDS*2;++i)vdc_vram_write(FRONT_CHIP,g_bowser_special_words[i]);}
+    if(bv){
+        vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
+        for(i=0;i<bv->frame_count*bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
+    }else{
+        /* Bowser only needs the captured hurt pose from the legacy bank. Keep
+           the seven source animation canvases in their own compact bank so
+           they cannot overwrite the hurt cells or the later-boss workspace. */
+        vdc_set_vram_write(FRONT_CHIP,BOWSER_HURT_BASE_WORD);
+        for(i=8*BOWSER_FRAME_WORDS;i<9*BOWSER_FRAME_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);
+        vdc_set_vram_write(FRONT_CHIP,BOWSER_WALK_BASE_WORD);
+        for(i=0;i<2*BOWSER_FRAME_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);
+        vdc_set_vram_write(FRONT_CHIP,BOWSER_FLAME_BASE_WORD);
+        for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);
+        vdc_set_vram_write(FRONT_CHIP,BOWSER_ANIM_BASE_WORD);
+        for(i=0;i<BOWSER_SPECIAL_FRAME_WORDS*BOWSER_SPECIAL_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_special_words[i]);
+    }
     if(bv){vdc_set_vram_write(FRONT_CHIP,BOSS_AUX_BASE_WORD);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_ring_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_hammer_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_bell_words[i]);for(i=0;i<512;++i)vdc_vram_write(FRONT_CHIP,g_boss_bomb_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_crate4_words[i]);if(g_boss_class==3)for(i=0;i<512;++i)vdc_vram_write(FRONT_CHIP,g_boss13_platform_words[i]);if(g_boss_class==1){vdc_set_vram_write(FRONT_CHIP,BOSS_WATER_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_boss_water_words[i]);}}
     init_objects();
 
