@@ -29,6 +29,13 @@ extern const short g_boss_hit_offsets[38];
 extern const unsigned long g_boss_handler_address[19];
 extern const BossVisualData g_later_boss_visuals[5];
 extern const unsigned char g_boss_collision[6144];
+#define ENEMY_RECORD_WORDS 8
+#define ENEMY_KIND_GENERIC 0
+#define ENEMY_KIND_MONKEY 1
+#define ENEMY_KIND_PTERODACTYL 2
+#define ENEMY_KIND_STRIKE_SNAKE 3
+#define ENEMY_KIND_CRATE_MIMIC 4
+#define ENEMY_KIND_FLOOR_SNAKE 5
 #define ENEMY_FRAME_WORDS 576
 #define ENEMY_VARIANT_VRAM_WORDS 1152
 #define BOWSER_SPECIAL_FRAME_COUNT 10

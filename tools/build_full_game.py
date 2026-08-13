@@ -478,7 +478,19 @@ def build_enemy_variants(r,levels):
                              has_hit_frame=(gfx not in no_hit_frame_gfx)))
         print('variant',idx,(gfx,base,sub),'wh',width,height,'mask',masks)
     keyidx={v['key']:i for i,v in enumerate(variants)}
-    # localize variants per level and rewrite enemy records as [x,y,local,state,flags,width,height]
+    # The 68000 dispatch selects behavior from the authored object family and
+    # state, not from the level number. Preserve that identity in each runtime
+    # record so shared behavior never has to infer a species from its stage.
+    def enemy_kind(gfx,state):
+        if gfx==6 and state==7: return 1  # monkey handler $C31A
+        if gfx==4 and state==5: return 2  # hanging pterodactyl
+        if gfx==5 and state==6: return 3  # long-strike snake
+        if gfx==1 and state==2: return 4  # crate mimic
+        if gfx==3 and state==4: return 5  # floor-opening snake $C62C
+        return 0
+
+    # Localize variants per level and rewrite enemy records as
+    # [x,y,local,state,flags,width,height,kind].
     for lev in levels:
         gids=[]
         for e in lev['enemies']:
@@ -488,7 +500,7 @@ def build_enemy_variants(r,levels):
         rec=[]
         for e in lev['enemies']:
             gi=keyidx[(e[2],e[3],e[4])]; v=variants[gi]
-            rec.append((e[0],e[1],loc[gi],e[5],e[6],v['width'],v['height']))
+            rec.append((e[0],e[1],loc[gi],e[5],e[6],v['width'],v['height'],enemy_kind(e[2],e[5])))
         lev['enemy_records']=rec
     return variants
 
@@ -935,6 +947,8 @@ def main():
     # Extend the legacy generated declaration block for the complete captured
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
+    hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
+        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('unsigned short mask0,mask1;','unsigned short mask0,mask1,mask2;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
                   'unsigned char width,height,has_hit_frame; } EnemyVariantData;')

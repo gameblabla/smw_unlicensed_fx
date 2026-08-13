@@ -70,9 +70,9 @@ extern void pcfx_tetsu_wait_frame(void);
 #define ENEMY_BASE_WORD  0x7400
 #define ENEMY_HIT_BASE_WORD 0xC800
 #define ENEMY_BANANA_BASE_WORD 0xDA00
-#define LEVEL8_SNAKE_BASE_WORD 0x9800
-#define LEVEL7_MONKEY_SPECIAL_BASE_WORD 0x9800
-#define LEVEL7_CRATE_WALK_BASE_WORD 0x9C80
+#define STRIKE_SNAKE_BASE_WORD 0x9800
+#define MONKEY_SPECIAL_BASE_WORD 0x9800
+#define CRATE_MIMIC_WALK_BASE_WORD 0x9C80
 #define FIREBALL_BASE_WORD 0x6E00
 #define HUD_HEART_BASE_WORD 0x7000
 #define HUD_DIGIT_BASE_WORD 0x7040
@@ -221,6 +221,7 @@ typedef struct {
     unsigned char width;
     unsigned char height;
     unsigned char state;
+    unsigned char kind;
     unsigned char flags;
     unsigned char defeated;
     unsigned char flying;
@@ -362,6 +363,15 @@ static Crate g_crates[MAX_CRATES];
 static Gem g_gems[MAX_GEMS];
 static Enemy g_enemies[MAX_ENEMIES];
 static EnemyShot g_enemy_shots[4];
+
+static int level_has_enemy_kind(unsigned char kind)
+{
+    int i;
+    if (!g_level) return 0;
+    for (i=0;i<g_level->enemy_count;++i)
+        if (g_level->enemies[i*ENEMY_RECORD_WORDS+7]==kind) return 1;
+    return 0;
+}
 static Fireball g_fireballs[MAX_FIREBALLS];
 static MovingPlatform g_moving_platforms[MAX_MOVING_PLATFORMS];
 static int g_moving_platform_count;
@@ -743,7 +753,7 @@ static void upload_game_sprites(void)
        generated table reproduces those combinations. Only variants referenced
        by the current level are copied to VDC1. */
     if (!g_in_boss && g_level) {
-        if(g_current_level==6||g_current_level==7){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
+        if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
         for(i=0;i<g_level->variant_count;++i) {
             int gi=g_level->variant_ids[i]; const EnemyVariantData *v=&g_enemy_variants[gi]; int line=-1;
             for(j=0;j<uniq;++j) if(palettes_equal(seen[j],v->palette)){ line=4+j; break; }
@@ -756,17 +766,19 @@ static void upload_game_sprites(void)
                 for(j=0;j<ENEMY_FRAME_WORDS;++j)vdc_vram_write(FRONT_CHIP,v->words[ENEMY_VARIANT_VRAM_WORDS+j]);
             }
         }
-        /* Level 8's snake strike is a genuine 64x40 metasprite and cannot
-           share the legacy 3x3-cell enemy frame.  The normal enemy bank for
-           this level ends exactly at $9800, leaving room for three 4x4 poses. */
-        if(g_current_level==7){
-            vdc_set_vram_write(FRONT_CHIP,LEVEL8_SNAKE_BASE_WORD);
+        /* The snake strike is a genuine 64x40 metasprite and cannot share the
+           legacy 3x3-cell enemy frame. Its authored variant set leaves room
+           at $9800 for the three 4x4 poses. */
+        if(level_has_enemy_kind(ENEMY_KIND_STRIKE_SNAKE)){
+            vdc_set_vram_write(FRONT_CHIP,STRIKE_SNAKE_BASE_WORD);
             for(i=0;i<3072;++i)vdc_vram_write(FRONT_CHIP,g_level8_snake_words[i]);
         }
-        if(g_current_level==6){
-            vdc_set_vram_write(FRONT_CHIP,LEVEL7_MONKEY_SPECIAL_BASE_WORD);
+        if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){
+            vdc_set_vram_write(FRONT_CHIP,MONKEY_SPECIAL_BASE_WORD);
             for(i=0;i<1152;++i)vdc_vram_write(FRONT_CHIP,g_monkey_special_words[i]);
-            vdc_set_vram_write(FRONT_CHIP,LEVEL7_CRATE_WALK_BASE_WORD);
+        }
+        if(level_has_enemy_kind(ENEMY_KIND_CRATE_MIMIC)){
+            vdc_set_vram_write(FRONT_CHIP,CRATE_MIMIC_WALK_BASE_WORD);
             for(i=0;i<1152;++i)vdc_vram_write(FRONT_CHIP,g_crate_walk_words[i]);
         }
     }
@@ -1198,15 +1210,14 @@ static void init_objects(void)
         }
         for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){g_gems[i].x=g_level->gems[i*2];g_gems[i].y=g_level->gems[i*2+1]-ycrop;g_gems[i].active=1;}
         for(i=0;i<g_level->enemy_count && i<MAX_ENEMIES;++i){
-            const short *e=&g_level->enemies[i*7];
+            const short *e=&g_level->enemies[i*ENEMY_RECORD_WORDS];
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
-            g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];
+            g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
-            /* State 18 always dispatches to the red flying-Koopa handler.
-               Levels 7/8 additionally use their own airborne states; state
-               4 there is the stationary snake handler. */
-            g_enemies[i].flying=(e[3]==18 ||
-                ((g_current_level==6||g_current_level==7)&&e[3]!=4));
+            /* State 18 dispatches to the red flying-Koopa handler. The other
+               airborne handlers are represented directly by enemy kind. */
+            g_enemies[i].flying=(e[3]==18 || e[7]==ENEMY_KIND_MONKEY ||
+                e[7]==ENEMY_KIND_PTERODACTYL);
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
 #ifdef FORCE_ENEMY_ACTION
@@ -1507,9 +1518,9 @@ static void update_enemies(void)
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
 
-        if(g_current_level==6||g_current_level==7){
+        if(e->kind!=ENEMY_KIND_GENERIC){
             int near=iabs_i(px-x);
-            if(e->state==7){ /* monkey: dormant until close, then slow swing/throw */
+            if(e->kind==ENEMY_KIND_MONKEY){ /* dormant until close, then slow swing/throw */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0){if(near<=96){e->behavior_phase=1;e->behavior_timer=0;}}
                 else if(e->behavior_phase==1){
@@ -1527,7 +1538,7 @@ static void update_enemies(void)
                     }
                 }else if(++e->behavior_timer>=20){e->behavior_phase=0;e->behavior_timer=0;}
                 y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
-            }else if(e->state==5){ /* pterodactyl: hide, then home when close */
+            }else if(e->kind==ENEMY_KIND_PTERODACTYL){ /* hide, then home when close */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0&&near<=70)e->behavior_phase=1;
                 if(e->behavior_phase&&((++e->behavior_timer)&1)==0){
@@ -1535,12 +1546,12 @@ static void update_enemies(void)
                     if(py<y)e->y-=FIX_ONE;else if(py>y)e->y+=FIX_ONE;
                 }
                 x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
-            }else if(e->state==6){ /* snake: hold, rear up, then long strike */
+            }else if(e->kind==ENEMY_KIND_STRIKE_SNAKE){ /* hold, rear up, then long strike */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0&&near<=72){e->behavior_phase=1;e->behavior_timer=0;}
                 else if(e->behavior_phase&&++e->behavior_timer>=72){e->behavior_phase=0;e->behavior_timer=0;}
                 goto enemy_attack_checks;
-            }else if(e->state==2){ /* crate mimic: reveal, pause, then walk */
+            }else if(e->kind==ENEMY_KIND_CRATE_MIMIC){ /* reveal, pause, then walk */
                 e->vy=0;
 #ifdef FORCE_CRATE_STAND
                 e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
@@ -1556,7 +1567,7 @@ static void update_enemies(void)
                 }
 #endif
                 x=(int)(e->x>>FIX_SHIFT);goto enemy_attack_checks;
-            }else if(e->state==4){ /* snake: fixed until its near-range strike */
+            }else if(e->kind==ENEMY_KIND_FLOOR_SNAKE){ /* fixed until its near-range strike */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0&&near<=64){e->behavior_phase=1;e->behavior_timer=0;}
                 else if(e->behavior_phase&&++e->behavior_timer>=64){e->behavior_phase=0;e->behavior_timer=0;}
@@ -1564,7 +1575,7 @@ static void update_enemies(void)
             }
         }
 
-        if ((g_current_level==6||g_current_level==7) && e->state==4) {
+        if (e->kind==ENEMY_KIND_FLOOR_SNAKE) {
             /* $C62C never applies horizontal movement or gravity. The snake
                remains at its authored floor opening. */
             e->vx=e->vy=0;
@@ -1873,7 +1884,7 @@ static void draw_game_sprites(void)
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
         /* The mimic's authored Y is the crate baseline.  Its revealed body
            grows upward from that footprint rather than down into the floor. */
-        if((g_current_level==6||g_current_level==7)&&e->state==2){
+        if(e->kind==ENEMY_KIND_CRATE_MIMIC){
             if(e->behavior_phase==1)sy-=8;       /* 24px crate -> 32px rise */
             else if(e->behavior_phase==2)sy-=14;/* walking art's visible baseline */
         }
@@ -1881,25 +1892,25 @@ static void draw_game_sprites(void)
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
         anim=(int)((g_state_frame/8)&1);
         if(e->defeated)anim=v->has_hit_frame?2:1;
-        else if(g_current_level==6||g_current_level==7){
-            if(e->state==7)anim=(e->behavior_phase==1)?((e->behavior_timer/12)&1):0;
-            else if(e->state==5)
+        else if(e->kind!=ENEMY_KIND_GENERIC){
+            if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==1)?((e->behavior_timer/12)&1):0;
+            else if(e->kind==ENEMY_KIND_PTERODACTYL)
                 /* The hanging pose is selector 0.  Once awake, alternate
                    both wide ROM frames instead of freezing on selector 1. */
                 anim=e->behavior_phase?(1+((e->behavior_timer/8)&1)):0;
-            else if(e->state==6)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
-            else if(e->state==2)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
-            else if(e->state==4)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
+            else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
+            else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
+            else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
         }
 #ifdef FORCE_SNAKE_FRAME
-        if(g_current_level==7&&e->state==6)anim=FORCE_SNAKE_FRAME;
+        if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=FORCE_SNAKE_FRAME;
 #endif
-        special_snake=(g_current_level==7&&e->state==6);
-        special_monkey=(g_current_level==6&&e->state==7&&(e->defeated||e->behavior_phase==2));
-        special_crate=(g_current_level==6&&e->state==2&&e->behavior_phase==2&&!e->defeated);
+        special_snake=(e->kind==ENEMY_KIND_STRIKE_SNAKE);
+        special_monkey=(e->kind==ENEMY_KIND_MONKEY&&(e->defeated||e->behavior_phase==2));
+        special_crate=(e->kind==ENEMY_KIND_CRATE_MIMIC&&e->behavior_phase==2&&!e->defeated);
         special_frame=e->defeated?1:0;
 #ifdef FORCE_MONKEY_HURT
-        if(g_current_level==6&&e->state==7){special_monkey=1;special_frame=1;}
+        if(e->kind==ENEMY_KIND_MONKEY){special_monkey=1;special_frame=1;}
 #endif
         if(special_snake){
             /* The long strike is 64x40 versus the 32x56 standing pose.
@@ -1915,7 +1926,7 @@ static void draw_game_sprites(void)
         for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
             int cell=cy*grid_cols+cx,dx;
             if(!(mask&(1u<<cell)))continue;dx=(e->vx>0)?(cols-1-cx)*16:cx*16;
-            u16 base=special_snake?(u16)(LEVEL8_SNAKE_BASE_WORD+anim*1024):(special_monkey?(u16)(LEVEL7_MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):(special_crate?(u16)(LEVEL7_CRATE_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):((anim==2)?(u16)(ENEMY_HIT_BASE_WORD+li*ENEMY_FRAME_WORDS):(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS))));
+            u16 base=special_snake?(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024):(special_monkey?(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):(special_crate?(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):((anim==2)?(u16)(ENEMY_HIT_BASE_WORD+li*ENEMY_FRAME_WORDS):(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS))));
             set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
         }
     }
