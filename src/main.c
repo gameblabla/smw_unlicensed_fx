@@ -2418,10 +2418,15 @@ static void update_play(u16 btn, u16 pressed)
     if ((pressed&JOY_II) && !g_crate_hide && g_lift_timer==0 && g_throw_timer==0) do_crate_action();
     if ((pressed&JOY_III) && g_lift_timer==0 && g_throw_timer==0) fire_fireball();
 
-    /* Camera hold belongs only to the stationary ground throw. A carried
-       crate/disguise must not freeze horizontal movement or scrolling. */
+    /* Grounded DOWN is a stationary crouch/disguise state. Exclude the jump
+       press so DOWN+JUMP can retain horizontal control as it leaves the floor;
+       the jump transition below clears the crouch/disguise state. */
     g_camera_hold=0;
-    if (g_lift_timer>0) {
+    if (g_grounded && (btn&JOY_DOWN) && !(pressed&JOY_I) &&
+        g_lift_timer==0 && g_throw_timer==0) {
+        g_vx=0;
+        g_camera_hold=1;
+    } else if (g_lift_timer>0) {
         --g_lift_timer;
         g_vx=0;
     } else if (g_throw_timer>0 && g_grounded) {
@@ -2437,9 +2442,9 @@ static void update_play(u16 btn, u16 pressed)
     } else g_vx=0;
 
     if (g_grounded && (pressed&JOY_I) && (btn&JOY_DOWN) && g_on_moving_platform!=-1) {
-        g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;g_player_down=0;g_crate_hide=0;
+        g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;g_player_down=0;g_crate_hide=0;g_camera_hold=0;
     } else if (g_grounded && (pressed&JOY_I) && g_lift_timer==0 && g_throw_timer==0) {
-        g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;g_player_down=0;g_crate_hide=0;
+        g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;g_player_down=0;g_crate_hide=0;g_camera_hold=0;
         Play_Sound_Sample(1,0,0);
     }
 
