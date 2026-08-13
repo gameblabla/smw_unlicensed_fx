@@ -1214,10 +1214,7 @@ static void init_objects(void)
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
-            /* State 18 dispatches to the red flying-Koopa handler. The other
-               airborne handlers are represented directly by enemy kind. */
-            g_enemies[i].flying=(e[3]==18 || e[7]==ENEMY_KIND_MONKEY ||
-                e[7]==ENEMY_KIND_PTERODACTYL);
+            g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA);
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
 #ifdef FORCE_ENEMY_ACTION
@@ -1584,21 +1581,10 @@ static void update_enemies(void)
         }
 
         if (e->flying) {
-            if(e->state==1||e->state==2)e->x-=FIX_ONE;
-            else if(e->state==5){
-                if(px<x)e->x-=FIX_ONE;else if(px>x)e->x+=FIX_ONE;
-                if(py<y)e->y-=FIX_ONE;else if(py>y)e->y+=FIX_ONE;
-            }
-            /* States 1/2 use the ROM-derived 58-step patrol profile. */
-            if(e->state==1||e->state==2)
-                e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
-            else if(e->state==7){
-                /* $C166 keeps the large attacker airborne between source
-                   object Y $90 and $E0 (screen-space 16..96). */
-                if(e->vy==0)e->vy=FIX_ONE;
-                if(y<=16)e->vy=FIX_ONE;else if(y>=96)e->vy=-FIX_ONE;
-                e->y+=e->vy;
-            }
+            /* Handler $B794 moves left and consumes one signed entry from
+               the exact 58-step ROM path on every update. */
+            e->x-=FIX_ONE;
+            e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
             if(++e->flight_phase>=58)e->flight_phase=0;
             x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
             /* $B794 never calls the terrain probes: the predetermined patrol

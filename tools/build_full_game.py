@@ -483,6 +483,7 @@ def build_enemy_variants(r,levels):
     # state, not from the level number. Preserve that identity in each runtime
     # record so shared behavior never has to infer a species from its stage.
     def enemy_kind(gfx,state):
+        if state==18: return 6            # red flying-Koopa handler $B794
         if gfx==6 and state==7: return 1  # monkey handler $C31A
         if gfx==4 and state==5: return 2  # hanging pterodactyl
         if gfx==5 and state==6: return 3  # long-strike snake
@@ -949,7 +950,7 @@ def main():
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
-        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_FRAME_WORDS 576')
+        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('unsigned short mask0,mask1;','unsigned short mask0,mask1,mask2;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
                   'unsigned char width,height,has_hit_frame; } EnemyVariantData;')
