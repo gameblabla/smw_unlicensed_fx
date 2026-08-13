@@ -76,7 +76,10 @@ extern void pcfx_tetsu_wait_frame(void);
 #define CONTINUE_TILE_BASE_WORD 0x2000
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
 #define CONTINUE_DIGIT_BASE_WORD 0xA000
-#define GAMEPLAY_DOWN_MARIO_BASE_WORD 0x8C00
+/* Enemy graphics are streamed from 0x7400 and the largest level uses 13
+   0x480-word variant banks, ending below 0xB000. Keep the reference player
+   banks beyond that dynamic range so level setup cannot overwrite them. */
+#define GAMEPLAY_DOWN_MARIO_BASE_WORD 0xB000
 #define GAMEPLAY_DOWN_LUIGI_BASE_WORD (GAMEPLAY_DOWN_MARIO_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
 #define CONTINUE_PLAYER_BASE_WORD (GAMEPLAY_DOWN_LUIGI_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
 #define CONTINUE_LUIGI_BASE_WORD (CONTINUE_PLAYER_BASE_WORD + 2 * PLAYER_FRAME_WORDS_LOCAL)
@@ -1778,8 +1781,8 @@ static void draw_continue_digit(void)
     if (d<0) d=0; if (d>9) d=9;
     for (i=0;i<3;++i) {
         u16 ctrl=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_1|CONTINUE_PLAYER_SPR_PAL);
-        set_sprite_entry(satb,i,72,48,(u16)(CONTINUE_PLAYER_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL+i*PLAYER_STRIP_WORDS),ctrl);
-        set_sprite_entry(satb,3+i,152,48,(u16)(CONTINUE_LUIGI_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL+i*PLAYER_STRIP_WORDS),ctrl);
+        set_sprite_entry(satb,i,72,48+i*16,(u16)(CONTINUE_PLAYER_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL+i*PLAYER_STRIP_WORDS),ctrl);
+        set_sprite_entry(satb,3+i,152,48+i*16,(u16)(CONTINUE_LUIGI_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL+i*PLAYER_STRIP_WORDS),ctrl);
     }
     set_sprite_entry(satb,6,116,152,(u16)(CONTINUE_DIGIT_BASE_WORD+d*256),
         (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|15));
@@ -2307,7 +2310,11 @@ static void update_play(u16 btn, u16 pressed)
     }
     if (g_paused) return;
     g_crate_hide=(g_carry_index>=0&&g_grounded&&(btn&JOY_DOWN))?1:0;
-    g_player_down=(g_carry_index<0&&g_grounded&&g_lift_timer==0&&g_throw_timer==0&&(btn&JOY_DOWN))?1:0;
+    /* DOWN selects the dedicated 32x40 crouch pose directly.  The source
+       object changes pose from the button state; tying it to the collision
+       grounded flag made the pose disappear during the first settling frames
+       and on slightly stepped terrain. */
+    g_player_down=(g_carry_index<0&&g_lift_timer==0&&g_throw_timer==0&&(btn&JOY_DOWN))?1:0;
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
