@@ -2,6 +2,7 @@
 /build/
 *.iso
 *.bin
+!assets/reference/boss/layers/boss16/*.bin
 *.cue
 *.zip
 *.mcr

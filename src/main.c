@@ -8,7 +8,8 @@
  *   TETSU  : 262-line, 5 MHz dot clock
  *   VDC0   : Mega Drive Plane B analogue (background/parallax)
  *   VDC1   : Mega Drive Plane A analogue + sprites/HUD
- *   KING/RAINBOW unused; sound effects are stubbed and music is Red Book CD-DA.
+ *   KING/RAINBOW unused; KRAM page 1 holds 16 kHz ADPCM effects and music is
+ *   Red Book CD-DA.
  *
  * Source geometry is not vertically centered. The MD V28 active picture starts
  * at the native raster position; the PC-FX BATs and metasprite anchors use the
@@ -67,6 +68,11 @@ extern void pcfx_tetsu_wait_frame(void);
 #define CRATE_BASE_WORD  0x6800
 #define GEM_BASE_WORD    0x6900
 #define ENEMY_BASE_WORD  0x7400
+#define ENEMY_HIT_BASE_WORD 0xC800
+#define ENEMY_BANANA_BASE_WORD 0xDA00
+#define LEVEL8_SNAKE_BASE_WORD 0x9800
+#define LEVEL7_MONKEY_SPECIAL_BASE_WORD 0x9800
+#define LEVEL7_CRATE_WALK_BASE_WORD 0x9C80
 #define FIREBALL_BASE_WORD 0x6E00
 #define HUD_HEART_BASE_WORD 0x7000
 #define HUD_DIGIT_BASE_WORD 0x7040
@@ -76,12 +82,14 @@ extern void pcfx_tetsu_wait_frame(void);
 #define CONTINUE_TILE_BASE_WORD 0x2000
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
 #define CONTINUE_DIGIT_BASE_WORD 0xA000
-/* Enemy graphics are streamed from 0x7400 and the largest level uses 13
-   0x480-word variant banks, ending below 0xB000. Keep the reference player
-   banks beyond that dynamic range so level setup cannot overwrite them. */
-#define GAMEPLAY_DOWN_MARIO_BASE_WORD 0xB000
+/* Crouch art must survive both the normal enemy stream and boss uploads.
+   Bowser's expanded ten-pose bank occupies 0x7400..0xdcff, while the later
+   bosses' auxiliary objects can reach 0xe940.  Start at the next 0x80-word
+   boundary required by 32-pixel-wide VDC sprite patterns; the gap to the SATB
+   buffers is still large enough for both 0x180-word crouch poses. */
+#define GAMEPLAY_DOWN_MARIO_BASE_WORD 0xE980
 #define GAMEPLAY_DOWN_LUIGI_BASE_WORD (GAMEPLAY_DOWN_MARIO_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
-#define CONTINUE_PLAYER_BASE_WORD (GAMEPLAY_DOWN_LUIGI_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
+#define CONTINUE_PLAYER_BASE_WORD 0xB300
 #define CONTINUE_LUIGI_BASE_WORD (CONTINUE_PLAYER_BASE_WORD + 2 * PLAYER_FRAME_WORDS_LOCAL)
 #define CONTINUE_PLAYER_SPR_PAL 14
 #define CONTINUE_PLAYER_FRAME_TICKS 8
@@ -98,16 +106,23 @@ extern void pcfx_tetsu_wait_frame(void);
 #if (BOOT_LUIGI_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > PUSH_BASE_WORD
 #error "boot Luigi bank overlaps title sprite assets"
 #endif
+#if (GAMEPLAY_DOWN_LUIGI_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL) > SATB_BASE0
+#error "gameplay crouch banks overlap SATB"
+#endif
+#if (GAMEPLAY_DOWN_MARIO_BASE_WORD % PLAYER_STRIP_WORDS) != 0 || \
+    (GAMEPLAY_DOWN_LUIGI_BASE_WORD % PLAYER_STRIP_WORDS) != 0
+#error "gameplay crouch banks must be aligned for 32-pixel-wide sprites"
+#endif
 #define ENEMY_VARIANT_WORDS ENEMY_VARIANT_VRAM_WORDS
 #define BOSS_BASE_WORD 0x7400
 #define BOWSER_SPECIAL_FRAME_WORDS (7*6*64)
-#define BOWSER_HURT_BASE_WORD BOSS_BASE_WORD
-#define BOWSER_ANIM_BASE_WORD 0x7D00
-#define BOWSER_WALK_BASE_WORD 0xC800
-#define BOWSER_FLAME_BASE_WORD 0xDC00
-#define BOWSER_SPECIAL_FIRE 0
-#define BOWSER_SPECIAL_TELEPORT 2
-#define BOWSER_SPECIAL_RUN 5
+#define BOWSER_ANIM_BASE_WORD BOSS_BASE_WORD
+#define BOWSER_FLAME_BASE_WORD 0xDD00
+#define BOWSER_SPECIAL_NORMAL 0
+#define BOWSER_SPECIAL_FIRE 2
+#define BOWSER_SPECIAL_TELEPORT 4
+#define BOWSER_SPECIAL_RUN 7
+#define BOWSER_SPECIAL_HURT 9
 #define BOWSER_FIRE_FRAME_TICKS 7
 #define BOWSER_TELEPORT_FRAME_TICKS 3
 #define BOWSER_RUN_FRAME_TICKS 7
@@ -125,6 +140,7 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BOSS13_PLATFORM_SPR_PAL 10
 #define BOSS_WATER_SPR_PAL 15
 #define BOSS_SPR_PAL_AUX 9
+#define BOSS_CROUCH_SPR_PAL 8
 #define PLAYER_SPR_PAL 13
 #define BOSS_SPR_PAL 14
 #define BOSS_HURT_FRAMES 30
@@ -209,6 +225,8 @@ typedef struct {
     unsigned char defeated;
     unsigned char flying;
     unsigned char flight_phase;
+    unsigned char behavior_phase;
+    unsigned char behavior_timer;
 } Enemy;
 
 typedef struct {
@@ -216,6 +234,8 @@ typedef struct {
     unsigned char active;
     unsigned char life;
 } Fireball;
+
+typedef struct { s32 x,y,vx,vy; unsigned char active,palette; } EnemyShot;
 
 typedef struct {
     s32 x, y;
@@ -306,6 +326,10 @@ static s32 g_boss_x,g_boss_y,g_boss_vx,g_boss_vy;
 static int g_boss_hp,g_boss_timer,g_boss_invuln,g_boss_defeated;
 static int g_boss_class,g_boss_phase,g_boss_face=1,g_boss_ground_y;
 static int g_boss_action,g_boss_action_timer,g_boss_action_dir;
+/* Bowser's script cursor is not itself the Mega Drive action/state number.
+   Each six-byte record selected by $6F3A supplies the action separately. */
+static const unsigned char g_bowser_action_script[12]={1,5,2,6,3,4,1,5,2,5,3,4};
+static const unsigned char g_bowser_direction_script[12]={0,1,1,1,0,1,0,1,1,0,0,1};
 static int g_boss_script_index;
 static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx,g_boss_shot_vy;
 static int g_boss_shot_active;
@@ -337,6 +361,7 @@ static const unsigned char g_boss8_script[]={
 static Crate g_crates[MAX_CRATES];
 static Gem g_gems[MAX_GEMS];
 static Enemy g_enemies[MAX_ENEMIES];
+static EnemyShot g_enemy_shots[4];
 static Fireball g_fireballs[MAX_FIREBALLS];
 static MovingPlatform g_moving_platforms[MAX_MOVING_PLATFORMS];
 static int g_moving_platform_count;
@@ -679,6 +704,7 @@ static void upload_game_sprites(void)
        the same Mario/object colors there. */
     for (i=0;i<16;++i) tetsu_set_palette((u16)(PLAYER_SPR_PAL*16+i),g_player_palette[i]);
     for (i=0;i<16;++i) tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),g_continue_player_palette[i]);
+    if(g_in_boss)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_CROUCH_SPR_PAL*16+i),g_continue_player_palette[i]);
 
     vdc_set_vram_write(FRONT_CHIP, PLAYER_BASE_WORD);
     for (i=0;i<PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL;++i) vdc_vram_write(FRONT_CHIP,g_player_frame_words[i]);
@@ -717,6 +743,7 @@ static void upload_game_sprites(void)
        generated table reproduces those combinations. Only variants referenced
        by the current level are copied to VDC1. */
     if (!g_in_boss && g_level) {
+        if(g_current_level==6||g_current_level==7){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
         for(i=0;i<g_level->variant_count;++i) {
             int gi=g_level->variant_ids[i]; const EnemyVariantData *v=&g_enemy_variants[gi]; int line=-1;
             for(j=0;j<uniq;++j) if(palettes_equal(seen[j],v->palette)){ line=4+j; break; }
@@ -724,6 +751,23 @@ static void upload_game_sprites(void)
             g_enemy_palette_line[i]=(unsigned char)line;
             vdc_set_vram_write(FRONT_CHIP,(u16)(ENEMY_BASE_WORD+i*ENEMY_VARIANT_VRAM_WORDS));
             for(j=0;j<ENEMY_VARIANT_VRAM_WORDS;++j)vdc_vram_write(FRONT_CHIP,v->words[j]);
+            if(v->has_hit_frame){
+                vdc_set_vram_write(FRONT_CHIP,(u16)(ENEMY_HIT_BASE_WORD+i*ENEMY_FRAME_WORDS));
+                for(j=0;j<ENEMY_FRAME_WORDS;++j)vdc_vram_write(FRONT_CHIP,v->words[ENEMY_VARIANT_VRAM_WORDS+j]);
+            }
+        }
+        /* Level 8's snake strike is a genuine 64x40 metasprite and cannot
+           share the legacy 3x3-cell enemy frame.  The normal enemy bank for
+           this level ends exactly at $9800, leaving room for three 4x4 poses. */
+        if(g_current_level==7){
+            vdc_set_vram_write(FRONT_CHIP,LEVEL8_SNAKE_BASE_WORD);
+            for(i=0;i<3072;++i)vdc_vram_write(FRONT_CHIP,g_level8_snake_words[i]);
+        }
+        if(g_current_level==6){
+            vdc_set_vram_write(FRONT_CHIP,LEVEL7_MONKEY_SPECIAL_BASE_WORD);
+            for(i=0;i<1152;++i)vdc_vram_write(FRONT_CHIP,g_monkey_special_words[i]);
+            vdc_set_vram_write(FRONT_CHIP,LEVEL7_CRATE_WALK_BASE_WORD);
+            for(i=0;i<1152;++i)vdc_vram_write(FRONT_CHIP,g_crate_walk_words[i]);
         }
     }
 }
@@ -769,6 +813,11 @@ static void set_game_palette_fade(int level)
        palette on a dedicated sprite line. */
     if(!g_in_boss&&g_current_level>=6&&g_current_level<=8)
         for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_pot_palette[i],level));
+    /* Boss bodies own palette line 14, which the continue room normally uses
+       for the separately indexed crouch art. Keep an independent boss-room
+       copy after every boss/background palette update. */
+    if(g_in_boss)for(i=0;i<16;++i)
+        tetsu_set_palette((u16)(BOSS_CROUCH_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
     g_game_fade_level=level;
 }
 
@@ -1141,6 +1190,7 @@ static void init_objects(void)
     for(i=0;i<MAX_CRATES;++i){g_crates[i].active=0;g_crates[i].carried=0;g_crates[i].thrown=0;}
     for(i=0;i<MAX_GEMS;++i)g_gems[i].active=0;
     for(i=0;i<MAX_ENEMIES;++i)g_enemies[i].active=0;
+    for(i=0;i<4;++i)g_enemy_shots[i].active=0;
     if(!g_in_boss && g_level){
         for(i=0;i<g_level->crate_count && i<MAX_CRATES;++i){
             g_crates[i].x=(s32)g_level->crates[i*3]<<FIX_SHIFT;g_crates[i].y=(s32)(g_level->crates[i*3+1]-ycrop)<<FIX_SHIFT;
@@ -1158,6 +1208,12 @@ static void init_objects(void)
             g_enemies[i].flying=(e[3]==18 ||
                 ((g_current_level==6||g_current_level==7)&&e[3]!=4));
             g_enemies[i].flight_phase=0;
+            g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
+#ifdef FORCE_ENEMY_ACTION
+            if(g_enemies[i].state==2||g_enemies[i].state==4||g_enemies[i].state==5||g_enemies[i].state==6||g_enemies[i].state==7){
+                g_enemies[i].behavior_phase=1;g_enemies[i].behavior_timer=40;
+            }
+#endif
         }
     }
     init_moving_platforms();
@@ -1258,7 +1314,7 @@ static void do_crate_action(void)
         /* Ground throws lock horizontal control; airborne throws preserve
            Mario's current air control and therefore must not pre-emptively
            zero velocity/camera here. update_play() applies the ground lock. */
-        Play_Sound_Sample(2,0,0);
+        Play_Sound_Sample(SFX_CRATE_THROW,0,0);
     } else {
         int i = find_pickup_crate();
         if (i >= 0) {
@@ -1267,7 +1323,6 @@ static void do_crate_action(void)
             g_crates[i].thrown = 0;
             g_lift_timer = 18;
             g_vx = 0;
-            Play_Sound_Sample(2,0,0);
         }
     }
 }
@@ -1287,7 +1342,7 @@ static void fire_fireball(void)
     f->life=52;
     g_throw_timer=31;
     /* As with a crate throw, air firing keeps normal horizontal control. */
-    Play_Sound_Sample(6,0,0);
+    Play_Sound_Sample(SFX_FIREBALL,0,0);
 }
 
 static void defeat_enemy(Enemy *e)
@@ -1296,7 +1351,7 @@ static void defeat_enemy(Enemy *e)
     e->defeated=1;
     e->vx=0;
     e->vy=FIX_ONE;
-    Play_Sound_Sample(4,0,0);
+    Play_Sound_Sample(SFX_BOSS_HIT,0,0);
 }
 
 static void update_fireballs(void)
@@ -1337,7 +1392,7 @@ static void update_gems(void)
                  g_gems[i].x, g_gems[i].y, GEM_W, GEM_H)) {
             g_gems[i].active = 0;
             ++g_gem_count;
-            Play_Sound_Sample(3,0,0);
+            Play_Sound_Sample(SFX_BLUE_CRYSTAL,0,0);
         }
     }
 }
@@ -1363,7 +1418,7 @@ static void begin_player_death(void)
     /* A retry must begin its level cue at index 00, never at the position the
        player died.  Start the fade while the death animation is still shown. */
     music_stop_for_transition();
-    Play_Sound_Sample(5,0,0);
+    Play_Sound_Sample(SFX_PLAYER_DEATH,0,0);
 }
 
 static void hurt_player(void)
@@ -1377,8 +1432,45 @@ static void hurt_player(void)
     g_invuln=HURT_FRAMES;
     g_hurt_pending_death=(g_player_hearts<=0);
     /* Source behavior is a one-second hurt interval rather than immediate
-       death.  The real sample is intentionally still stubbed in this port. */
-    Play_Sound_Sample(7,0,0);
+       death. */
+    Play_Sound_Sample(SFX_PLAYER_HURT,0,0);
+}
+
+/* A resting crate is terrain for ordinary level enemies.  Carried crates have
+   no world body, and a thrown crate keeps its projectile behavior below. */
+static int enemy_crate_blocked(const Enemy *e, s32 next_x, int y)
+{
+    int i;
+    int x=(int)(next_x>>FIX_SHIFT);
+    for (i=0;i<MAX_CRATES;++i) {
+        const Crate *c=&g_crates[i];
+        int cx,cy;
+        if (!c->active || c->carried || c->thrown) continue;
+        cx=(int)(c->x>>FIX_SHIFT);
+        cy=(int)(c->y>>FIX_SHIFT);
+        if (aabb(x,y+3,e->width,e->height-6,cx,cy,CRATE_W,CRATE_H))
+            return 1;
+    }
+    return 0;
+}
+
+/* Resting crates are walkable floors as well as side obstacles.  Keeping the
+   top contact separate prevents a falling enemy from treating its landing as
+   a side collision and endlessly turning in place. */
+static int enemy_crate_floor_top(const Enemy *e, int x, int old_bottom,
+                                 int new_bottom)
+{
+    int i,best=0x7FFF;
+    for (i=0;i<MAX_CRATES;++i) {
+        const Crate *c=&g_crates[i];
+        int cx,cy;
+        if (!c->active || c->carried || c->thrown) continue;
+        cx=(int)(c->x>>FIX_SHIFT);
+        cy=(int)(c->y>>FIX_SHIFT);
+        if (x+e->width-3<=cx || x+3>=cx+CRATE_W) continue;
+        if (old_bottom<=cy+1 && new_bottom>=cy && cy<best) best=cy;
+    }
+    return best;
 }
 
 static void update_enemies(void)
@@ -1394,6 +1486,7 @@ static void update_enemies(void)
 
         if (!e->active) continue;
         x=(int)(e->x>>FIX_SHIFT);
+        y=(int)(e->y>>FIX_SHIFT);
         h=e->height;
 
         if (e->defeated) {
@@ -1414,9 +1507,87 @@ static void update_enemies(void)
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
 
+        if(g_current_level==6||g_current_level==7){
+            int near=iabs_i(px-x);
+            if(e->state==7){ /* monkey: dormant until close, then slow swing/throw */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0){if(near<=96){e->behavior_phase=1;e->behavior_timer=0;}}
+                else if(e->behavior_phase==1){
+                    ++e->behavior_timer;
+                    if((e->behavior_timer%3)==0){
+                        if(y<=16)e->vy=FIX_ONE;else if(y>=96)e->vy=-FIX_ONE;
+                        if(e->vy==0)e->vy=FIX_ONE;e->y+=e->vy;
+                    }
+                    if(e->behavior_timer>=120){
+                        int k;e->behavior_phase=2;e->behavior_timer=0;
+                        for(k=0;k<4;++k)if(!g_enemy_shots[k].active){
+                            EnemyShot *s=&g_enemy_shots[k];s->active=1;s->x=e->x+16*FIX_ONE;s->y=e->y+24*FIX_ONE;
+                            s->vx=(px<x)?-2*FIX_ONE:2*FIX_ONE;s->vy=-2*FIX_ONE;s->palette=g_enemy_palette_line[e->variant];break;
+                        }
+                    }
+                }else if(++e->behavior_timer>=20){e->behavior_phase=0;e->behavior_timer=0;}
+                y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->state==5){ /* pterodactyl: hide, then home when close */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0&&near<=70)e->behavior_phase=1;
+                if(e->behavior_phase&&((++e->behavior_timer)&1)==0){
+                    if(px<x)e->x-=FIX_ONE;else if(px>x)e->x+=FIX_ONE;
+                    if(py<y)e->y-=FIX_ONE;else if(py>y)e->y+=FIX_ONE;
+                }
+                x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->state==6){ /* snake: hold, rear up, then long strike */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0&&near<=72){e->behavior_phase=1;e->behavior_timer=0;}
+                else if(e->behavior_phase&&++e->behavior_timer>=72){e->behavior_phase=0;e->behavior_timer=0;}
+                goto enemy_attack_checks;
+            }else if(e->state==2){ /* crate mimic: reveal, pause, then walk */
+                e->vy=0;
+#ifdef FORCE_CRATE_STAND
+                e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
+#else
+                if(e->behavior_phase==0){
+                    e->vx=0;
+                    if(near<=60){e->behavior_phase=1;e->behavior_timer=0;}
+                }
+                else if(e->behavior_phase==1&&++e->behavior_timer>=24){e->behavior_phase=2;e->behavior_timer=0;e->vx=-FIX_ONE;}
+                else if(e->behavior_phase==2){
+                    if(enemy_crate_blocked(e,e->x+e->vx,y)) e->vx=-e->vx;
+                    else e->x+=e->vx;
+                }
+#endif
+                x=(int)(e->x>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->state==4){ /* snake: fixed until its near-range strike */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0&&near<=64){e->behavior_phase=1;e->behavior_timer=0;}
+                else if(e->behavior_phase&&++e->behavior_timer>=64){e->behavior_phase=0;e->behavior_timer=0;}
+                y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }
+        }
+
+        if ((g_current_level==6||g_current_level==7) && e->state==4) {
+            /* $C62C never applies horizontal movement or gravity. The snake
+               remains at its authored floor opening. */
+            e->vx=e->vy=0;
+            y=(int)(e->y>>FIX_SHIFT);
+            goto enemy_attack_checks;
+        }
+
         if (e->flying) {
-            e->x-=FIX_ONE;
-            e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
+            if(e->state==1||e->state==2)e->x-=FIX_ONE;
+            else if(e->state==5){
+                if(px<x)e->x-=FIX_ONE;else if(px>x)e->x+=FIX_ONE;
+                if(py<y)e->y-=FIX_ONE;else if(py>y)e->y+=FIX_ONE;
+            }
+            /* States 1/2 use the ROM-derived 58-step patrol profile. */
+            if(e->state==1||e->state==2)
+                e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
+            else if(e->state==7){
+                /* $C166 keeps the large attacker airborne between source
+                   object Y $90 and $E0 (screen-space 16..96). */
+                if(e->vy==0)e->vy=FIX_ONE;
+                if(y<=16)e->vy=FIX_ONE;else if(y>=96)e->vy=-FIX_ONE;
+                e->y+=e->vy;
+            }
             if(++e->flight_phase>=58)e->flight_phase=0;
             x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
             /* $B794 never calls the terrain probes: the predetermined patrol
@@ -1434,21 +1605,31 @@ static void update_enemies(void)
             int nxi=(int)(nx>>FIX_SHIFT);
             int side=e->vx>0?nxi+e->width-1:nxi;
             y=(int)(e->y>>FIX_SHIFT);
-            if (solid_h(side,y+8)||solid_h(side,y+h-3))
+            if (solid_h(side,y+8)||solid_h(side,y+h-3) ||
+                enemy_crate_blocked(e,nx,y))
                 e->vx=-e->vx;
             else
                 e->x=nx;
         }
 
-        e->y+=e->vy;
-        x=(int)(e->x>>FIX_SHIFT);
-        y=(int)(e->y>>FIX_SHIFT);
-        bottom=y+h-1;
-        if (e->vy>=0 && (solid_v(x+3,bottom)||solid_v(x+e->width-4,bottom))) {
-            int top=(bottom>>3)<<3;
-            e->y=(s32)(top-h)<<FIX_SHIFT;
-            e->vy=0;
-            y=top-h;
+        {
+            int old_bottom=y+h-1;
+            e->y+=e->vy;
+            x=(int)(e->x>>FIX_SHIFT);
+            y=(int)(e->y>>FIX_SHIFT);
+            bottom=y+h-1;
+            {
+                int top=0x7FFF;
+                int crate_top=enemy_crate_floor_top(e,x,old_bottom,bottom);
+                if (e->vy>=0 && (solid_v(x+3,bottom)||solid_v(x+e->width-4,bottom)))
+                    top=(bottom>>3)<<3;
+                if (crate_top<top) top=crate_top;
+                if (top!=0x7FFF) {
+                    e->y=(s32)(top-h)<<FIX_SHIFT;
+                    e->vy=0;
+                    y=top-h;
+                }
+            }
         }
 
 enemy_attack_checks:
@@ -1492,6 +1673,17 @@ enemy_attack_checks:
                 hurt_player();
             }
         }
+    }
+}
+
+static void update_enemy_shots(void)
+{
+    int i,px=player_body_x(),py=player_body_y();
+    for(i=0;i<4;++i){EnemyShot *s=&g_enemy_shots[i];int x,y;if(!s->active)continue;
+        s->x+=s->vx;s->vy+=48;if(s->vy>4*FIX_ONE)s->vy=4*FIX_ONE;s->y+=s->vy;
+        x=(int)(s->x>>FIX_SHIFT);y=(int)(s->y>>FIX_SHIFT);
+        if(x<g_camera_x-24||x>g_camera_x+280||y>240){s->active=0;continue;}
+        if(g_invuln==0&&aabb(px,py,PLAYER_BODY_W,PLAYER_BODY_H,x,y,16,16)){hurt_player();s->active=0;}
     }
 }
 
@@ -1560,7 +1752,8 @@ static void draw_game_sprites(void)
     u16 paddr = (u16)(PLAYER_BASE_WORD + (frame-1) * PLAYER_FRAME_WORDS_LOCAL);
     if (g_player_down && g_grounded) {
         paddr=(g_menu_choice==MENU_2P)?GAMEPLAY_DOWN_LUIGI_BASE_WORD:GAMEPLAY_DOWN_MARIO_BASE_WORD;
-        pctrl=(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | CONTINUE_PLAYER_SPR_PAL);
+        pctrl=(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 |
+                    (g_in_boss?BOSS_CROUCH_SPR_PAL:CONTINUE_PLAYER_SPR_PAL));
         py+=8;
     }
     int player_visible=1;
@@ -1674,26 +1867,69 @@ static void draw_game_sprites(void)
     }
 
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
-        int sx,sy,anim,li,gi,cx,cy,cols,rows; unsigned mask; u16 flip;
+        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame; unsigned mask; u16 flip;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
+        /* The mimic's authored Y is the crate baseline.  Its revealed body
+           grows upward from that footprint rather than down into the floor. */
+        if((g_current_level==6||g_current_level==7)&&e->state==2){
+            if(e->behavior_phase==1)sy-=8;       /* 24px crate -> 32px rise */
+            else if(e->behavior_phase==2)sy-=14;/* walking art's visible baseline */
+        }
         if(sx<-56||sx>255||sy<-56||sy>239)continue;
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
-        anim=(int)((g_state_frame/8)&1);mask=anim?v->mask1:v->mask0;cols=(e->width+15)>>4;rows=(e->height+15)>>4;flip=(e->vx>0)?VDC_SPR_X_INVERT:0;
-        for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
-            int cell=cy*3+cx,dx;
-            if(!(mask&(1u<<cell)))continue;dx=(e->vx>0)?(cols-1-cx)*16:cx*16;
-            set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
+        anim=(int)((g_state_frame/8)&1);
+        if(e->defeated)anim=v->has_hit_frame?2:1;
+        else if(g_current_level==6||g_current_level==7){
+            if(e->state==7)anim=(e->behavior_phase==1)?((e->behavior_timer/12)&1):0;
+            else if(e->state==5)
+                /* The hanging pose is selector 0.  Once awake, alternate
+                   both wide ROM frames instead of freezing on selector 1. */
+                anim=e->behavior_phase?(1+((e->behavior_timer/8)&1)):0;
+            else if(e->state==6)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
+            else if(e->state==2)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
+            else if(e->state==4)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
         }
+#ifdef FORCE_SNAKE_FRAME
+        if(g_current_level==7&&e->state==6)anim=FORCE_SNAKE_FRAME;
+#endif
+        special_snake=(g_current_level==7&&e->state==6);
+        special_monkey=(g_current_level==6&&e->state==7&&(e->defeated||e->behavior_phase==2));
+        special_crate=(g_current_level==6&&e->state==2&&e->behavior_phase==2&&!e->defeated);
+        special_frame=e->defeated?1:0;
+#ifdef FORCE_MONKEY_HURT
+        if(g_current_level==6&&e->state==7){special_monkey=1;special_frame=1;}
+#endif
+        if(special_snake){
+            /* The long strike is 64x40 versus the 32x56 standing pose.
+               Both use the same ground baseline in the Mega Drive SAT, so
+               compensate for the strike canvas being sixteen pixels shorter. */
+            if(anim==2){sx-=32;sy+=16;}
+            mask=g_level8_snake_masks[anim];cols=rows=grid_cols=4;
+        }
+        else if(special_monkey){mask=g_monkey_special_masks[special_frame];cols=rows=grid_cols=3;}
+        else if(special_crate){special_frame=(g_state_frame/10)&1;mask=g_crate_walk_masks[special_frame];cols=rows=grid_cols=3;}
+        else{mask=(anim==2)?v->mask2:(anim?v->mask1:v->mask0);cols=(e->width+15)>>4;rows=(e->height+15)>>4;grid_cols=3;}
+        flip=(e->vx>0)?VDC_SPR_X_INVERT:0;
+        for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
+            int cell=cy*grid_cols+cx,dx;
+            if(!(mask&(1u<<cell)))continue;dx=(e->vx>0)?(cols-1-cx)*16:cx*16;
+            u16 base=special_snake?(u16)(LEVEL8_SNAKE_BASE_WORD+anim*1024):(special_monkey?(u16)(LEVEL7_MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):(special_crate?(u16)(LEVEL7_CRATE_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):((anim==2)?(u16)(ENEMY_HIT_BASE_WORD+li*ENEMY_FRAME_WORDS):(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS))));
+            set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
+        }
+    }
+
+    for(i=0;i<4&&n<62;++i)if(g_enemy_shots[i].active){
+        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-g_camera_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT);
+        set_sprite_entry(satb,n++,sx,sy,ENEMY_BANANA_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|g_enemy_shots[i].palette));
     }
 
     if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<58){
         /* Hurt includes an impact puff four pixels above the body, so its
            capture origin needs +4 relative to the old value to keep Bowser's
            feet aligned with the neighboring walk poses. */
-        static const signed char pose_y_offset[9]={18,22,22,18,16,22,22,16,12};
-        int bx=(int)(g_boss_x>>FIX_SHIFT),by=(int)(g_boss_y>>FIX_SHIFT),anim,cx,cy;
+        int bx=(int)(g_boss_x>>FIX_SHIFT),by=(int)(g_boss_y>>FIX_SHIFT),cx,cy;
         unsigned long long mask;
         u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
@@ -1714,34 +1950,26 @@ static void draw_game_sprites(void)
            seven ticks each, two fire frames at seven ticks each, and the
            three teleport frames at three ticks each. Fire loops while its
            projectile state is active; teleport is a single 9-tick sequence. */
-        int special=-1,t=g_boss_action_timer;
-        if(g_boss_invuln>0)anim=8;
-        else if(g_boss_action==5){
+        int special,t=g_boss_action_timer;
+        int action=g_bowser_action_script[g_boss_action];
+        if(g_boss_invuln>0){
+            special=BOWSER_SPECIAL_HURT;
+        }else if(action==5){
             if(t<1)t=1;
             special=BOWSER_SPECIAL_FIRE+(((t-1)/BOWSER_FIRE_FRAME_TICKS)&1);
-            anim=9;
-        }else if(g_boss_action==6&&t>=1&&t<9){
+        }else if(action==6&&t>=1&&t<9){
             special=BOWSER_SPECIAL_TELEPORT+(t-1)/BOWSER_TELEPORT_FRAME_TICKS;
             if(special>BOWSER_SPECIAL_TELEPORT+2)special=BOWSER_SPECIAL_TELEPORT+2;
-            anim=9;
-        }else if(g_boss_action==3||g_boss_action==4){
+        }else if(action==3||action==4){
             if(t<1)t=1;
             special=BOWSER_SPECIAL_RUN+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
-            anim=9;
         }else{
             if(t<1)t=1;
-            /* Handler $7526 leaves actions 1/2 in graphics state 0. */
-            anim=((t-1)/BOWSER_RUN_FRAME_TICKS)&1;
+            special=BOWSER_SPECIAL_NORMAL+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
         }
-        if(anim>=9&&special>=0){
-            mask=g_bowser_special_masks[special];
-            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
-        }else{
-            mask=g_bowser_masks[anim];
-            by+=pose_y_offset[anim]-16;
-            u16 base=(anim==8)?BOWSER_HURT_BASE_WORD:(u16)(BOWSER_WALK_BASE_WORD+anim*BOWSER_FRAME_WORDS);
-            for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<6 && n<62;++cx){int cell=cy*6+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(5-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
-        }
+        by-=15;
+        mask=g_bowser_special_masks[special];
+        for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
         }
     }
 
@@ -1889,13 +2117,7 @@ static void start_boss(int fade_in)
         vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
         for(i=0;i<bv->frame_count*bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
     }else{
-        /* Bowser only needs the captured hurt pose from the legacy bank. Keep
-           the seven source animation canvases in their own compact bank so
-           they cannot overwrite the hurt cells or the later-boss workspace. */
-        vdc_set_vram_write(FRONT_CHIP,BOWSER_HURT_BASE_WORD);
-        for(i=8*BOWSER_FRAME_WORDS;i<9*BOWSER_FRAME_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);
-        vdc_set_vram_write(FRONT_CHIP,BOWSER_WALK_BASE_WORD);
-        for(i=0;i<2*BOWSER_FRAME_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);
+        /* Every Bowser body pose comes from the canonical bowser/ bank. */
         vdc_set_vram_write(FRONT_CHIP,BOWSER_FLAME_BASE_WORD);
         for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);
         vdc_set_vram_write(FRONT_CHIP,BOWSER_ANIM_BASE_WORD);
@@ -1943,8 +2165,8 @@ static void start_boss(int fade_in)
 static void boss_take_hit(void)
 {
     if(g_boss_invuln||g_boss_defeated||g_boss_hp<=0)return;
-    --g_boss_hp;Play_Sound_Sample(4,0,0);
-    if(g_boss_hp<=0){g_boss_defeated=1;g_boss_vx=0;g_boss_vy=-5*FIX_ONE;g_boss_shot_active=0;}
+    --g_boss_hp;Play_Sound_Sample(SFX_BOSS_HIT,0,0);
+    if(g_boss_hp<=0){g_boss_defeated=1;g_boss_vx=0;g_boss_vy=-5*FIX_ONE;g_boss_shot_active=0;Play_Sound_Sample(SFX_BOSS_DEFEAT,0,0);}
     else g_boss_invuln=BOSS_HURT_FRAMES;
 }
 
@@ -2018,14 +2240,15 @@ static void update_boss_motion(void)
     switch(g_boss_class){
     default:
     case 0: { /* levels 3/6: literal action script used by handler $7526 */
-        static const unsigned char action[12]={1,5,2,6,3,4,1,5,2,5,3,4};
-        static const unsigned char direction[12]={0,1,1,1,0,1,0,1,1,0,0,1};
         int a;
         if(g_boss_action_timer==0){
-            a=action[g_boss_action];g_boss_action_dir=direction[g_boss_action];
-            g_boss_face=g_boss_action_dir?1:-1;
+            a=g_bowser_action_script[g_boss_action];g_boss_action_dir=g_bowser_direction_script[g_boss_action];
+            /* The supplied Bowser pixels are stored left-facing.  The MD
+               direction bit is one for rightward actions, so those actions
+               need the PC-FX horizontal-invert path. */
+            g_boss_face=g_boss_action_dir?-1:1;
         }
-        a=action[g_boss_action];++g_boss_action_timer;
+        a=g_bowser_action_script[g_boss_action];++g_boss_action_timer;
         if(a==5&&g_boss_action_timer==8){
             /* Metasprite 10 owns the attached flame during wind-up. Create
                the detached object only when the clean breath pose begins. */
@@ -2306,6 +2529,9 @@ static void start_gameplay(int fade_in)
     ycrop=(g_current_level==2)?8:0;
     g_player_x=(s32)g_level->spawn_x<<FIX_SHIFT;
     g_player_y=(s32)(g_level->spawn_y-ycrop)<<FIX_SHIFT;
+#ifdef FORCE_PLAYER_X
+    g_player_x=(s32)FORCE_PLAYER_X<<FIX_SHIFT;
+#endif
     g_vx=g_vy=0;
     g_grounded=1;
     g_facing=1;
@@ -2373,7 +2599,7 @@ static void update_play(u16 btn, u16 pressed)
         set_game_palette_fade(level);
         draw_game_sprites();
         if (g_death_timer>=48) {
-            Stop_Sound_Sample(7,0);
+            Stop_Sound_Sample(SFX_PLAYER_HURT,0);
             /* A normal death consumes one reserve life.  Do not enter the
                CONTINUE room while reserves remain: reload the current level
                from its source spawn instead.  This also deliberately exits a
@@ -2403,7 +2629,7 @@ static void update_play(u16 btn, u16 pressed)
     if (g_invuln>0) {
         --g_invuln;
         if (g_invuln==0) {
-            Stop_Sound_Sample(7,0);
+            Stop_Sound_Sample(SFX_PLAYER_HURT,0);
             if (g_hurt_pending_death) {
                 begin_player_death();
                 draw_game_sprites();
@@ -2446,7 +2672,7 @@ static void update_play(u16 btn, u16 pressed)
         g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;g_player_down=0;g_crate_hide=0;g_camera_hold=0;
     } else if (g_grounded && (pressed&JOY_I) && g_lift_timer==0 && g_throw_timer==0) {
         g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;g_player_down=0;g_crate_hide=0;g_camera_hold=0;
-        Play_Sound_Sample(1,0,0);
+        Play_Sound_Sample(SFX_JUMP,0,0);
     }
 
     g_prev_body_y=player_body_y();
@@ -2501,6 +2727,7 @@ static void update_play(u16 btn, u16 pressed)
     update_fireballs();
     if(g_in_boss) update_boss_actor();
     else { update_gems(); update_enemies(); }
+    if(!g_in_boss)update_enemy_shots();
     if (g_state==STATE_LEVEL_FADE) { draw_game_sprites(); return; }
     if (g_player_mode!=PMODE_NORMAL) { draw_game_sprites(); return; }
     update_camera();
@@ -2858,7 +3085,7 @@ static void update_frontend(u16 pressed)
         if ((pressed&(JOY_RUN|JOY_I|JOY_II)) && elapsed>=24 && g_continues>0) {
             --g_continues;
             g_lives=4;
-            Play_Sound_Sample(8,0,0);
+            Play_Sound_Sample(SFX_MENU_CONFIRM,0,0);
             music_stop_for_transition();
             g_continue_resume=1; g_state=STATE_CONTINUE_FADE; g_state_frame=0; return;
         }
@@ -2870,7 +3097,7 @@ static void update_frontend(u16 pressed)
         int level=16-(int)(g_state_frame*16/32); if (level<0) level=0;
         set_continue_palette_fade(level); draw_continue_digit();
         if (g_state_frame>=32) {
-            Stop_Sound_Sample(8,0);
+            Stop_Sound_Sample(SFX_MENU_CONFIRM,0);
             if (g_continue_resume) {
                 /* Continue resumes the current level from its normal spawn. */
                 start_gameplay(1);
@@ -2898,6 +3125,7 @@ int main(void)
 {
     contrlr_pad_init(0);
     init_video();
+    audio_init();
     music_init();
     enter_boot();
 

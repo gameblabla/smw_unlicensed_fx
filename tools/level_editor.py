@@ -7,6 +7,7 @@ from urllib.parse import urlparse, parse_qs
 import csv, json, os, tempfile
 from level_extension import foreground_words_240
 import build_assets as ba
+from build_full_game import make_dumped_boss_planes
 from PIL import Image
 
 ROOT=Path(__file__).resolve().parent.parent
@@ -34,8 +35,8 @@ def atomic_json(path,data):
         if os.path.exists(tmp):os.unlink(tmp)
 
 class Model:
-    def __init__(self,kit,overrides):
-        self.kit=kit;self.overrides=overrides
+    def __init__(self,kit,defaults,overrides):
+        self.kit=kit;self.defaults=defaults;self.overrides=overrides
         self.manifest=json.loads((kit/'graphics/stage_sets/stage_sets_manifest.json').read_text())
         self.by_level={slot:s for s in self.manifest for slot in s['level_slots']}
 
@@ -67,16 +68,16 @@ class Model:
     def boss_default(self,level,layer):
         if level not in BOSS_LEVELS:raise ValueError('this level is not a boss room')
         which=layer[5:]
-        if level==19:
-            root=BOSSREF/'layers/boss19'
-            raw=read_words(root/f'md19_{which}_words_be.bin')
-            if which=='foreground':words=[raw[y*64+x] if y<26 else 0 for y in range(32) for x in range(32)]
-            else:words=[raw[min(y,27)*64+x] for y in range(32) for x in range(32)]
-            vram=(root/'md19_vram.bin').read_bytes()
-            cram=json.loads((root/'md19_dump.json').read_text())['cram']
-            palette=[[0,0,0] for _ in range(64)]
+        if level in (16,19):
+            dumped=make_dumped_boss_planes(level);words=dumped['maps'][which]
+            vram=bytearray(4096*32)
+            for tile,pix in enumerate(dumped['tiles']):
+                off=tile*32
+                for i in range(32):vram[off+i]=(pix[i*2]<<4)|pix[i*2+1]
+            cram=json.loads((BOSSREF/f'layers/boss{level}'/f'md{level}_dump.json').read_text())['cram']
+            palette=[[0,0,0] for _ in range(256)]
             for i,w in enumerate(cram):palette[i]=list(ba.genesis_cram_rgb(w))
-            return words,vram,palette
+            return words,bytes(vram),palette
         # The earlier captured rooms are already exact-size PC-FX tile banks.
         # Their foreground starts empty and can be authored independently.
         if level in (3,6):
@@ -100,16 +101,20 @@ class Model:
                     bit=7-x;pix.append(((tw[y]>>bit)&1)|(((tw[y]>>(8+bit))&1)<<1)|(((tw[8+y]>>bit)&1)<<2)|(((tw[8+y]>>(8+bit))&1)<<3))
             off=tile*32
             for i in range(32):vram[off+i]=(pix[i*2]<<4)|pix[i*2+1]
-        palette=[list(ba.pcfxemu_decode_yuv444(w)) for w in packed['palette'][:64]]
+        palette=[list(ba.pcfxemu_decode_yuv444(w)) for w in packed['palette'][:256]]
         return words,bytes(vram),palette
 
-    def read_override(self,name):
-        p=self.overrides/name
+    def read_edit(self,root,name):
+        p=root/name
         return json.loads(p.read_text()) if p.exists() else None
 
+    def read_override(self,name):return self.read_edit(self.overrides,name)
+    def read_default(self,name):return self.read_edit(self.defaults,name)
+
     def apply_tiles(self,vram,name):
-        data=self.read_override(name);out=bytearray(vram)
-        if data:
+        out=bytearray(vram)
+        for data in (self.read_default(name),self.read_override(name)):
+          if data:
             for key,pix in data.get('tiles',{}).items():
                 off=int(key)*32
                 for i in range(32):out[off+i]=(pix[i*2]<<4)|pix[i*2+1]
@@ -149,6 +154,8 @@ class Model:
         isboss=layer.startswith('boss-')
         if isboss:default,vram,palette=self.boss_default(level,layer)
         else:default=self.foreground_default(level,segment) if layer=='foreground' else self.background_default(level)
+        promoted=self.read_default(map_name)
+        if promoted:default=promoted.get('words',default)
         saved=self.read_override(map_name);words=saved.get('words',default) if saved else default
         stage=self.by_level[level]
         if not isboss:
@@ -162,7 +169,9 @@ class Model:
         return {'version':1,'level':level,'layer':layer,'segment':segment,
             'set':stage['set_id'],'shared_with':stage['level_slots'],'width':32 if layer in ('foreground','boss-foreground','boss-background') else 64,
             'height':32 if isboss else 30,'extension_start_row':VISIBLE_ROWS,'words':words,'default_words':default,'tile_pixels':pixels,
-            'palette':palette,'saved':saved is not None,'tile_saved':self.read_override(tile_name) is not None}
+            'palette':palette,'palette_count':16 if isboss else 4,
+            'attribute_format':'pcfx' if isboss else 'genesis',
+            'saved':saved is not None,'tile_saved':self.read_override(tile_name) is not None}
 
     def save(self,data):
         level=int(data['level']);layer=data['layer'];segment=int(data.get('segment',0))
@@ -212,10 +221,11 @@ class Handler(SimpleHTTPRequestHandler):
 
 def main():
     ap=ArgumentParser();ap.add_argument('--kit',type=Path,default=ROOT/'Super_Mario_Bros_MD_reconstruction_kit')
+    ap.add_argument('--defaults',type=Path,default=ROOT/'level_defaults')
     ap.add_argument('--overrides',type=Path,default=ROOT/'level_overrides');ap.add_argument('--host',default='127.0.0.1');ap.add_argument('--port',type=int,default=8765)
-    a=ap.parse_args();Handler.model=Model(a.kit.resolve(),a.overrides.resolve())
+    a=ap.parse_args();Handler.model=Model(a.kit.resolve(),a.defaults.resolve(),a.overrides.resolve())
     server=ThreadingHTTPServer((a.host,a.port),Handler)
-    print(f'PC-FX level editor: http://{a.host}:{a.port}/');print(f'Overrides: {a.overrides.resolve()}')
+    print(f'PC-FX level editor: http://{a.host}:{a.port}/');print(f'Defaults: {a.defaults.resolve()}');print(f'Overrides: {a.overrides.resolve()}')
     try:server.serve_forever()
     except KeyboardInterrupt:pass
 

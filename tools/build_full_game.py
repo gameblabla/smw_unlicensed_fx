@@ -12,6 +12,7 @@ KIT=Path(os.environ.get('KIT','/mnt/data/mdkit_full/Super_Mario_Bros_MD_reconstr
 ROMPATH=Path(os.environ.get('ROM','/mnt/data/r9mdrom/smb_patched.md'))
 BOSSREF=Path(os.environ.get('BOSSREF',str(PROJECT/'assets/reference/boss')))
 LEVEL_OVERRIDES=Path(os.environ.get('LEVEL_OVERRIDES',str(PROJECT/'level_overrides')))
+LEVEL_DEFAULTS=Path(os.environ.get('LEVEL_DEFAULTS',str(PROJECT/'level_defaults')))
 
 # These slots share the early cloud-sky background family.  The Mega Drive
 # source is a 224-line composition; on PC-FX it is placed at Y+16 rather than
@@ -35,44 +36,66 @@ MD_VISIBLE_ROWS=28
 # so only this one stored row is removed from the PC-FX tile/collision maps.
 LEVEL3_ACTIVE_CROP_ROWS=1
 
-def override_json(name):
-    path=LEVEL_OVERRIDES/name
+def edit_json(root,name):
+    path=root/name
     if not path.exists(): return None
     data=json.loads(path.read_text())
-    if data.get('version')!=1: raise RuntimeError(f'Unsupported level override version in {path}')
+    if data.get('version')!=1: raise RuntimeError(f'Unsupported level edit version in {path}')
     return data
 
+def override_json(name):return edit_json(LEVEL_OVERRIDES,name)
+def default_json(name):return edit_json(LEVEL_DEFAULTS,name)
+
 def override_words(name,default,expected):
+    promoted=default_json(name)
+    if promoted is not None:
+        default=promoted.get('words')
     data=override_json(name)
-    if data is None: return default
-    words=data.get('words')
+    if promoted is None and data is None:return default
+    words=default if data is None else data.get('words')
     if not isinstance(words,list) or len(words)!=expected or any(not isinstance(x,int) or not 0<=x<=0xFFFF for x in words):
         raise RuntimeError(f'Invalid {expected}-word tilemap override: {LEVEL_OVERRIDES/name}')
     return words
 
+def apply_collision_overrides(name,collision):
+    """Apply sparse 8x8 collision-cell edits to an extracted segment grid."""
+    out=bytearray(collision)
+    for root,data in ((LEVEL_DEFAULTS,default_json(name)),(LEVEL_OVERRIDES,override_json(name))):
+        if data is None:continue
+        cells=data.get('cells',{})
+        if not isinstance(cells,dict):
+            raise RuntimeError(f'Invalid collision override: {root/name}')
+        for key,value in cells.items():
+            try:index=int(key)
+            except (TypeError,ValueError):raise RuntimeError(f'Invalid collision cell {key!r}: {root/name}')
+            if not 0<=index<len(out) or not isinstance(value,int) or not 0<=value<=0xFF:
+                raise RuntimeError(f'Invalid collision cell {key!r}: {root/name}')
+            out[index]=value
+    return bytes(out)
+
 def apply_tile_overrides(vram,name):
-    data=override_json(name)
-    if data is None:return vram
     out=bytearray(vram)
-    for key,pixels in data.get('tiles',{}).items():
-        tile=int(key)
-        if not 0<=tile<2048 or not isinstance(pixels,list) or len(pixels)!=64 or any(not isinstance(x,int) or not 0<=x<16 for x in pixels):
-            raise RuntimeError(f'Invalid tile override {key}: {LEVEL_OVERRIDES/name}')
-        off=tile*32
-        for i in range(32):out[off+i]=(pixels[i*2]<<4)|pixels[i*2+1]
+    for root,data in ((LEVEL_DEFAULTS,default_json(name)),(LEVEL_OVERRIDES,override_json(name))):
+        if data is None:continue
+        for key,pixels in data.get('tiles',{}).items():
+            tile=int(key)
+            if not 0<=tile<2048 or not isinstance(pixels,list) or len(pixels)!=64 or any(not isinstance(x,int) or not 0<=x<16 for x in pixels):
+                raise RuntimeError(f'Invalid tile override {key}: {root/name}')
+            off=tile*32
+            for i in range(32):out[off+i]=(pixels[i*2]<<4)|pixels[i*2+1]
     return bytes(out)
 
 def apply_packed_tile_overrides(asset,name):
     """Apply editor pixels to an already packed PC-FX 4bpp tile bank."""
-    data=override_json(name)
-    if data is None:return asset
     words=list(asset['tile_words']);highest=asset['tile_count']-1
-    for key,pixels in data.get('tiles',{}).items():
-        tile=int(key)
-        if not 0<=tile<2048 or not isinstance(pixels,list) or len(pixels)!=64 or any(not isinstance(x,int) or not 0<=x<16 for x in pixels):
-            raise RuntimeError(f'Invalid packed boss tile override {key}: {LEVEL_OVERRIDES/name}')
-        while len(words)<(tile+1)*16:words.extend([0]*16)
-        words[tile*16:(tile+1)*16]=ba.encode_bg_tile(tuple(pixels));highest=max(highest,tile)
+    for root,data in ((LEVEL_DEFAULTS,default_json(name)),(LEVEL_OVERRIDES,override_json(name))):
+        if data is None:continue
+        for key,pixels in data.get('tiles',{}).items():
+            tile=int(key)
+            if not 0<=tile<2048 or not isinstance(pixels,list) or len(pixels)!=64 or any(not isinstance(x,int) or not 0<=x<16 for x in pixels):
+                raise RuntimeError(f'Invalid packed boss tile override {key}: {root/name}')
+            while len(words)<(tile+1)*16:words.extend([0]*16)
+            words[tile*16:(tile+1)*16]=ba.encode_bg_tile(tuple(pixels));highest=max(highest,tile)
     asset['tile_words']=words;asset['tile_count']=highest+1
     return asset
 
@@ -87,6 +110,64 @@ def packed_with_transparent_zero(asset):
     out['tile_words']=[0]*16+list(asset['tile_words'])
     out['bat']=[(w&0xF000)|((w&0x0FFF)+1) for w in asset['bat']]
     out['tile_count']=asset['tile_count']+1
+    return out
+
+def canonicalize_packed_palettes(words,source_bat):
+    """Restore the palette line belonging to each packed tile.
+
+    The editor historically copied the 12-bit tile number without the upper
+    palette bits.  Packed RGB tiles are keyed by (palette,pixels), therefore a
+    tile has one authoritative palette line and recovering it is lossless.
+    """
+    palette_by_tile={w&0x0fff:w&0xf000 for w in source_bat}
+    return [(w&0x0fff)|palette_by_tile.get(w&0x0fff,w&0xf000) for w in words]
+
+def make_dumped_boss_planes(slot):
+    """Convert sprite-free live VDP planes for the last two arenas.
+
+    Only the active 32 columns are copied.  Level 16's rows 28..31 are VDP
+    object/scratch work, so its final visible floor row is continued for the
+    PC-FX extension.  The final boss background is a true 32-row scrolling
+    texture and is intentionally retained in full.
+    """
+    layer=BOSSREF/f'layers/boss{slot}'
+    vram=(layer/f'md{slot}_vram.bin').read_bytes()
+    dump=json.loads((layer/f'md{slot}_dump.json').read_text())
+    palette=[ba.rgb_to_yuv(0,0,0)]*256
+    for i,wc in enumerate(dump['cram']):palette[i]=ba.rgb_to_yuv(*ba.genesis_cram_rgb(wc))
+    tiles=[tuple([0]*64)];lookup={(0,tiles[0]):0};maps={}
+    for name in ('background','foreground'):
+        raw=ba.read_words_be(layer/f'md{slot}_{name}_words_be.bin')
+        source=[]
+        for y in range(32):
+            for x in range(32):
+                if slot==16 and name=='foreground' and y>=28:
+                    # Repeat the complete final 16-pixel floor tile, not only
+                    # its lower 8-pixel chevron half.
+                    word=raw[(26+(y-28)%2)*64+x]
+                elif slot==19 and name=='foreground' and y>=30:word=0
+                else:word=raw[y*64+x]
+                source.append(word)
+        maps[name]=[ba.append_genesis_word(w,vram,tiles,lookup) for w in source]
+    tile_words=[]
+    for tile in tiles:tile_words.extend(ba.encode_bg_tile(tile))
+    return dict(palette=palette,tile_words=tile_words,tile_count=len(tiles),maps=maps,tiles=tiles)
+
+def boss13_sprite_free_bat(bat):
+    """Remove the two carrier sprites captured into the level-13 arena map.
+
+    The level-13 reference was captured with the Mega Drive's two moving
+    carriers enabled.  They are rebuilt as live PC-FX sprites, so retaining
+    them in the background map creates two inert duplicates.  The arena's
+    teal wall texture repeats on the 8x8 tile grid; copy clean wall cells from
+    the same columns to restore the two 64x24 captured regions.  This occurs
+    after level defaults/overrides are applied, ensuring a saved default map
+    cannot restore the baked sprites.
+    """
+    out=list(bat)
+    for (dx,dy),(sx,sy) in (((0,8),(0,14)),((24,23),(24,15))):
+        for row in range(3):
+            out[(dy+row)*32+dx:(dy+row)*32+dx+8]=out[(sy+row)*32+sx:(sy+row)*32+sx+8]
     return out
 
 def background_plane_halves(level_dir):
@@ -121,6 +202,11 @@ def emit_u8(f,n,v,cols=24,static=False):
     pre='static ' if static else ''
     f.write(f'{pre}const unsigned char {n}[{len(v)}] = {{\n')
     for i in range(0,len(v),cols): f.write('  '+', '.join(str(int(x)&255) for x in v[i:i+cols])+',\n')
+    f.write('};\n\n')
+def emit_u64(f,n,v,cols=4,static=False):
+    pre='static ' if static else ''
+    f.write(f'{pre}const unsigned long long {n}[{len(v)}] = {{\n')
+    for i in range(0,len(v),cols): f.write('  '+', '.join(f'0x{x:011X}ULL' for x in v[i:i+cols])+',\n')
     f.write('};\n\n')
 def emit_s16(f,n,rows,cols=14,static=False):
     flat=[]
@@ -170,6 +256,7 @@ def build_sets(stage_manifest):
             cf=next(sd.glob('collision_ROM_*.bin')).read_bytes()[:1024]
             if sx['set_id']==3:
                 cf=cf[32:]+cf[-32:]
+            cf=apply_collision_overrides(f'set_{sx["set_id"]:02d}_segment_{seg:02d}_collision.json',cf)
             collisions.extend(cf)
         # Level-specific background layers are converted into this set's shared tile dictionary.
         bgs={}
@@ -243,7 +330,70 @@ def enemy_palette(r,gfx):
     pi=b16(r,0xF426+gfx*2); ptr=b32(r,0x72338+pi*4)
     return [ba.rgb_to_yuv(*ba.genesis_cram_rgb(b16(r,ptr+i*2))) for i in range(16)]
 
+def make_monkey_banana(r):
+    """Pack metasprite $1E3 created by monkey handler $C31A."""
+    allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());m={x['id']:x for x in allm}[0x1E3]
+    tbl=b32(r,0x7246C+6*4);ptr=b32(r,tbl+3*4);next_ptr=b32(r,tbl+4*4)
+    addr=ba.vdp_addr(b32(r,0xF454));vv=bytearray(65536);vv[addr:addr+next_ptr-ptr]=r[ptr:next_ptr]
+    canvas=[[0]*16 for _ in range(16)]
+    for part in m['parts']:
+        ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset']+4)
+    return ba.encode_sprite_cell(canvas)
+
+def make_monkey_special_frames(r):
+    """Pack selector 4 (banana throw) and selector 5 (40x40 death pose)."""
+    allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());byid={m['id']:m for m in allm}
+    gfx,sub=6,0;tbl=b32(r,0x7246C+gfx*4);addr=ba.vdp_addr(b32(r,0xF454+sub*4));want_tile=addr//32
+    frames=[];masks=[]
+    for anim,shape_base in ((4,261),(5,255)):
+        bw=byid[shape_base]['bbox'][2]+1;bh=byid[shape_base]['bbox'][3]+1;candidates=[]
+        for m in allm:
+            if m['parts'] and m['parts'][0]['tile_index']==want_tile and m['bbox'][2]+1==bw and m['bbox'][3]+1==bh:
+                candidates.append((abs(m['id']-shape_base),m))
+        shape=min(candidates,key=lambda x:x[0])[1] if candidates else byid[shape_base]
+        ptr=b32(r,tbl+anim*4)
+        # Selector 5 is the table's final entry; its data ends where gfx 7's
+        # first frame begins, not at the following null table slot.
+        next_ptr=b32(r,tbl+(anim+1)*4) if anim<5 else b32(r,b32(r,0x7246C+7*4))
+        raw_len=next_ptr-ptr
+        vv=bytearray(65536);vv[addr:addr+raw_len]=r[ptr:next_ptr];canvas=[[0]*48 for _ in range(48)]
+        for part in shape['parts']:
+            ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset'])
+        mask=0
+        for cy in range(3):
+            for cx in range(3):
+                cell=[[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+                if any(any(row) for row in cell):mask|=1<<(cy*3+cx)
+                frames.extend(ba.encode_sprite_cell(cell))
+        masks.append(mask)
+    return frames,masks
+
+def make_crate_walk_frames(r):
+    """Pack crate-mimic selectors 4/5, its two exposed walking poses."""
+    allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());byid={m['id']:m for m in allm}
+    gfx,sub=1,1;tbl=b32(r,0x7246C+gfx*4);addr=ba.vdp_addr(b32(r,0xF454+sub*4));want_tile=addr//32
+    candidates=[m for m in allm if m['parts'] and m['parts'][0]['tile_index']==want_tile and m['bbox'][2]+1==32 and m['bbox'][3]+1==40]
+    shape=min(candidates,key=lambda m:abs(m['id']-231)) if candidates else byid[231]
+    frames=[];masks=[]
+    for anim in (4,5):
+        ptr=b32(r,tbl+anim*4);next_ptr=b32(r,tbl+(anim+1)*4) if anim<5 else ptr+0x280
+        vv=bytearray(65536);vv[addr:addr+next_ptr-ptr]=r[ptr:next_ptr];canvas=[[0]*48 for _ in range(48)]
+        for part in shape['parts']:
+            ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset'])
+        mask=0
+        for cy in range(3):
+            for cx in range(3):
+                cell=[[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+                if any(any(row) for row in cell):mask|=1<<(cy*3+cx)
+                frames.extend(ba.encode_sprite_cell(cell))
+        masks.append(mask)
+    return frames,masks
+
 def build_enemy_variants(r,levels):
+    # Graphics family 0 is the shared Goomba/Koopa family. Its source table
+    # contains two walking poses only; selector 3 is not a death/hit image.
+    # All other runtime enemy families provide a third impact pose.
+    no_hit_frame_gfx={0}
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text()); byid={m['id']:m for m in allm}
     keys=[]
     for lev in levels:
@@ -253,22 +403,60 @@ def build_enemy_variants(r,levels):
     variants=[]
     for idx,(gfx,base,sub) in enumerate(keys):
         frames=[]; masks=[]
-        for anim in range(2):
-            tbl=b32(r,0x7246C+gfx*4); ptr=b32(r,tbl+anim*4); raw=r[ptr:ptr+0x180]
-            vv=bytearray(65536); addr=ba.vdp_addr(b32(r,0xF454+sub*4)); vv[addr:addr+len(raw)]=raw
+        # Most handlers use selector 3 for their attack/hit pose.  Graphics
+        # family 4 (the green pterodactyl) is different: its table has only
+        # selectors 0, 1 and 2; entry 3 is null.  Selector 0 is the narrow
+        # hanging pose, while 1/2 are the two wide flying poses (the second
+        # also remains available as the impact/defeat image).
+        anim_selectors=(0,1,2) if gfx==4 else (0,1,3)
+        for anim in anim_selectors:
+            tbl=b32(r,0x7246C+gfx*4); ptr=b32(r,tbl+anim*4); next_ptr=b32(r,tbl+(anim+1)*4)
+            addr=ba.vdp_addr(b32(r,0xF454+sub*4));want_tile=addr//32
+            # Resolve the shape first; it also provides a safe exact minimum
+            # length for families whose final animation pointer has no
+            # following frame pointer in the ROM table.
+            # Family 4 changes shape as well as graphics when it takes off.
+            # The encounter stores base 231 (32x40 hanging layout).  Its
+            # 24-tile flying layout is metasprite 273 (48x32), i.e. base+42.
+            # Treating those tiles as the superficially plausible 32x48
+            # layout transposed the final eight tiles and left debris below
+            # the left wing.
+            if gfx==4 and anim!=0:
+                shape_base=base+42       # pterodactyl: 32x40 -> 48x32
+            elif gfx==1 and anim==1:
+                shape_base=base+6        # crate: 24x24 -> 24x32
+            elif gfx==1 and anim==3:
+                shape_base=base+24       # crate legs: 32x40
+            elif gfx==3 and anim==1:
+                shape_base=base-42       # floor attacker rises: 32x32
+            elif gfx==3 and anim==3:
+                shape_base=base-36       # floor attacker strike: 32x40
+            else:
+                shape_base=base
+            bm=byid[shape_base]; bw=bm['bbox'][2]-bm['bbox'][0]+1; bh=bm['bbox'][3]-bm['bbox'][1]+1
+            cand=[]
+            for mid in range(max(0,shape_base-12),min(len(allm),shape_base+18)):
+                mm=byid[mid]
+                if not mm['parts'] or mm['parts'][0]['tile_index']!=want_tile: continue
+                mw=mm['bbox'][2]-mm['bbox'][0]+1; mh=mm['bbox'][3]-mm['bbox'][1]+1
+                score=(0 if (mw,mh)==(bw,bh) else 100)+abs(mid-shape_base)
+                cand.append((score,mid,mm))
+            m=min(cand,key=lambda x:x[0])[2] if cand else bm
+            shape_len=max((p['tile_index']+p['width_tiles']*p['height_tiles']-want_tile)*32 for p in m['parts'])
+            # Each graphics family has its own DMA size. The former fixed
+            # 0x180-byte copy happened to fit small enemies but truncated the
+            # 20/24/30-tile actors in levels 7 and 8 to one corner. Adjacent
+            # frame pointers are the exact packed lengths used by the ROM.
+            raw_len=next_ptr-ptr
+            if raw_len<=0 or raw_len>0x800 or raw_len%32:
+                raw_len=shape_len
+            if raw_len<shape_len: raw_len=shape_len
+            raw=r[ptr:ptr+raw_len]
+            vv=bytearray(65536);vv[addr:addr+len(raw)]=raw
             # The object record's metasprite base is a shape family, while the
             # graphics DMA table selects one of six VRAM tile banks. Most families
             # happen to be base+sub*2; gfx #5 does not. Resolve the metasprite by
             # matching the actual DMA destination tile and the base shape dimensions.
-            want_tile=addr//32; bm=byid[base]; bw=bm['bbox'][2]-bm['bbox'][0]+1; bh=bm['bbox'][3]-bm['bbox'][1]+1
-            cand=[]
-            for mid in range(max(0,base-12),min(len(allm),base+18)):
-                mm=byid[mid]
-                if not mm['parts'] or mm['parts'][0]['tile_index']!=want_tile: continue
-                mw=mm['bbox'][2]-mm['bbox'][0]+1; mh=mm['bbox'][3]-mm['bbox'][1]+1
-                score=(0 if (mw,mh)==(bw,bh) else 100)+abs(mid-base)
-                cand.append((score,mid,mm))
-            m=min(cand,key=lambda x:x[0])[2] if cand else bm
             canvas=[[0]*64 for _ in range(64)]
             for part in m['parts']:
                 ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset'])
@@ -280,7 +468,14 @@ def build_enemy_variants(r,levels):
                     words.extend(ba.encode_sprite_cell(cell))
             frames.extend(words); masks.append(mask)
         bbox=m.get('bbox',[0,0,23,31]); width=bbox[2]+1; height=bbox[3]+1
-        variants.append(dict(key=(gfx,base,sub),words=frames,masks=masks,palette=enemy_palette(r,gfx),width=width,height=height))
+        # Family 4 alternates between a 32x40 vertical pose and a 48x32
+        # horizontal pose.  Its PC-FX cell canvas must cover their union;
+        # using either frame's dimensions alone clips the other pose.
+        if gfx==4: width,height=48,48
+        elif gfx==1: width,height=32,48
+        elif gfx==3: width,height=32,48
+        variants.append(dict(key=(gfx,base,sub),words=frames,masks=masks,palette=enemy_palette(r,gfx),width=width,height=height,
+                             has_hit_frame=(gfx not in no_hit_frame_gfx)))
         print('variant',idx,(gfx,base,sub),'wh',width,height,'mask',masks)
     keyidx={v['key']:i for i,v in enumerate(variants)}
     # localize variants per level and rewrite enemy records as [x,y,local,state,flags,width,height]
@@ -296,6 +491,36 @@ def build_enemy_variants(r,levels):
             rec.append((e[0],e[1],loc[gi],e[5],e[6],v['width'],v['height']))
         lev['enemy_records']=rec
     return variants
+
+def make_level8_snake(r):
+    """Pack gfx family 5's complete 64-pixel strike, which exceeds 3x3 cells."""
+    allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());byid={m['id']:m for m in allm}
+    gfx,sub=5,2;tbl=b32(r,0x7246C+gfx*4);addr=ba.vdp_addr(b32(r,0xF454+sub*4));want_tile=addr//32
+    frames=[];masks=[]
+    for anim,shape_base in ((0,243),(1,243),(3,291)):
+        ptr=b32(r,tbl+anim*4);next_ptr=b32(r,tbl+(anim+1)*4)
+        bm=byid[shape_base];bw=bm['bbox'][2]+1;bh=bm['bbox'][3]+1
+        candidates=[]
+        for m in allm:
+            if not m['parts'] or m['parts'][0]['tile_index']!=want_tile:continue
+            mw=m['bbox'][2]+1;mh=m['bbox'][3]+1
+            candidates.append(((0 if (mw,mh)==(bw,bh) else 100)+abs(m['id']-shape_base),m))
+        m=min(candidates,key=lambda x:x[0])[1]
+        needed=max((p['tile_index']+p['width_tiles']*p['height_tiles']-want_tile)*32 for p in m['parts'])
+        raw_len=next_ptr-ptr
+        if raw_len<=0 or raw_len>0x800 or raw_len%32:raw_len=needed
+        raw_len=max(raw_len,needed);vv=bytearray(65536);vv[addr:addr+raw_len]=r[ptr:ptr+raw_len]
+        canvas=[[0]*64 for _ in range(64)]
+        for part in m['parts']:
+            ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset'])
+        mask=0
+        for cy in range(4):
+            for cx in range(4):
+                cell=[[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+                if any(any(row) for row in cell):mask|=1<<(cy*4+cx)
+                frames.extend(ba.encode_sprite_cell(cell))
+        masks.append(mask)
+    return frames,masks,enemy_palette(r,gfx)
 
 def make_boss_background(slot):
     # The emulator capture is a 224-line Mega Drive active picture in a
@@ -349,55 +574,50 @@ def _diff_components(ref,im):
     return sorted(out,key=len,reverse=True)
 
 def make_bowser_sprite():
-    """Recover four walk poses and the breath pose from the real fight."""
-    ref=Image.open(BOSSREF/'boss1_arena.png').convert('RGB')
-    src=[]; freq={}
-    frames=(('boss1_walk0.png',True,False),('boss1_walk1.png',True,False),
-            ('boss1_walk2.png',True,False),('boss1_walk3.png',True,False),
-            ('boss1_breath0.png',False,False),('boss1_breath1.png',False,False),
-            ('boss1_breath2.png',False,False),('boss1_breath3.png',False,False),
-            # The captured state-3 frame faces left. Normalize it to the same
-            # right-facing storage convention as the walk/breath bank.
-            ('boss1_hurt.png',True,True))
-    for fn,mirror,is_hurt in frames:
-        im=Image.open(BOSSREF/fn).convert('RGB')
-        if is_hurt:
-            # State 3 is metasprite 6 plus disconnected impact-puff pieces.
-            # Retain every changed component local to Bowser, not only his
-            # connected body component.
-            pts=[p for comp in _diff_components(ref,im)
-                 if len(comp)>=12 and min(y for x,y in comp)>=110
-                 and max(y for x,y in comp)<210 for p in comp]
-        else:
-            pts=_largest_diff_component(ref,im)
-        if not pts: raise RuntimeError(f'Could not isolate Bowser in {fn}')
-        xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
-        x0,y0=min(xs),min(ys)
-        pix={}
-        for x,y in pts:
-            xx,yy=x-x0,y-y0
-            if mirror: xx=95-xx
-            if 0<=xx<96 and 0<=yy<96:
-                c=im.getpixel((x,y)); pix[(xx,yy)]=c; freq[c]=freq.get(c,0)+1
-        src.append(pix)
-    # Index 0 remains transparent.  These components use exactly fifteen
-    # visible Mega Drive colors, so no source color needs to be discarded.
-    colors=[c for c,_ in sorted(freq.items(),key=lambda kv:-kv[1])][:15]
-    words=[]; masks=[]
-    for pix in src:
-        idx=[[0]*96 for _ in range(96)]; mask=0
+    """Pack Bowser exclusively from the canonical images in ``bowser/``."""
+    freq={}
+    # The supplied Bowser bank is already aligned to the source object's
+    # 112x96 canvas. Retaining
+    # the canvas origin is important because the three teleport poses shrink
+    # toward their upper-left anchor instead of being recentered.
+    bowser_anim=PROJECT/'bowser'
+    def bowser_frame(name):
+        im=Image.open(bowser_anim/name).convert('RGB')
+        if im.size!=(112,96): raise RuntimeError(f'Unexpected Bowser frame size: {name}')
+        transparent=im.getpixel((0,0));pix={}
+        for y in range(96):
+            for x in range(112):
+                c=im.getpixel((x,y))
+                if c!=transparent: pix[(x,y)]=c;freq[c]=freq.get(c,0)+1
+        return pix
+    # Runtime order follows the state groups selected by the Mega Drive boss
+    # script: normal patrol, fire, teleport, run, then the damage pose.
+    special_src=tuple(bowser_frame(name) for name in (
+        'bowser_normal1.png','bowser_normal2.png',
+        'bowser_fire1.png','bowser_fire2.png',
+        'bowser_teleport1.png','bowser_teleport2.png','bowser_teleport3.png',
+        'bowser_run1.png','bowser_run2.png','bowser_hurt.png'))
+    # Index 0 remains transparent. Deriving this palette only from these
+    # seven files prevents old captures from silently recoloring Bowser.
+    if len(freq)>15: raise RuntimeError(f'Bowser bank has {len(freq)} visible colors; expected at most 15')
+    colors=[c for c,_ in sorted(freq.items(),key=lambda kv:-kv[1])]
+    specialwords=[];specialmasks=[]
+    for pix in special_src:
+        idx=[[0]*112 for _ in range(96)];mask=0
         for (x,y),c in pix.items():
             ci=min(range(len(colors)),key=lambda j:sum((colors[j][k]-c[k])**2 for k in range(3)))
             idx[y][x]=ci+1
         for cy in range(6):
-            for cx in range(6):
+            for cx in range(7):
                 cell=[[idx[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
-                if any(any(row) for row in cell): mask|=1<<(cy*6+cx)
-                words.extend(ba.encode_sprite_cell(cell))
-        masks.append(mask)
+                if any(any(row) for row in cell):mask|=1<<(cy*7+cx)
+                specialwords.extend(ba.encode_sprite_cell(cell))
+        specialmasks.append(mask)
     # The detached 42x18 flame is the second large changed component in the
-    # breath capture (the first is Bowser, the third is Mario).  Store it as a
-    # 3x2 grid of 16-pixel cells using Bowser's source palette.
+    # breath capture (the first is Bowser, the third is Mario). This is a
+    # projectile, not a Bowser body frame; quantize it into the canonical
+    # bowser/ palette rather than allowing it to influence that palette.
+    ref=Image.open(BOSSREF/'boss1_arena.png').convert('RGB')
     breath=Image.open(BOSSREF/'boss1_breath2.png').convert('RGB')
     flame=max((p for p in _diff_components(ref,breath)
                if 200<len(p)<1000 and min(y for x,y in p)>120),key=len)
@@ -416,16 +636,60 @@ def make_bowser_sprite():
             flamewords.extend(ba.encode_sprite_cell(cell))
     py=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
     py += [ba.rgb_to_yuv(0,0,0)]*(16-len(py))
-    return words,masks,py[:16],flamewords,flamemask
+    return py[:16],flamewords,flamemask,specialwords,specialmasks
 
 def make_later_boss_assets():
-    """Pack the five non-Bowser encounters captured from the Mega Drive.
+    """Pack the complete non-Bowser action banks from the Genesis sheet.
 
     These are deliberately separate banks: the original loader selects a
     different graphics, palette and room-map pointer for every boss slot.
     """
     out=[]
-    spawns={8:(96,46),10:(8,20),13:(125,57),16:(76,53),19:(88,49)}
+    # Boss 3 starts at the MD handler's (344,200) object coordinate, i.e.
+    # (216,72) after the shared $80 object-space bias is removed.
+    spawns={8:(216,72),10:(8,20),13:(125,57),16:(76,53),19:(88,49)}
+    sheet=Image.open(PROJECT/'bosses_besides_bowser.png').convert('RGB')
+    transparent=sheet.getpixel((0,0))
+    # The contact sheet is not a sprite atlas: the 96-pixel windows overlap
+    # neighboring rows for slot 8.  Use the cleaned seven-pose strip for the
+    # pig (boss 3) so no wheel or other neighboring sprite is baked into it.
+    pig_strip=Image.open(PROJECT/'pig_boss_boss3.png').convert('RGB')
+    if pig_strip.size!=(455,71):
+        raise RuntimeError('pig_boss_boss3.png must be exactly 455x71')
+    pig_transparent=pig_strip.getpixel((0,0))
+    pig_frames=[]
+    for i in range(7):
+        frame=Image.new('RGB',(80,80),pig_transparent)
+        frame.paste(pig_strip.crop((i*65,0,(i+1)*65,71)),(0,0))
+        pig_frames.append(frame)
+    # The remaining boss sheets use their existing source regions. Slot 13
+    # has ten poses; its own arena has no concurrent auxiliary bank, so all
+    # ten fit in VRAM.
+    frame_regions={10:((0,0,3),),13:((0,192,5),(0,288,5)),
+                   16:((0,384,5),),19:((0,480,5),)}
+    def elephant_frames():
+        """Use the cleaned five-pose strip, preserving its shared baseline."""
+        strip=Image.open(PROJECT/'elephant_strip.png').convert('RGB')
+        strip_transparent=strip.getpixel((0,0))
+        seen=set();components=[]
+        for y in range(strip.height):
+            for x in range(strip.width):
+                if (x,y) in seen or strip.getpixel((x,y))==strip_transparent:continue
+                todo=[(x,y)];seen.add((x,y));points=[]
+                while todo:
+                    px,py=todo.pop();points.append((px,py))
+                    for nx,ny in ((px-1,py),(px+1,py),(px,py-1),(px,py+1)):
+                        if 0<=nx<strip.width and 0<=ny<strip.height and (nx,ny) not in seen and strip.getpixel((nx,ny))!=strip_transparent:
+                            seen.add((nx,ny));todo.append((nx,ny))
+                if len(points)>7000:components.append(points)
+        if len(components)!=5:raise RuntimeError(f'Expected five elephant components, got {len(components)}')
+        frames=[]
+        for i,points in enumerate(sorted(components,key=lambda p:min(x for x,y in p))):
+            canvas=Image.new('RGB',(112,144),transparent);xbase=i*112
+            for x,y in points:
+                if xbase<=x<xbase+112:canvas.putpixel((x-xbase,y+8),strip.getpixel((x,y)))
+            frames.append(canvas)
+        return frames
     for slot in (8,10,13,16,19):
         root=BOSSREF/'later'
         bg=packed_with_transparent_zero(ba.pack_bg_rgb(Image.open(root/f'boss{slot}_arena.png').convert('RGB')))
@@ -434,81 +698,96 @@ def make_later_boss_assets():
         # slot 19 is replaced below by the exact two VDP planes.
         bg['bat'] += [0]*(32*32-len(bg['bat']))
         fg=dict(tile_words=[0]*16,bat=[0]*(32*32),tile_count=1)
-        if slot==19:
-            layer=BOSSREF/'layers/boss19'
-            vram=apply_tile_overrides((layer/'md19_vram.bin').read_bytes(),'boss_19_tiles.json')
-            dump=json.loads((layer/'md19_dump.json').read_text())
-            palette=[ba.rgb_to_yuv(0,0,0)]*256
-            for i,wc in enumerate(dump['cram']):palette[i]=ba.rgb_to_yuv(*ba.genesis_cram_rgb(wc))
-            tiles=[tuple([0]*64)];lookup={(0,tiles[0]):0}
-            maps={}
+        if slot in (16,19):
+            dumped=make_dumped_boss_planes(slot);maps=dumped['maps']
+            canonical=maps['background']+maps['foreground']
             for name in ('background','foreground'):
-                raw=ba.read_words_be(layer/f'md19_{name}_words_be.bin')
-                # The dumped VDP plane is 64x32.  The live room occupies the
-                # first 32 columns; the second half is inactive work space.
-                # V28 only displays rows 0..27.  Rows 28..31 in the live VDP
-                # allocation are unrelated scratch tiles (foreground) or
-                # blank (background), never room artwork.  PC-FX is 240 lines,
-                # so continue the final visible tile row into the extension
-                # and hidden wrap rows instead of exposing that work area.
-                if name=='foreground':
-                    # The platform ends at source row 25. Rows 26-27 are
-                    # transparent padding and rows 28+ are object work tiles.
-                    default=[raw[y*64+x] if y<26 else 0 for y in range(32) for x in range(32)]
-                else:
-                    default=[raw[min(y,27)*64+x] for y in range(32) for x in range(32)]
-                source=override_words(f'boss_19_{name}.json',default,32*32)
-                maps[name]=[ba.append_genesis_word(w,vram,tiles,lookup) for w in source]
-            tile_words=[]
-            for t in tiles:tile_words.extend(ba.encode_bg_tile(t))
-            bg=dict(palette=palette,tile_words=tile_words,bat=maps['background'],tile_count=len(tiles))
-            # Both planes deliberately reference one shared tile bank/palette.
-            fg=dict(tile_words=tile_words,bat=maps['foreground'],tile_count=len(tiles))
+                maps[name]=override_words(f'boss_{slot:02d}_{name}.json',maps[name],32*32)
+                maps[name]=canonicalize_packed_palettes(maps[name],canonical)
+            bg=dict(palette=dumped['palette'],tile_words=dumped['tile_words'],bat=maps['background'],tile_count=dumped['tile_count'])
+            bg=apply_packed_tile_overrides(bg,f'boss_{slot:02d}_tiles.json')
+            # Both sprite-free VDP planes reference one exact shared bank.
+            fg=dict(tile_words=bg['tile_words'],bat=maps['foreground'],tile_count=bg['tile_count'])
         else:
+            source_bat=list(bg['bat'])
             bg['bat']=override_words(f'boss_{slot:02d}_background.json',bg['bat'],32*32)
+            bg['bat']=canonicalize_packed_palettes(bg['bat'],source_bat)
+            if slot==13: bg['bat']=boss13_sprite_free_bat(bg['bat'])
             bg=apply_packed_tile_overrides(bg,f'boss_{slot:02d}_tiles.json')
             fg['bat']=override_words(f'boss_{slot:02d}_foreground.json',fg['bat'],32*32)
             # Foreground and background share a bank so a copied tile has the
             # same meaning in both editor layers.
             fg['tile_words']=bg['tile_words'];fg['tile_count']=bg['tile_count']
-        normal=Image.open(root/f'boss{slot}_pose1.png').convert('RGBA')
-        hit_path=root/f'boss{slot}_pose_hit.png'
-        hit=Image.open(hit_path).convert('RGBA') if hit_path.exists() else normal.copy()
-        images=[]
-        for pose in (normal,hit):
-            box=pose.getchannel('A').getbbox()
-            if not box: raise RuntimeError(f'empty boss {slot} sprite')
-            images.append(pose.crop(box))
-        w=((max(im.width for im in images)+15)//16)*16
-        h=((max(im.height for im in images)+15)//16)*16
-        freq={}
-        for im in images:
-            for r,g,b,a in im.getdata():
-                if a: freq[(r,g,b)]=freq.get((r,g,b),0)+1
-        colors=[c for c,_ in sorted(freq.items(),key=lambda kv:-kv[1])[:15]]
-        if slot==19:
-            dump=json.loads((BOSSREF/'layers/boss19/md19_dump.json').read_text())
-            colors=[ba.genesis_cram_rgb(w) for w in dump['cram'][17:32]]
-        words=[];masks=[];cols=w//16;rows=h//16
-        for im in images:
-            idx=[[0]*w for _ in range(h)]
-            pix=im.load(); ox=(w-im.width)//2; oy=h-im.height
-            for y in range(im.height):
-                for x in range(im.width):
-                    r,g,b,a=pix[x,y]
-                    if not a: continue
-                    c=min(range(len(colors)),key=lambda j:sum((colors[j][k]-(r,g,b)[k])**2 for k in range(3)))
-                    idx[oy+y][ox+x]=c+1
+        frames=[]
+        if slot==8:
+            frames=pig_frames
+            frame_transparent=pig_transparent
+        elif slot==10:
+            ostrich_strip=Image.open(PROJECT/'ostrich_boss_boss4.png').convert('RGB')
+            if ostrich_strip.size!=(272,108):
+                raise RuntimeError('ostrich_boss_boss4.png must be exactly 272x108')
+            ostrich_transparent=ostrich_strip.getpixel((0,0))
+            # The supplied strip is three 90/91-pixel source frames. Keep
+            # their native pixels and put each into the same 112x112 canvas
+            # so the action origin does not move between poses.
+            frames=[]
+            for x0,x1 in ((0,90),(90,181),(181,272)):
+                frame=Image.new('RGB',(112,112),ostrich_transparent)
+                frame.paste(ostrich_strip.crop((x0,0,x1,108)),(0,0))
+                frames.append(frame)
+            frame_transparent=ostrich_transparent
+        elif slot==19:
+            frames=elephant_frames()
+            frame_transparent=transparent
+        else:
+            for x,y,count in frame_regions[slot]:
+                frames.extend(sheet.crop((x+i*112,y,x+(i+1)*112,y+96)) for i in range(count))
+            frame_transparent=transparent
+        cols=5 if slot==8 else 7
+        rows=5 if slot==8 else (9 if slot==19 else (7 if slot==10 else 6))
+        cell_colors=[];freq={}
+        for im in frames:
+            for cy in range(rows):
+                for cx in range(cols):
+                    colors={im.getpixel((cx*16+px,cy*16+py)) for py in range(16) for px in range(16)}-{frame_transparent}
+                    cell_colors.append(colors)
+                    for color in colors:freq[color]=freq.get(color,0)+1
+        # A Genesis sprite cell selects one 16-colour line.  Keep source
+        # colours exact by grouping cells into the minimum greedy set of
+        # 15-visible-colour lines; this sheet needs at most two per boss.
+        groups=[]
+        for colors in sorted((c for c in cell_colors if c),key=len,reverse=True):
+            fit=[(len(group|colors),i) for i,group in enumerate(groups) if len(group|colors)<=15]
+            if fit:groups[min(fit)[1]]|=colors
+            else:groups.append(set(colors))
+        if not groups or len(groups)>2:raise RuntimeError(f'Boss {slot} needs {len(groups)} sprite palettes')
+        palettes=[];lookups=[]
+        for group in groups:
+            colors=sorted(group,key=lambda color:-freq[color])
+            lookups.append({color:i+1 for i,color in enumerate(colors)})
+            pal=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*color) for color in colors]
+            palettes.extend(pal+[ba.rgb_to_yuv(0,0,0)]*(16-len(pal)))
+        words=[];masks=[];cell_palettes=[]
+        for im in frames:
             mask=0
             for cy in range(rows):
                 for cx in range(cols):
-                    cell=[[idx[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
-                    if any(any(row) for row in cell): mask|=1<<(cy*cols+cx)
+                    colors={im.getpixel((cx*16+px,cy*16+py)) for py in range(16) for px in range(16)}-{frame_transparent}
+                    palette=next((i for i,group in enumerate(groups) if colors<=group),None)
+                    if palette is None:raise RuntimeError(f'Boss {slot} cell cannot select a source palette')
+                    cell_palettes.append(palette)
+                    cell=[]
+                    for py in range(16):
+                        row=[]
+                        for px in range(16):
+                            color=im.getpixel((cx*16+px,cy*16+py))
+                            row.append(0 if color==frame_transparent else lookups[palette][color])
+                        cell.append(row)
+                    if colors:mask|=1<<(cy*cols+cx)
                     words.extend(ba.encode_sprite_cell(cell))
             masks.append(mask)
-        pal=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
-        pal += [ba.rgb_to_yuv(0,0,0)]*(16-len(pal))
-        out.append(dict(slot=slot,bg=bg,fg=fg,words=words,palette=pal[:16],masks=masks,
+        out.append(dict(slot=slot,bg=bg,fg=fg,words=words,palettes=palettes,masks=masks,
+                        cell_palettes=cell_palettes,palette_count=len(groups),frame_count=len(frames),
                         cols=cols,rows=rows,spawn=spawns[slot]))
     return out
 
@@ -546,6 +825,33 @@ def make_level6_platform_words():
             [[canvas[y][cx*16+x] for x in range(16)] for y in range(16)]))
     return words
 
+def make_boss13_platform_words():
+    """User-approved 64x23 gold carrier used only by the level-13 boss."""
+    im=Image.open(BOSSREF/'boss13_platform.png').convert('RGBA')
+    if im.size!=(64,23): raise RuntimeError('boss13_platform.png must be exactly 64x23')
+    # Black in the reference is the transparent surround.  Keep every other
+    # source colour exact and place the 23 scanlines at the top of a 64x32
+    # two-sprite canvas.
+    colors=[]
+    for rgba in im.getdata():
+        rgb=rgba[:3]
+        if rgba[3] and rgb!=(0,0,0) and rgb not in colors: colors.append(rgb)
+    if len(colors)>15: raise RuntimeError('boss13 platform exceeds one sprite palette')
+    canvas=[[0]*64 for _ in range(32)]
+    pix=im.load()
+    for y in range(23):
+        for x in range(64):
+            rgb=pix[x,y][:3]
+            if pix[x,y][3] and rgb!=(0,0,0): canvas[y][x]=colors.index(rgb)+1
+    words=[]
+    for half in range(2):
+        for cy in range(2):
+            for cx in range(2):
+                words.extend(ba.encode_sprite_cell([[canvas[cy*16+y][half*32+cx*16+x] for x in range(16)] for y in range(16)]))
+    palette=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
+    palette += [ba.rgb_to_yuv(0,0,0)]*(16-len(palette))
+    return words,palette
+
 def make_final_boss_aux_words():
     """Exact 24x24 ring/hammer objects from the final-room live VDP bank."""
     vram=(BOSSREF/'layers/boss19/md19_vram.bin').read_bytes();out=[]
@@ -563,50 +869,92 @@ def make_final_boss_aux_words():
     return out[:256],out[256:],palette
 
 def make_boss_item_words():
-    """Distinct throwable silhouettes used by $806A (pot) and $99BE (bell)."""
-    def bank(kind):
-        c=[[0]*32 for _ in range(32)]
-        if kind=='pot':
-            # Metasprite 428 is an 8x16 pot. Enlarge it to a readable 16x24
-            # PC-FX cell while retaining the narrow neck/rounded body.
-            for y,(x0,x1) in enumerate([(12,19),(10,21),(10,21),(12,19),(8,23),(7,24),(6,25),(6,25),(7,24),(8,23),(9,22),(10,21),(11,20),(12,19),(13,18),(13,18)]):
-                yy=y+8
-                for x in range(x0,x1+1):c[yy][x]=2 if x in (x0,x1) else (4 if y<4 else 3)
-        else:
-            for y in range(7,24):
-                half=4+max(0,(y-8)//3);x0=16-half;x1=15+half
-                for x in range(x0,x1+1):c[y][x]=2 if x in (x0,x1) else 5
-            for x in range(11,21):c[6][x]=3
-            for x in range(9,23):c[24][x]=3
-            for y in range(24,28):c[y][15]=c[y][16]=2
+    """Pack the supplied boss-only throwable/crate bitmaps exactly."""
+    def pack(path, crops):
+        im=Image.open(PROJECT/path).convert('RGB')
+        transparent=im.getpixel((0,0)); colors=[]
+        for crop in crops:
+            for y in range(crop[1],crop[3]):
+                for x in range(crop[0],crop[2]):
+                    c=im.getpixel((x,y))
+                    if c!=transparent and c not in colors: colors.append(c)
+        if len(colors)>15: raise RuntimeError(f'{path} exceeds one sprite palette')
+        lookup={c:i+1 for i,c in enumerate(colors)}
         words=[]
-        for cy in range(2):
-            for cx in range(2):words.extend(ba.encode_sprite_cell([[c[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]))
-        return words
-    rgb=[(0,0,0),(49,49,49),(87,49,0),(206,119,0),(255,206,87),(255,174,0)]+[(0,0,0)]*10
-    return bank('pot'),bank('bell'),[ba.rgb_to_yuv(*c) for c in rgb]
+        for x0,y0,x1,y1 in crops:
+            cell=[[0]*16 for _ in range(16)]
+            # Every supplied object fits in one 32x32 metasprite frame. A
+            # two-frame strip simply contributes two consecutive 32x32 banks.
+            canvas=[[0]*32 for _ in range(32)]
+            for y in range(y0,y1):
+                for x in range(x0,x1):
+                    c=im.getpixel((x,y))
+                    if c!=transparent: canvas[y-y0][x-x0]=lookup[c]
+            for cy in range(2):
+                for cx in range(2):
+                    words.extend(ba.encode_sprite_cell([[canvas[cy*16+py][cx*16+px] for px in range(16)] for py in range(16)]))
+        palette=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
+        palette += [ba.rgb_to_yuv(0,0,0)]*(16-len(palette))
+        return words,palette
+    pot,potpal=pack('pot.png',[(0,0,23,24)])
+    bombs,bombpal=pack('bombs_boss5.png',[(0,0,32,23),(40,0,71,23)])
+    crate4,crate4pal=pack('crate_boss4.png',[(0,0,16,24)])
+    bell,bellpal=pack('bell_boss6.png',[(0,0,24,27)])
+    return pot,potpal,bombs,bombpal,crate4,crate4pal,bell,bellpal
+
+def make_boss_water_words():
+    """Pack the pig's 7x16 falling water drop as one transparent cell."""
+    im=Image.open(PROJECT/'water.png').convert('RGB')
+    if im.size!=(7,16): raise RuntimeError('water.png must be exactly 7x16')
+    transparent=im.getpixel((0,0)); colors=[]
+    for y in range(im.height):
+        for x in range(im.width):
+            c=im.getpixel((x,y))
+            if c!=transparent and c not in colors: colors.append(c)
+    lookup={c:i+1 for i,c in enumerate(colors)}
+    cell=[[0]*16 for _ in range(16)]
+    for y in range(im.height):
+        for x in range(im.width):
+            c=im.getpixel((x,y))
+            if c!=transparent: cell[y][x]=lookup[c]
+    words=ba.encode_sprite_cell(cell)
+    palette=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
+    palette += [ba.rgb_to_yuv(0,0,0)]*(16-len(palette))
+    return words,palette
 
 def main():
     r=ROMPATH.read_bytes(); sm=json.load(open(KIT/'graphics/stage_sets/stage_sets_manifest.json')); init=json.load(open(KIT/'graphics/metasprites/level_init_objects_and_spawns.json'))
     routes=parse_routes(r,sm); sets=build_sets(sm); levels=parse_level_objects(r,routes,init); variants=build_enemy_variants(r,levels)
     set_index={slot:s['set_id']-1 for s in sets for slot in s['slots']}
     palettes={slot:palette_for_level(slot) for slot in range(1,20)}
-    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosswords,bossmasks,bosspal,bossflamewords,bossflamemask=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,bellwords,itempal=make_boss_item_words()
+    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
     bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
-    h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#endif\n''')
+    h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')
     # Keep the generated declarations tied to the actual captured pose count.
     # Extend the legacy generated declaration block for the complete captured
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
+    hs=hs.replace('unsigned short mask0,mask1;','unsigned short mask0,mask1,mask2;')
+    hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
+                  'unsigned char width,height,has_hit_frame; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
-        'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palette; unsigned short bg_tile_count,fg_tile_count; unsigned long long sprite_mask,sprite_hit_mask; unsigned char cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
-    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];')
-    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned short g_boss_hp_1p')
+        'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
+    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned long long g_bowser_special_masks[10];\nextern const unsigned short g_boss_hp_1p')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_banana_words[64];\nextern const unsigned short g_boss_hp_1p')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_special_words[1152],g_monkey_special_masks[2];\nextern const unsigned short g_boss_hp_1p')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_crate_walk_words[1152],g_crate_walk_masks[2];\nextern const unsigned short g_boss_hp_1p')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_level8_snake_words[3072],g_level8_snake_palette[16],g_level8_snake_masks[3];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned long g_boss_handler_address[19];',
         'extern const unsigned long g_boss_handler_address[19];\nextern const BossVisualData g_later_boss_visuals[5];\nextern const unsigned char g_boss_collision[6144];')
     hs=hs.replace('extern const unsigned char g_bowser_flame_mask;',
-        'extern const BossRoomData g_bowser_rooms[2];\nextern const unsigned short g_final_ring_words[256],g_final_hammer_words[256],g_final_aux_palette[16],g_boss_pot_words[256],g_boss_bell_words[256],g_boss_item_palette[16];\nextern const unsigned char g_bowser_flame_mask;')
+        'extern const BossRoomData g_bowser_rooms[2];\nextern const unsigned short g_final_ring_words[256],g_final_hammer_words[256],g_final_aux_palette[16],g_boss_pot_words[256],g_boss_pot_palette[16],g_boss_bomb_words[512],g_boss_bomb_palette[16],g_boss_crate4_words[256],g_boss_crate4_palette[16],g_boss_bell_words[256],g_boss_bell_palette[16],g_boss_water_words[64],g_boss_water_palette[16],g_boss13_platform_words[512],g_boss13_platform_palette[16];\nextern const unsigned char g_bowser_flame_mask;')
+    # Legacy Bowser captures are intentionally absent: bowser/ is the sole
+    # body-frame and palette source.
+    hs=hs.replace('g_bowser_words[],','').replace('extern const unsigned long long g_bowser_masks[9];\n','')
+    hs=hs.replace('#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 9\n','')
+    hs=hs.replace('#define BOWSER_SPECIAL_FRAME_COUNT 7','#define BOWSER_SPECIAL_FRAME_COUNT 10')
     h.write_text(hs)
     with out.open('w') as f:
         f.write('#include "game_levels_generated.h"\n\n')
@@ -617,10 +965,14 @@ def main():
             route,modes,quads=routes[slot]; emit_u8(f,f'level{slot:02d}_route',route,static=True);emit_u8(f,f'level{slot:02d}_modes',modes,static=True);emit_u8(f,f'level{slot:02d}_quads',quads,static=True);emit_u16(f,f'level{slot:02d}_pal',palettes[slot],static=True)
             lev=levels[slot-1];emit_s16(f,f'level{slot:02d}_crates',lev['crates'],static=True);emit_s16(f,f'level{slot:02d}_gems',lev['gems'],static=True);emit_s16(f,f'level{slot:02d}_enemies',lev['enemy_records'],static=True);emit_u8(f,f'level{slot:02d}_variants',lev['variant_ids'],static=True)
         for i,v in enumerate(variants): emit_u16(f,f'enemy_variant_{i:02d}_words',v['words'],static=True);emit_u16(f,f'enemy_variant_{i:02d}_pal',v['palette'],static=True)
+        emit_u16(f,'g_monkey_special_words',monkeyspecial);emit_u16(f,'g_monkey_special_masks',monkeyspecialmasks)
+        emit_u16(f,'g_crate_walk_words',cratewalk);emit_u16(f,'g_crate_walk_masks',cratewalkmasks)
+        emit_u16(f,'g_level8_snake_words',snakewords);emit_u16(f,'g_level8_snake_masks',snakemasks);emit_u16(f,'g_level8_snake_palette',snakepal)
         f.write(f'const unsigned short g_enemy_variant_count={len(variants)};\n')
         f.write('const EnemyVariantData g_enemy_variants[] = {\n')
-        for i,v in enumerate(variants): f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},{v["width"]},{v["height"]}}},\n')
-        f.write('};\n\n')
+        for i,v in enumerate(variants):
+            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},{v["width"]},{v["height"]},{int(v["has_hit_frame"])}}},\n')
+        f.write('};\n\n');emit_u16(f,'g_monkey_banana_words',bananawords)
         f.write('const StageSetData g_stage_sets[12] = {\n')
         for s in sets: q=f'set{s["set_id"]:02d}'; f.write(f'  {{{q}_tiles,{q}_bat,{q}_col,{s["tile_count"]},{s["segment_count"]}}},\n')
         f.write('};\n\n')
@@ -636,15 +988,15 @@ def main():
         for ri,(room,fg) in enumerate(bowserrooms):
             q=f'bowser_room{ri}';f.write(f'  {{{q}_palette,{q}_tiles,{q}_bg_bat,{q}_fg_bat,{room["tile_count"]}}},\n')
         f.write('};\n\n')
-        emit_u16(f,'g_bowser_words',bosswords);emit_u16(f,'g_bowser_flame_words',bossflamewords);emit_u16(f,'g_bowser_palette',bosspal);f.write('const unsigned long long g_bowser_masks[9]={'+','.join(f'0x{x:09X}ULL' for x in bossmasks)+'};\n');f.write(f'const unsigned char g_bowser_flame_mask=0x{bossflamemask:02X};\n');emit_u16(f,'g_level6_platform_words',level6platform);emit_u16(f,'g_final_ring_words',finalring);emit_u16(f,'g_final_hammer_words',finalhammer);emit_u16(f,'g_final_aux_palette',finalauxpal);emit_u16(f,'g_boss_pot_words',potwords);emit_u16(f,'g_boss_bell_words',bellwords);emit_u16(f,'g_boss_item_palette',itempal)
+        emit_u16(f,'g_bowser_flame_words',bossflamewords);emit_u16(f,'g_bowser_special_words',bowserspecialwords);emit_u16(f,'g_bowser_palette',bosspal);f.write('const unsigned long long g_bowser_special_masks[10]={'+','.join(f'0x{x:09X}ULL' for x in bowserspecialmasks)+'};\n');f.write(f'const unsigned char g_bowser_flame_mask=0x{bossflamemask:02X};\n');emit_u16(f,'g_level6_platform_words',level6platform);emit_u16(f,'g_boss13_platform_words',boss13platform);emit_u16(f,'g_boss13_platform_palette',boss13platformpal);emit_u16(f,'g_final_ring_words',finalring);emit_u16(f,'g_final_hammer_words',finalhammer);emit_u16(f,'g_final_aux_palette',finalauxpal);emit_u16(f,'g_boss_pot_words',potwords);emit_u16(f,'g_boss_pot_palette',potpal);emit_u16(f,'g_boss_bomb_words',bombwords);emit_u16(f,'g_boss_bomb_palette',bombpal);emit_u16(f,'g_boss_crate4_words',crate4words);emit_u16(f,'g_boss_crate4_palette',crate4pal);emit_u16(f,'g_boss_bell_words',bellwords);emit_u16(f,'g_boss_bell_palette',bellpal);emit_u16(f,'g_boss_water_words',waterwords);emit_u16(f,'g_boss_water_palette',waterpal)
         for b in laterboss:
             q=f'boss{b["slot"]}'
             emit_u16(f,q+'_bg_palette',b['bg']['palette'],static=True);emit_u16(f,q+'_bg_tiles',b['bg']['tile_words'],static=True);emit_u16(f,q+'_bg_bat',b['bg']['bat'],static=True)
             emit_u16(f,q+'_fg_tiles',b['fg']['tile_words'],static=True);emit_u16(f,q+'_fg_bat',b['fg']['bat'],static=True)
-            emit_u16(f,q+'_sprite_words',b['words'],static=True);emit_u16(f,q+'_sprite_palette',b['palette'],static=True)
+            emit_u16(f,q+'_sprite_words',b['words'],static=True);emit_u16(f,q+'_sprite_palettes',b['palettes'],static=True);emit_u64(f,q+'_sprite_masks',b['masks'],static=True);emit_u8(f,q+'_sprite_cell_palettes',b['cell_palettes'],static=True)
         f.write('const BossVisualData g_later_boss_visuals[5]={\n')
         for b in laterboss:
-            q=f'boss{b["slot"]}'; f.write(f'  {{{q}_bg_palette,{q}_bg_tiles,{q}_bg_bat,{q}_fg_tiles,{q}_fg_bat,{q}_sprite_words,{q}_sprite_palette,{b["bg"]["tile_count"]},{b["fg"]["tile_count"]},0x{b["masks"][0]:016X}ULL,0x{b["masks"][1]:016X}ULL,{b["cols"]},{b["rows"]},{b["spawn"][0]},{b["spawn"][1]}}},\n')
+            q=f'boss{b["slot"]}'; f.write(f'  {{{q}_bg_palette,{q}_bg_tiles,{q}_bg_bat,{q}_fg_tiles,{q}_fg_bat,{q}_sprite_words,{q}_sprite_palettes,{q}_sprite_masks,{q}_sprite_cell_palettes,{b["bg"]["tile_count"]},{b["fg"]["tile_count"]},{b["palette_count"]},{b["frame_count"]},{b["cols"]},{b["rows"]},{b["spawn"][0]},{b["spawn"][1]}}},\n')
         f.write('};\n\n');emit_u8(f,'g_boss_collision',bosscollision)
         emit_u16(f,'g_boss_hp_1p',bosshp1); emit_u16(f,'g_boss_hp_2p',bosshp2)
         emit_u16(f,'g_boss_params',bossparams); emit_s16(f,'g_boss_hit_offsets',[bossoffsets])

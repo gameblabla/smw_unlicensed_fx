@@ -1,17 +1,16 @@
 
-The game over for mario and luigi should have animation frames, yet are lacking, they are static.
+HTML editor should be allowed to edit the boss areas (and background and foreground separately).
 
-level 2 platform graphics are incorrect.
+When pressing down while holding a crate, a different animation of mario (or rather, the crate with eyes appears and mario's sprite disappear etc...), i believe it cannot be touched by enemies or projectiles.
 
-level 3 (before first boss), the lava tiles are not animated.
+Boss 3 should drop "crates" but they look different (pots), the sample is true for the bosses after (look at disasm).
 
-The first boss is completely inaccurate
-You can't jump on the first platform, and neither go down on platform by pressing down+A.
-No crates are being dropped.
-THe Bowser boss should be sitting on platform, not jumping, instead it goes left, right, run, teleport (sometimes) with animation etc...
-The tile graphics for boss 1 (and presumbly the other bosses) are completely wrong, there should be a black bar at top (that may explain why bowser seem to 'float') and that presumbly may affect other boss areas etc...
-That can be see in /home/anonymous/Downloads/Super_Mario_Bros_PC_FX_fullgame_r12m/verification_r11/level03_boss_forced_test.png
+Boss 5 has 2 moving platforms that should be implemented for boss to work (the boss can also go on these and wait for the platforms.
 
-Add a debug mode, where i cannot die, and i have unlimited fireballs.
+Boss 6 can teleport and fire these 3 yellow ring projects as well as "crates" (Bells) to throw at him.
+
+Boss 7 is final boss, he can spout stuff, and it drops hammer 'crates' to throw at him with scrolling background endlessly..
+
+The text in Game over screen is not horizontally centered.
 
 Do not hesitate to boot up the headless blastem build for the original megadrive game its based on, to try to understand the game.

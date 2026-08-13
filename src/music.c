@@ -48,8 +48,19 @@ static void music_set_volume(unsigned volume)
     eris_cdda_music_set_volume(g_volume);
 }
 
+static int music_is_playing_track(u8 track)
+{
+    return track == g_next_track &&
+        (g_state == MUSIC_PLAYING || g_state == MUSIC_FADING_IN);
+}
+
 static void music_transition_to(u8 track, int loop)
 {
+    /* Adjacent ordinary levels often share a source cue.  Keep the current
+     * disc position in that case instead of needlessly fading, seeking and
+     * restarting the same track from index 00. */
+    if (music_is_playing_track(track)) return;
+
     g_next_track = track;
     g_next_loop = loop ? 1 : 0;
     g_wait_frames = MUSIC_START_DELAY;
@@ -95,6 +106,14 @@ void music_transition_to_level(int level_index)
 {
     if (level_index < 0 || level_index >= 19) return;
     music_transition_to(g_level_tracks[level_index], 1);
+}
+
+void music_prepare_level_transition(int next_level_index)
+{
+    if (next_level_index < 0 || next_level_index >= 19 ||
+        !music_is_playing_track(g_level_tracks[next_level_index])) {
+        music_stop_for_transition();
+    }
 }
 
 void music_transition_to_boss(void)

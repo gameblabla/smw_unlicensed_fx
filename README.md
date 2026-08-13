@@ -106,7 +106,7 @@ Then open `http://127.0.0.1:8765/`. It edits the final PC-FX 8×8 foreground seg
 
 The default Y=224–239 foreground is derived by stage family: Level 3 continues its cropped masonry phase, Levels 6 and 9 continue each column's established terrain period, Levels 7–8 extend the jungle interior without repeating decorative cap tiles, and Level 10 onward uses transparent foreground cells so the level-specific background remains visible. The editor and asset generator share this conversion logic.
 
-**Save overrides** writes small JSON files under `level_overrides/` without modifying the reconstruction kit. **Restore default** removes the selected map override and its layer-specific tile-pixel overrides, returning to the extracted Mega Drive source. Visual edits do not alter collision grids.
+**Save overrides** writes small JSON files under `level_overrides/` without modifying the reconstruction kit. **Restore default** removes the selected map override and its layer-specific tile-pixel overrides, returning to the extracted Mega Drive source. Visual edits do not alter collision grids. Sparse collision corrections can be stored separately as `set_NN_segment_NN_collision.json`, with 0-based 8×8 cell indices in its `cells` object; they are applied during generation after the extracted collision grid.
 
 Apply saved edits and rebuild with:
 
