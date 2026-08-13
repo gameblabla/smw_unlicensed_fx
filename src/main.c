@@ -1134,6 +1134,7 @@ static void update_camera(void)
     int px=(int)(g_player_x>>FIX_SHIFT);
     int max_camera=g_level_width_tiles*8-SCREEN_W;
     int target=g_camera_x;
+    int new_tile;
 
     /* The MD stage camera does not re-center on Mario every frame. Keep Mario
        inside a forward dead-zone and never pull the map backwards because an
@@ -1143,20 +1144,11 @@ static void update_camera(void)
         target=px-112;
     if (target<0) target=0;
     if (target>max_camera) target=max_camera;
-    g_camera_target_x=target;
-}
 
-static void commit_stage_camera(void)
-{
-    int new_tile;
-    if(g_in_boss)return;
-
-    /* update_camera() runs after gameplay simulation and only publishes a
-       target. Commit it here, immediately after the frame-wrap wait, so BAT
-       writes and both scroll-register pairs are completed together in the
-       leading blanking interval. Writing them at the end of the variable-time
-       gameplay update split the visible viewport during rightward jumps. */
-    new_tile=g_camera_target_x>>3;
+    /* Prepare wrapped BAT columns before publishing the target. These cells
+       are outside the committed viewport, so the VRAM burst is not visible
+       and does not consume the leading blanking interval used by KING. */
+    new_tile=target>>3;
     while (g_camera_tile<new_tile) {
         ++g_camera_tile;
         stream_level_column(g_camera_tile+FG_BAT_W-1);
@@ -1165,6 +1157,18 @@ static void commit_stage_camera(void)
         --g_camera_tile;
         stream_level_column(g_camera_tile);
     }
+    g_camera_target_x=target;
+}
+
+static void commit_stage_camera(void)
+{
+    if(g_in_boss)return;
+
+    /* update_camera() runs after gameplay simulation and only publishes a
+       target after its off-screen BAT column is ready. Commit only the scroll
+       registers here, immediately after frame wrap: this prevents the visible
+       split from late scroll writes without putting a VRAM-write burst in the
+       leading blanking interval, where it can disturb KING ADPCM playback. */
     g_camera_x=g_camera_target_x;
     vdc_set_scroll(FRONT_CHIP,(u16)(g_camera_x&0x01FF),0);
     vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
