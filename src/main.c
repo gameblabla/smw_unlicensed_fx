@@ -1557,7 +1557,7 @@ static void draw_game_sprites(void)
     u16 player_pal=(u16)(g_in_boss?PLAYER_SPR_PAL:0);
     u16 pctrl = (u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | player_pal);
     u16 paddr = (u16)(PLAYER_BASE_WORD + (frame-1) * PLAYER_FRAME_WORDS_LOCAL);
-    if (g_player_down) {
+    if (g_player_down && g_grounded) {
         paddr=(g_menu_choice==MENU_2P)?GAMEPLAY_DOWN_LUIGI_BASE_WORD:GAMEPLAY_DOWN_MARIO_BASE_WORD;
         pctrl=(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | CONTINUE_PLAYER_SPR_PAL);
         py+=8;
@@ -2348,11 +2348,9 @@ static void update_play(u16 btn, u16 pressed)
     }
     if (g_paused) return;
     g_crate_hide=(g_carry_index>=0&&g_grounded&&(btn&JOY_DOWN))?1:0;
-    /* DOWN selects the dedicated 32x40 crouch pose directly.  The source
-       object changes pose from the button state; tying it to the collision
-       grounded flag made the pose disappear during the first settling frames
-       and on slightly stepped terrain. */
-    g_player_down=(g_carry_index<0&&g_lift_timer==0&&g_throw_timer==0&&(btn&JOY_DOWN))?1:0;
+    /* DOWN selects the dedicated 32x40 crouch pose only while grounded. The
+       jump input below clears it immediately when both buttons are pressed. */
+    g_player_down=(g_carry_index<0&&g_grounded&&g_lift_timer==0&&g_throw_timer==0&&(btn&JOY_DOWN))?1:0;
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
@@ -2420,8 +2418,10 @@ static void update_play(u16 btn, u16 pressed)
     if ((pressed&JOY_II) && !g_crate_hide && g_lift_timer==0 && g_throw_timer==0) do_crate_action();
     if ((pressed&JOY_III) && g_lift_timer==0 && g_throw_timer==0) fire_fireball();
 
-    if(g_crate_hide){g_vx=0;g_camera_hold=1;}
-    else if (g_lift_timer>0) {
+    /* Camera hold belongs only to the stationary ground throw. A carried
+       crate/disguise must not freeze horizontal movement or scrolling. */
+    g_camera_hold=0;
+    if (g_lift_timer>0) {
         --g_lift_timer;
         g_vx=0;
     } else if (g_throw_timer>0 && g_grounded) {
@@ -2437,9 +2437,9 @@ static void update_play(u16 btn, u16 pressed)
     } else g_vx=0;
 
     if (g_grounded && (pressed&JOY_I) && (btn&JOY_DOWN) && g_on_moving_platform!=-1) {
-        g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;
+        g_drop_platform_timer=12;g_grounded=0;g_on_moving_platform=-1;g_vy=FIX_ONE;g_player_down=0;g_crate_hide=0;
     } else if (g_grounded && (pressed&JOY_I) && g_lift_timer==0 && g_throw_timer==0) {
-        g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;
+        g_jump_active=1; g_jump_index=0; g_bounce_active=0; g_grounded=0;g_player_down=0;g_crate_hide=0;
         Play_Sound_Sample(1,0,0);
     }
 
