@@ -2008,6 +2008,14 @@ static void draw_game_sprites(void)
     vdc_set_vram_write(FRONT_CHIP, base);
     for (i = 0; i < 64 * 4; ++i) vdc_vram_write(FRONT_CHIP, satb[i]);
     vdc_set_satb_address(FRONT_CHIP, base);
+    /* SATB submission is the final VDC register traffic of the frame. Restore
+       the playfield scroll registers afterwards so a stale/aliased VDC write
+       cannot latch a sprite-derived value into BYR and vertically roll the
+       whole display. Normal stages never use vertical camera scrolling. */
+    if (!g_in_boss) {
+        vdc_set_scroll(FRONT_CHIP,(u16)(g_camera_x&0x01FF),0);
+        vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
+    }
     g_satb_page ^= 1;
 }
 
