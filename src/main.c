@@ -286,6 +286,7 @@ static s32 g_vx, g_vy;
 static int g_grounded;
 static int g_facing; /* -1 left, +1 right */
 static int g_camera_x;
+static int g_camera_target_x;
 static int g_camera_tile;
 static int g_satb_page;
 static int g_player_anim_clock;
@@ -848,10 +849,8 @@ static void stream_level_column(int world_col)
     if(world_col<0||world_col>=g_level_width_tiles)return;
 
     /* A BAT column is contiguous when MAWR advances by the 64-word map
-       stride. The old loop reselected MAWR and DATA thirty times whenever
-       Mario crossed an 8-pixel camera boundary; on PC-FX that live VDC
-       register churn could disturb the latched viewport. Select the address
-       once, stream the column, then restore the normal +1 CHR/BAT mode. */
+       stride. Select the address once, stream the column, then restore the
+       normal +1 CHR/BAT mode used by sprite and pattern uploads. */
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,
                (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IW_40));
     vdc_set_vram_write(FRONT_CHIP,(u16)map_col);
@@ -883,7 +882,8 @@ static void init_level_ring(void)
     vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
     for(i=0;i<g_stage_set->tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_stage_set->tile_words[i]);
     for(col=0;col<FG_BAT_W;++col)stream_level_column(col);
-    g_camera_x=0;g_camera_tile=0;vdc_set_scroll(BACK_CHIP,0,0);vdc_set_scroll(FRONT_CHIP,0,0);
+    g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
+    vdc_set_scroll(BACK_CHIP,0,0);vdc_set_scroll(FRONT_CHIP,0,0);
     upload_game_sprites(); set_game_palette_fade(16);
 }
 
@@ -1124,7 +1124,7 @@ static const signed char g_flying_koopa_dy[58]={
 static void update_camera(void)
 {
     if(g_in_boss){
-        g_camera_x=0;g_camera_tile=0;
+        g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
         vdc_set_scroll(FRONT_CHIP,0,0);
         /* Handler $940E continuously advances the final room's wall plane;
            its collision/platform plane remains fixed. */
@@ -1133,18 +1133,30 @@ static void update_camera(void)
     }
     int px=(int)(g_player_x>>FIX_SHIFT);
     int max_camera=g_level_width_tiles*8-SCREEN_W;
-    int new_tile;
+    int target=g_camera_x;
 
     /* The MD stage camera does not re-center on Mario every frame. Keep Mario
        inside a forward dead-zone and never pull the map backwards because an
        action temporarily stops him. This also prevents world-object snapping
        on throw/reversal frames. */
     if (!g_camera_hold && px-g_camera_x>112)
-        g_camera_x=px-112;
-    if (g_camera_x<0) g_camera_x=0;
-    if (g_camera_x>max_camera) g_camera_x=max_camera;
+        target=px-112;
+    if (target<0) target=0;
+    if (target>max_camera) target=max_camera;
+    g_camera_target_x=target;
+}
 
-    new_tile=g_camera_x>>3;
+static void commit_stage_camera(void)
+{
+    int new_tile;
+    if(g_in_boss)return;
+
+    /* update_camera() runs after gameplay simulation and only publishes a
+       target. Commit it here, immediately after the frame-wrap wait, so BAT
+       writes and both scroll-register pairs are completed together in the
+       leading blanking interval. Writing them at the end of the variable-time
+       gameplay update split the visible viewport during rightward jumps. */
+    new_tile=g_camera_target_x>>3;
     while (g_camera_tile<new_tile) {
         ++g_camera_tile;
         stream_level_column(g_camera_tile+FG_BAT_W-1);
@@ -1153,6 +1165,7 @@ static void update_camera(void)
         --g_camera_tile;
         stream_level_column(g_camera_tile);
     }
+    g_camera_x=g_camera_target_x;
     vdc_set_scroll(FRONT_CHIP,(u16)(g_camera_x&0x01FF),0);
     vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
 }
@@ -3142,6 +3155,8 @@ int main(void)
     for (;;) {
         u16 btn, pressed;
         wait_frame();
+        if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE)
+            commit_stage_camera();
         btn = read_buttons();
         pressed = (u16)(btn & (u16)~g_prev_buttons);
         g_prev_buttons = btn;
