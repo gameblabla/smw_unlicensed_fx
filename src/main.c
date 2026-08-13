@@ -844,8 +844,21 @@ static u16 level_fg_bat_entry(int world_col,int row)
 
 static void stream_level_column(int world_col)
 {
-    int row,map_col=world_col&(FG_BAT_W-1); if(world_col<0||world_col>=g_level_width_tiles)return;
-    for(row=0;row<30;++row){vdc_set_vram_write(FRONT_CHIP,(u16)(row*FG_BAT_W+map_col));vdc_vram_write(FRONT_CHIP,level_fg_bat_entry(world_col,row));}
+    int row,map_col=world_col&(FG_BAT_W-1);
+    if(world_col<0||world_col>=g_level_width_tiles)return;
+
+    /* A BAT column is contiguous when MAWR advances by the 64-word map
+       stride. The old loop reselected MAWR and DATA thirty times whenever
+       Mario crossed an 8-pixel camera boundary; on PC-FX that live VDC
+       register churn could disturb the latched viewport. Select the address
+       once, stream the column, then restore the normal +1 CHR/BAT mode. */
+    vdc_setreg(FRONT_CHIP,VDC_REG_CR,
+               (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IW_40));
+    vdc_set_vram_write(FRONT_CHIP,(u16)map_col);
+    for(row=0;row<30;++row)
+        vdc_vram_write(FRONT_CHIP,level_fg_bat_entry(world_col,row));
+    vdc_setreg(FRONT_CHIP,VDC_REG_CR,
+               (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IW_01));
 }
 
 static void upload_level_back(void)
@@ -2008,14 +2021,6 @@ static void draw_game_sprites(void)
     vdc_set_vram_write(FRONT_CHIP, base);
     for (i = 0; i < 64 * 4; ++i) vdc_vram_write(FRONT_CHIP, satb[i]);
     vdc_set_satb_address(FRONT_CHIP, base);
-    /* SATB submission is the final VDC register traffic of the frame. Restore
-       the playfield scroll registers afterwards so a stale/aliased VDC write
-       cannot latch a sprite-derived value into BYR and vertically roll the
-       whole display. Normal stages never use vertical camera scrolling. */
-    if (!g_in_boss) {
-        vdc_set_scroll(FRONT_CHIP,(u16)(g_camera_x&0x01FF),0);
-        vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
-    }
     g_satb_page ^= 1;
 }
 
