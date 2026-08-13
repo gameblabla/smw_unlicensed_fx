@@ -1708,11 +1708,6 @@ static void draw_game_sprites(void)
                 }
             }
         }else{
-        /* Bowser's supplied 112x96 canvases are authored 15 pixels below the
-           actor/platform anchor used by the Mega Drive object. Keep the
-           actor position unchanged for collision, movement, and effects;
-           shift only the rendered class-0 Bowser image. */
-        by-=15;
         /* The Genesis animation table at $71D2 selects two run frames at
            seven ticks each, two fire frames at seven ticks each, and the
            three teleport frames at three ticks each. Fire loops while its
