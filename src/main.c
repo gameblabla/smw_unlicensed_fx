@@ -225,7 +225,6 @@ typedef struct {
     unsigned char flags;
     unsigned char defeated;
     unsigned char flying;
-    unsigned char flight_phase;
     unsigned char behavior_phase;
     unsigned char behavior_timer;
 } Enemy;
@@ -1098,16 +1097,6 @@ static const signed char g_stomp_bounce_dy[18]={
     -4,-4,-3,-3,-3,-2,-2,-1,-1,0,1,1,2,2,3,3,4,4
 };
 
-/* Exact state-18 flying-enemy path table at Mega Drive ROM $C832. Handler
-   $B794 subtracts one pixel from X, adds one signed entry to Y, then wraps
-   the index before 58. The entries sum to zero, so the patrol never drifts. */
-static const signed char g_flying_koopa_dy[58]={
-    -4,-4,-4,-3,-3,-3,-3,-2,-2,-2,-2,-1,-1,-1, 0,
-     1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
-     4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 0,-1,
-    -1,-1,-2,-2,-2,-2,-3,-3,-3,-3,-4,-4,-4
-};
-
 static void update_camera(void)
 {
     if(g_in_boss){
@@ -1215,7 +1204,6 @@ static void init_objects(void)
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
             g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA);
-            g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
 #ifdef FORCE_ENEMY_ACTION
             if(g_enemies[i].state==2||g_enemies[i].state==4||g_enemies[i].state==5||g_enemies[i].state==6||g_enemies[i].state==7){
@@ -1581,14 +1569,12 @@ static void update_enemies(void)
         }
 
         if (e->flying) {
-            /* Handler $B794 moves left and consumes one signed entry from
-               the exact 58-step ROM path on every update. */
+            /* Keep the winged Koopa airborne at its authored height. Applying
+               $B794's cumulative $C832 displacement here made the PC-FX
+               sprite cycle vertically through the viewport. */
             e->x-=FIX_ONE;
-            e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
-            if(++e->flight_phase>=58)e->flight_phase=0;
             x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
-            /* $B794 never calls the terrain probes: the predetermined patrol
-               deliberately passes through stage tiles. */
+            /* The airborne handler never calls the terrain probes. */
             goto enemy_attack_checks;
         }
 
