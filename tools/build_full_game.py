@@ -471,34 +471,44 @@ def make_later_boss_assets():
             # Foreground and background share a bank so a copied tile has the
             # same meaning in both editor layers.
             fg['tile_words']=bg['tile_words'];fg['tile_count']=bg['tile_count']
-        im=Image.open(root/f'boss{slot}_pose1.png').convert('RGBA')
-        box=im.getchannel('A').getbbox()
-        if not box: raise RuntimeError(f'empty boss {slot} sprite')
-        im=im.crop(box); w=((im.width+15)//16)*16; h=((im.height+15)//16)*16
+        normal=Image.open(root/f'boss{slot}_pose1.png').convert('RGBA')
+        hit_path=root/f'boss{slot}_pose_hit.png'
+        hit=Image.open(hit_path).convert('RGBA') if hit_path.exists() else normal.copy()
+        images=[]
+        for pose in (normal,hit):
+            box=pose.getchannel('A').getbbox()
+            if not box: raise RuntimeError(f'empty boss {slot} sprite')
+            images.append(pose.crop(box))
+        w=((max(im.width for im in images)+15)//16)*16
+        h=((max(im.height for im in images)+15)//16)*16
         freq={}
-        for r,g,b,a in im.getdata():
-            if a: freq[(r,g,b)]=freq.get((r,g,b),0)+1
+        for im in images:
+            for r,g,b,a in im.getdata():
+                if a: freq[(r,g,b)]=freq.get((r,g,b),0)+1
         colors=[c for c,_ in sorted(freq.items(),key=lambda kv:-kv[1])[:15]]
         if slot==19:
             dump=json.loads((BOSSREF/'layers/boss19/md19_dump.json').read_text())
             colors=[ba.genesis_cram_rgb(w) for w in dump['cram'][17:32]]
-        idx=[[0]*w for _ in range(h)]
-        pix=im.load()
-        for y in range(im.height):
-            for x in range(im.width):
-                r,g,b,a=pix[x,y]
-                if not a: continue
-                c=min(range(len(colors)),key=lambda j:sum((colors[j][k]-(r,g,b)[k])**2 for k in range(3)))
-                idx[y][x]=c+1
-        words=[];mask=0;cols=w//16;rows=h//16
-        for cy in range(rows):
-            for cx in range(cols):
-                cell=[[idx[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
-                if any(any(row) for row in cell): mask|=1<<(cy*cols+cx)
-                words.extend(ba.encode_sprite_cell(cell))
+        words=[];masks=[];cols=w//16;rows=h//16
+        for im in images:
+            idx=[[0]*w for _ in range(h)]
+            pix=im.load(); ox=(w-im.width)//2; oy=h-im.height
+            for y in range(im.height):
+                for x in range(im.width):
+                    r,g,b,a=pix[x,y]
+                    if not a: continue
+                    c=min(range(len(colors)),key=lambda j:sum((colors[j][k]-(r,g,b)[k])**2 for k in range(3)))
+                    idx[oy+y][ox+x]=c+1
+            mask=0
+            for cy in range(rows):
+                for cx in range(cols):
+                    cell=[[idx[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+                    if any(any(row) for row in cell): mask|=1<<(cy*cols+cx)
+                    words.extend(ba.encode_sprite_cell(cell))
+            masks.append(mask)
         pal=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*c) for c in colors]
         pal += [ba.rgb_to_yuv(0,0,0)]*(16-len(pal))
-        out.append(dict(slot=slot,bg=bg,fg=fg,words=words,palette=pal[:16],mask=mask,
+        out.append(dict(slot=slot,bg=bg,fg=fg,words=words,palette=pal[:16],masks=masks,
                         cols=cols,rows=rows,spawn=spawns[slot]))
     return out
 
@@ -590,7 +600,7 @@ def main():
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
-        'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palette; unsigned short bg_tile_count,fg_tile_count; unsigned long long sprite_mask; unsigned char cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
+        'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palette; unsigned short bg_tile_count,fg_tile_count; unsigned long long sprite_mask,sprite_hit_mask; unsigned char cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
     hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned long g_boss_handler_address[19];',
@@ -634,7 +644,7 @@ def main():
             emit_u16(f,q+'_sprite_words',b['words'],static=True);emit_u16(f,q+'_sprite_palette',b['palette'],static=True)
         f.write('const BossVisualData g_later_boss_visuals[5]={\n')
         for b in laterboss:
-            q=f'boss{b["slot"]}'; f.write(f'  {{{q}_bg_palette,{q}_bg_tiles,{q}_bg_bat,{q}_fg_tiles,{q}_fg_bat,{q}_sprite_words,{q}_sprite_palette,{b["bg"]["tile_count"]},{b["fg"]["tile_count"]},0x{b["mask"]:016X}ULL,{b["cols"]},{b["rows"]},{b["spawn"][0]},{b["spawn"][1]}}},\n')
+            q=f'boss{b["slot"]}'; f.write(f'  {{{q}_bg_palette,{q}_bg_tiles,{q}_bg_bat,{q}_fg_tiles,{q}_fg_bat,{q}_sprite_words,{q}_sprite_palette,{b["bg"]["tile_count"]},{b["fg"]["tile_count"]},0x{b["masks"][0]:016X}ULL,0x{b["masks"][1]:016X}ULL,{b["cols"]},{b["rows"]},{b["spawn"][0]},{b["spawn"][1]}}},\n')
         f.write('};\n\n');emit_u8(f,'g_boss_collision',bosscollision)
         emit_u16(f,'g_boss_hp_1p',bosshp1); emit_u16(f,'g_boss_hp_2p',bosshp2)
         emit_u16(f,'g_boss_params',bossparams); emit_s16(f,'g_boss_hit_offsets',[bossoffsets])

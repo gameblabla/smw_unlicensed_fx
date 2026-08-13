@@ -1553,15 +1553,13 @@ static void draw_game_sprites(void)
         u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
             const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];
-            mask=v->sprite_mask;
+            int frame_words=v->cols*v->rows*64;
+            mask=g_boss_invuln?v->sprite_hit_mask:v->sprite_mask;
             for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
                 int cell=cy*v->cols+cx,dx,dy=by+cy*16;if(!(mask&(1ULL<<cell)))continue;
                 dx=(g_boss_face<0)?(v->cols-1-cx)*16:cx*16;
-                /* Slot 13 is two source objects: the frog jumps away while
-                   the treaded vehicle remains on the middle carrier. */
-                if(g_boss_class==3&&cy>=4){dx+=(96-bx);dy=112+(cy-4)*16;}
                 set_sprite_entry(satb,n++,bx+dx,dy,
-                    (u16)(BOSS_BASE_WORD+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
+                    (u16)(BOSS_BASE_WORD+(g_boss_invuln?frame_words:0)+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
             }
         }else{
         /* The real capture has four distinct walk cells and a separate
@@ -1706,7 +1704,7 @@ static void start_boss(int fade_in)
     }
     upload_game_sprites();
     vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
-    if(bv)for(i=0;i<bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
+    if(bv)for(i=0;i<bv->cols*bv->rows*128;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
     else{for(i=0;i<BOWSER_FRAME_WORDS*BOWSER_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_words[i]);for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);}
     if(bv){vdc_set_vram_write(FRONT_CHIP,BOSS_AUX_BASE_WORD);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_ring_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_hammer_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_bell_words[i]);}
     init_objects();

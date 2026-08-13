@@ -4,7 +4,7 @@
 typedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;
 typedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;
 typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;
-typedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palette; unsigned short bg_tile_count,fg_tile_count; unsigned long long sprite_mask; unsigned char cols,rows; short spawn_x,spawn_y; } BossVisualData;
+typedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palette; unsigned short bg_tile_count,fg_tile_count; unsigned long long sprite_mask,sprite_hit_mask; unsigned char cols,rows; short spawn_x,spawn_y; } BossVisualData;
 typedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;
 extern const StageSetData g_stage_sets[12];
 extern const GameLevelData g_game_levels[19];
