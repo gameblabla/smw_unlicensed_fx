@@ -103,6 +103,8 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BOSS_FLAME_BASE_WORD (BOSS_BASE_WORD + BOWSER_FRAME_WORDS * BOWSER_FRAME_COUNT)
 #define BOWSER_SPECIAL_FRAME_WORDS (7*6*64)
 #define BOSS_SPECIAL_BASE_WORD (BOSS_FLAME_BASE_WORD+384)
+#define BOWSER_SPECIAL_TELEPORT 0
+#define BOWSER_SPECIAL_BREATH 1
 #define BOSS_AUX_BASE_WORD 0xE000
 #define BOSS_RING_BASE_WORD BOSS_AUX_BASE_WORD
 #define BOSS_HAMMER_BASE_WORD (BOSS_AUX_BASE_WORD+256)
@@ -1704,8 +1706,14 @@ static void draw_game_sprites(void)
            forward-leaning breath cell. State 3 is a solid fixed hurt pose;
            the Mega Drive does not flicker the boss during this pause. */
         if(g_boss_invuln>0)anim=8;
-        else if(g_boss_class==0&&g_boss_action==6)anim=10;
-        else if(g_boss_class==0&&g_boss_action==5)anim=9;
+        /* The generated special bank follows the source sheet order:
+           teleport first, then the breath pose.  Handler $7526's action 6
+           is the nine-frame relocation wind-up; once it completes, motion
+           advances to the next action and this falls back to a walk frame. */
+        else if(g_boss_class==0&&g_boss_action==6&&g_boss_action_timer<9)
+            anim=9+BOWSER_SPECIAL_TELEPORT;
+        else if(g_boss_class==0&&g_boss_action==5)
+            anim=9+BOWSER_SPECIAL_BREATH;
         else anim=(g_boss_timer/10)&3;
         if(anim>=9){
             int special=anim-9;
