@@ -32,10 +32,11 @@ CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/forest.wav \
              NEWMUSIC/street.wav NEWMUSIC/titlescreen.wav NEWMUSIC/world.wav
 SFX_ADPCM_HEADER := src/sfx_adpcm_generated.h
 SFX_WAVS := megadrive_sfx_wav_lowlevel/command_90.wav \
-            megadrive_sfx_wav_lowlevel/command_96.wav \
+            megadrive_sfx_wav_lowlevel/command_9C.wav \
             megadrive_sfx_wav_lowlevel/command_99.wav \
             megadrive_sfx_wav_lowlevel/command_9D.wav \
             megadrive_sfx_wav_lowlevel/command_9E.wav \
+            megadrive_sfx_wav_lowlevel/command_AE.wav \
             megadrive_sfx_wav_lowlevel/command_A8.wav \
             megadrive_sfx_wav_lowlevel/command_A9.wav
 all: disc

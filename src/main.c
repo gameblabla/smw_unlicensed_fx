@@ -1439,7 +1439,6 @@ static void defeat_enemy(Enemy *e)
     e->defeated=1;
     e->vx=0;
     e->vy=FIX_ONE;
-    Play_Sound_Sample(SFX_BOSS_HIT,0,0);
 }
 
 static void update_fireballs(void)
@@ -3211,6 +3210,7 @@ static void update_frontend(u16 pressed)
         }
         draw_menu_people(0);
         if (pressed&(JOY_RUN|JOY_I|JOY_II)) {
+            Play_Sound_Sample(SFX_MENU_CONFIRM,0,0);
             /* The HUD reserve begins at x4.  Continue credits are a separate
                pool; do not consume a reserve merely for entering gameplay. */
             g_lives=4; g_continues=5; g_current_level=0; g_in_boss=0;

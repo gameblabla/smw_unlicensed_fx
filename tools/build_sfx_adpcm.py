@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Bake the selected Mega Drive effects into a PC-FX 16 kHz ADPCM bank."""
+"""Filter Mega Drive captures and bake a PC-FX 32 kHz ADPCM bank."""
+import math
 import pathlib
 import struct
 import wave
 
 
-RATE = 16000
+RATE = 32000
 ALIGN_WORDS = 256
-# The low-level renderer leaves these 16-bit captures at roughly one quarter
-# full scale.  Restore that headroom before the 14-bit KING predictor encoder.
-ENCODE_GAIN = 4
+# Preserve the source effects' relative loudness while using the 14-bit KING
+# predictor's range.  The loudest selected capture peaks just below 0x2000.
+ENCODE_GAIN = 1.9
+SILENCE_THRESHOLD = 8
+TRIM_PAD_MS = 20
+FIR_TAPS = 48
 STEP_SIZES = (16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55,
               60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190,
               209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598,
@@ -19,12 +23,13 @@ STEP_DELTAS = (-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8)
 # Numeric entries are the gameplay API ids.  Keeping the association here,
 # beside the source filenames, makes the generated header data-only.
 SOURCES = {
+    1: ('jump', 'AE'),
     2: ('crate_throw', 'A8'),
     3: ('blue_crystal', '9E'),
     4: ('boss_hit', '90'),
     6: ('fireball', '9D'),
     7: ('player_hurt', '99'),
-    8: ('menu_confirm', '96'),
+    8: ('menu_confirm', '9C'),
     9: ('boss_defeat', 'A9'),
 }
 
@@ -43,18 +48,80 @@ def read_mono(path):
                 for i in range(0, len(frames), 2)], wav.getframerate()
 
 
-def resample(samples, source_rate):
-    """Linear 48 kHz -> 16 kHz resample; the captured effects are mono-safe."""
-    count = (len(samples) * RATE + source_rate // 2) // source_rate
-    out = []
-    for i in range(count):
-        pos = i * source_rate
-        index, fraction = divmod(pos, RATE)
-        a = samples[min(index, len(samples) - 1)]
-        b = samples[min(index + 1, len(samples) - 1)]
-        out.append(clamp(((a * (RATE - fraction) + b * fraction) // RATE) * ENCODE_GAIN,
-                         -0x4000, 0x3fff))
-    return out
+def trim_silence(samples, source_rate):
+    """Remove only sample-exact quiet margins, retaining attack and release pads."""
+    active = [i for i, sample in enumerate(samples)
+              if abs(sample) > SILENCE_THRESHOLD]
+    if not active:
+        return [0]
+    pad = source_rate * TRIM_PAD_MS // 1000
+    first = max(0, active[0] - source_rate // 250)  # 4 ms pre-roll
+    last = min(len(samples), active[-1] + pad + 1)
+    return samples[first:last]
+
+
+def highpass(samples, source_rate, cutoff=20.0):
+    """First-order DC blocker; prevents predictor range being spent on offset."""
+    pole = math.exp(-2.0 * math.pi * cutoff / source_rate)
+    previous_input = previous_output = 0.0
+    output = []
+    for sample in samples:
+        value = sample - previous_input + pole * previous_output
+        output.append(value)
+        previous_input, previous_output = sample, value
+    return output
+
+
+def resample(samples, source_rate, lowpass_hz=None):
+    """Band-limited windowed-sinc resampling (48 kHz capture -> 32 kHz)."""
+    if not samples:
+        return [0]
+    count = max(1, (len(samples) * RATE + source_rate // 2) // source_rate)
+    # Leave a transition band below the 16 kHz output Nyquist frequency.
+    cutoff = (min(0.46 * RATE / source_rate, 0.46) if lowpass_hz is None
+              else min(lowpass_hz / source_rate, 0.46))
+    half = FIR_TAPS // 2
+    output = []
+    for out_index in range(count):
+        position = out_index * source_rate / RATE
+        center = int(math.floor(position))
+        total = weight_sum = 0.0
+        for source_index in range(center - half + 1, center + half + 1):
+            distance = position - source_index
+            if abs(distance) >= half:
+                continue
+            angle = 2.0 * math.pi * cutoff * distance
+            sinc = 2.0 * cutoff if distance == 0.0 else math.sin(angle) / (math.pi * distance)
+            window = 0.5 + 0.5 * math.cos(math.pi * distance / half)
+            weight = sinc * window
+            sample = samples[clamp(source_index, 0, len(samples) - 1)]
+            total += sample * weight
+            weight_sum += weight
+        output.append(total / weight_sum if weight_sum else 0.0)
+    return output
+
+
+def prepare(samples, source_rate, gain=ENCODE_GAIN, lowpass_hz=None,
+            fade_in_ms=1, fade_out_ms=3):
+    samples = trim_silence(samples, source_rate)
+    samples = resample(highpass(samples, source_rate), source_rate, lowpass_hz)
+    fade_in = min(len(samples), RATE * fade_in_ms // 1000)
+    fade_out = min(len(samples), RATE * fade_out_ms // 1000)
+    for i in range(fade_in):
+        samples[i] *= i / max(1, fade_in)
+    for i in range(fade_out):
+        samples[-1 - i] *= i / max(1, fade_out)
+    return [clamp(round(sample * gain), -0x4000, 0x3fff)
+            for sample in samples]
+
+
+def command_tuning(command):
+    """Per-command mastering for unusually hot or sharp original effects."""
+    if command.upper() == '96':
+        # Command 96 is important but has an unusually hard, bright transient.
+        # Keep its raw capture untouched; soften only converter/listening output.
+        return dict(gain=1.35, lowpass_hz=10500, fade_in_ms=3, fade_out_ms=8)
+    return {}
 
 
 def encode(samples):
@@ -65,13 +132,12 @@ def encode(samples):
         target = clamp(sample, -0x4000, 0x3fff)
         best = None
         for nibble in range(16):
-            # 16 kHz selects rate field 1: hardware halves the delta then
-            # applies it twice when interpolation is enabled.
-            delta = (STEP_SIZES[step_index] * ((nibble & 7) + 1)) >> 1
+            # At 32 kHz the interpolation divider is one, so each nibble
+            # applies exactly one native SoundBox predictor delta.
+            delta = STEP_SIZES[step_index] * ((nibble & 7) + 1)
             if nibble & 8:
                 delta = -delta
             candidate = clamp(predictor + delta, -0x4000, 0x3fff)
-            candidate = clamp(candidate + delta, -0x4000, 0x3fff)
             error = (target - candidate) ** 2
             if best is None or error < best[0]:
                 best = (error, nibble, candidate)
@@ -97,10 +163,18 @@ def main():
         while (len(bank) // 2) % ALIGN_WORDS:
             bank.extend(b'\0\0')
         samples, source_rate = read_mono(source_dir / ('command_%s.wav' % command))
-        encoded = encode(resample(samples, source_rate))
+        prepared = prepare(samples, source_rate, **command_tuning(command))
+        encoded = encode(prepared)
         metas[effect_id] = (len(bank) // 2, len(encoded) // 2)
         labels[effect_id] = name
         bank.extend(encoded)
+        print('%-12s: %6d PCM samples, %5d ADPCM bytes' %
+              (name, len(prepared), len(encoded)))
+
+    if len(bank) > 512 * 1024:
+        raise ValueError('ADPCM bank exceeds the 512 KiB KRAM page')
+    if any(start > 0xffff or count > 0xffff for start, count in metas):
+        raise ValueError('ADPCM metadata exceeds its 16-bit word fields')
 
     with output.open('w') as f:
         f.write('/* Generated by tools/build_sfx_adpcm.py; do not edit. */\n')
