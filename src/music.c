@@ -39,6 +39,7 @@ static u8 g_state;
 static u8 g_volume;
 static u8 g_next_track;
 static u8 g_next_loop;
+static u8 g_start_pending;
 static unsigned g_wait_frames;
 
 static void music_set_volume(unsigned volume)
@@ -63,6 +64,7 @@ static void music_transition_to(u8 track, int loop)
 
     g_next_track = track;
     g_next_loop = loop ? 1 : 0;
+    g_start_pending = 1;
     g_wait_frames = MUSIC_START_DELAY;
 
     if (g_state == MUSIC_PLAYING || g_state == MUSIC_FADING_IN) {
@@ -81,12 +83,14 @@ void music_init(void)
     eris_cdda_music_init();
     g_state = MUSIC_IDLE;
     g_next_track = CDDA_TRACK_NONE;
+    g_start_pending = 0;
     music_set_volume(0);
 }
 
 void music_stop_for_transition(void)
 {
     g_next_track = CDDA_TRACK_NONE;
+    g_start_pending = 0;
     g_wait_frames = 0;
     if (g_state == MUSIC_PLAYING || g_state == MUSIC_FADING_IN) {
         g_state = MUSIC_FADING_OUT;
@@ -95,6 +99,22 @@ void music_stop_for_transition(void)
         music_set_volume(0);
         g_state = MUSIC_IDLE;
     }
+}
+
+void music_start_at_black(void)
+{
+    if (!g_start_pending || g_next_track == CDDA_TRACK_NONE) return;
+
+    /* Do not leave a queued play command to the normal update loop: by the
+     * time its seek delay expires, the new screen can already be fading in.
+     * The caller invokes this only after it has blanked both VDC outputs (or
+     * their palettes), so the CD-DA restart is synchronized to true black. */
+    eris_cdda_music_stop();
+    music_set_volume(0);
+    eris_cdda_music_play(g_next_track, g_next_loop);
+    g_wait_frames = 0;
+    g_start_pending = 0;
+    g_state = MUSIC_FADING_IN;
 }
 
 void music_transition_to_title(void)
@@ -142,7 +162,7 @@ void music_update(void)
     case MUSIC_WAITING:
         if (g_wait_frames > 0) {
             --g_wait_frames;
-        } else if (g_next_track != CDDA_TRACK_NONE) {
+        } else if (!g_start_pending && g_next_track != CDDA_TRACK_NONE) {
             /* A stopped track is always restarted at index 00, including after
              * death/retry, rather than resuming the previous disc position. */
             eris_cdda_music_play(g_next_track, g_next_loop);

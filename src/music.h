@@ -11,5 +11,9 @@ void music_prepare_level_transition(int next_level_index);
 void music_transition_to_boss(void);
 void music_transition_to_continue(void);
 void music_stop_for_transition(void);
+/* Start a newly queued cue while the caller has the video fully black.  This
+ * deliberately performs the CD seek/play command at that point, rather than
+ * after an arbitrary loader delay while the next screen may be visible. */
+void music_start_at_black(void);
 
 #endif

@@ -387,6 +387,7 @@ static void enter_boot(void);
 static void start_boss(int fade_in);
 static void submit_front_satb(u16 *satb);
 static void clear_front_sprites(void);
+static void set_front_sprites_enabled(int enabled);
 static void set_sprite_entry(u16 *satb, int index, int x, int y, u16 addr, u16 ctrl);
 
 static void wait_frame(void)
@@ -2091,6 +2092,7 @@ static void load_continue_hidden(void)
     vdc_set_scroll(BACK_CHIP,0,0); vdc_set_scroll(FRONT_CHIP,0,0);
     g_continue_digit=9;
     set_continue_palette_fade(0);
+    music_start_at_black();
     draw_continue_digit();
     g_state=STATE_CONTINUE_LOAD;
     g_state_frame=0;
@@ -2185,7 +2187,9 @@ static void start_boss(int fade_in)
     g_boss_hp=(int)g_boss_hp_1p[g_current_level];
     if(g_boss_hp<=0)g_boss_hp=8;
     g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_boss_drop_rng=0x51F15EEDu;g_boss_random_drop_timer=72;g_after_boss=0;
-    g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);draw_game_sprites();
+    g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);
+    music_start_at_black();
+    draw_game_sprites();
     g_state=STATE_STAGE_LOAD;g_state_frame=0;
 }
 
@@ -2468,7 +2472,7 @@ static void update_boss_actor(void)
         /* Source HP-zero path at $16398 changes the boss state instead of
            erasing it. Keep the sprite visible while it launches/falls away. */
         g_boss_vy+=72;if(g_boss_vy>7*FIX_ONE)g_boss_vy=7*FIX_ONE;g_boss_y+=g_boss_vy;
-        if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();g_state=STATE_LEVEL_FADE;g_state_frame=0;}
+        if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();set_front_sprites_enabled(0);g_state=STATE_LEVEL_FADE;g_state_frame=0;}
         return;
     }
     if(g_boss_invuln>0)--g_boss_invuln;
@@ -2575,6 +2579,8 @@ static void start_gameplay(int fade_in)
     g_death_timer=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;
     set_game_palette_fade(fade_in?0:16);
+    /* Both VDC outputs are disabled above and all palettes are now black. */
+    music_start_at_black();
     update_camera();
     draw_game_sprites();
     g_state=STATE_STAGE_LOAD;
@@ -2769,11 +2775,15 @@ static void update_play(u16 btn, u16 pressed)
         g_after_boss=0;
         if(g_boss_level_flags[g_current_level]) music_stop_for_transition();
         else music_prepare_level_transition(next_level);
+        set_front_sprites_enabled(0);
         g_state=STATE_LEVEL_FADE; g_state_frame=0; return;
     }
 
     if (pressed&JOY_SELECT) {
-        music_transition_to_title();
+        /* This shortcut enters the menu directly rather than the title
+           screen, so leave its cue stopped until a later black load selects
+           a real destination track. */
+        music_stop_for_transition();
         show_black();
         load_menu_asset();
         enter_menu();
@@ -2795,6 +2805,16 @@ static void clear_front_sprites(void)
     static u16 satb[64*4];
     int i; for (i=0;i<64*4;++i) satb[i]=0;
     submit_front_satb(satb);
+}
+
+static void set_front_sprites_enabled(int enabled)
+{
+    /* SATB replacement is deferred by the VDC, so clearing it alone can leave
+       the old, fully lit sprite list on one output frame.  Gate the sprite
+       plane itself for every screen transition; the background plane remains
+       available for its normal palette fade. */
+    vdc_setreg(FRONT_CHIP, VDC_REG_CR,
+               enabled ? (u16)(VDC_CR_BB | VDC_CR_SB) : VDC_CR_BB);
 }
 
 static void add_front_player(u16 *satb, int *n, int x, int y, int frame, u16 baseword, int facing)
@@ -2953,6 +2973,7 @@ static void enter_boot(void)
 {
     music_transition_to_title();
     show_black();
+    music_start_at_black();
     upload_front_sprites();
     boot_exact_setup();
     g_boot_dual_load_pos=0;
@@ -2974,6 +2995,7 @@ static void enter_title_fade(void)
     vdc_set_scroll(BACK_CHIP,0,256);
     vdc_set_scroll(FRONT_CHIP,0,0);
     clear_front_sprites();
+    set_front_sprites_enabled(0);
     g_state=STATE_TITLE_FADE;
     g_state_frame=0;
 }
@@ -3017,6 +3039,7 @@ static void update_frontend(u16 pressed)
             int level=16-(int)(g_state_frame*16/90);
             set_title_exact_palette_fade(level);
             clear_front_sprites();
+            set_front_sprites_enabled(0);
         } else if (g_state_frame<110) {
             if (g_state_frame==90) {
                 /* Stage menu CHR/BAT only after the title has reached black.
@@ -3073,11 +3096,13 @@ static void update_frontend(u16 pressed)
         } else if (g_state_frame<156) {
             clear_bat(FRONT_CHIP,FG_BAT_WORDS);
             clear_front_sprites();
+            set_front_sprites_enabled(0);
         } else if (g_state_frame<204) {
             int level=16-(int)((g_state_frame-156)*16/48);
             if (level<0) level=0;
             set_asset_palette_fade(&g_menu_combo_asset,level);
             clear_front_sprites();
+            set_front_sprites_enabled(0);
         } else {
 #ifdef FORCE_BOSS
             start_boss(1);
@@ -3122,7 +3147,7 @@ static void update_frontend(u16 pressed)
         }
     } else if (g_state==STATE_CONTINUE_FADE) {
         int level=16-(int)(g_state_frame*16/32); if (level<0) level=0;
-        set_continue_palette_fade(level); draw_continue_digit();
+        set_continue_palette_fade(level); clear_front_sprites(); set_front_sprites_enabled(0);
         if (g_state_frame>=32) {
             Stop_Sound_Sample(SFX_MENU_CONFIRM,0);
             if (g_continue_resume) {
@@ -3133,7 +3158,7 @@ static void update_frontend(u16 pressed)
         }
     } else if (g_state==STATE_LEVEL_FADE) {
         int level=16-(int)(g_state_frame*16/32); if(level<0)level=0;
-        set_game_palette_fade(level); draw_game_sprites();
+        set_game_palette_fade(level); clear_front_sprites(); set_front_sprites_enabled(0);
         if(g_state_frame>=32){
             if(g_after_boss){
                 ++g_current_level; g_in_boss=0; g_after_boss=0;
