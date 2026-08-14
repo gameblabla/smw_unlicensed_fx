@@ -1247,6 +1247,8 @@ static void init_objects(void)
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
+            /* Only state 18 reaches $B794.  State 5 has its own airborne
+               handler at $C472 and must not be routed through the Koopa path. */
             g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA);
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
@@ -1571,30 +1573,51 @@ static void update_enemies(void)
 
         if(e->kind!=ENEMY_KIND_GENERIC){
             int near=iabs_i(px-x);
-            if(e->kind==ENEMY_KIND_MONKEY){ /* dormant until close, then slow swing/throw */
+            if(e->kind==ENEMY_KIND_MONKEY){
                 e->vx=e->vy=0;
-                if(e->behavior_phase==0){if(near<=96){e->behavior_phase=1;e->behavior_timer=0;}}
-                else if(e->behavior_phase==1){
-                    ++e->behavior_timer;
-                    if((e->behavior_timer%3)==0){
-                        if(y<=16)e->vy=FIX_ONE;else if(y>=96)e->vy=-FIX_ONE;
-                        if(e->vy==0)e->vy=FIX_ONE;e->y+=e->vy;
+                /* State 7, ROM $C166.  The source bounds $90..$E0 map to
+                   8..88 in the extracted 240-line stage coordinates.  Keep
+                   direction in flight_phase: recomputing it at an endpoint
+                   made the old approximation alternate 95/96 forever. */
+                if(e->behavior_phase==0){
+                    if(++e->behavior_timer>=63){e->behavior_phase=1;e->behavior_timer=0;}
+                }else if(e->behavior_phase==1){
+                    e->behavior_timer=(unsigned char)(30+(g_state_frame&63));
+                    e->flight_phase=(unsigned char)((g_state_frame>>2)&1);
+                    e->behavior_phase=2;
+                }else if(e->behavior_phase==2){
+                    if(e->flight_phase){
+                        e->y-=FIX_ONE;
+                        if((int)(e->y>>FIX_SHIFT)<=8){e->y=(s32)8<<FIX_SHIFT;e->flight_phase=0;}
+                    }else{
+                        e->y+=FIX_ONE;
+                        if((int)(e->y>>FIX_SHIFT)>=88){e->y=(s32)88<<FIX_SHIFT;e->flight_phase=1;}
                     }
-                    if(e->behavior_timer>=120){
+                    if(--e->behavior_timer==0){
                         int k;e->behavior_phase=2;e->behavior_timer=0;
                         for(k=0;k<4;++k)if(!g_enemy_shots[k].active){
                             EnemyShot *s=&g_enemy_shots[k];s->active=1;s->x=e->x+16*FIX_ONE;s->y=e->y+24*FIX_ONE;
                             s->vx=(px<x)?-2*FIX_ONE:2*FIX_ONE;s->vy=-2*FIX_ONE;s->palette=g_enemy_palette_line[e->variant];break;
                         }
+                        e->behavior_phase=3;
                     }
-                }else if(++e->behavior_timer>=20){e->behavior_phase=0;e->behavior_timer=0;}
+                }else if(++e->behavior_timer>=25){e->behavior_phase=0;e->behavior_timer=0;}
                 y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
-            }else if(e->kind==ENEMY_KIND_PTERODACTYL){ /* hide, then home when close */
+            }else if(e->kind==ENEMY_KIND_PTERODACTYL){
                 e->vx=e->vy=0;
-                if(e->behavior_phase==0&&near<=70)e->behavior_phase=1;
-                if(e->behavior_phase&&((++e->behavior_timer)&1)==0){
+                /* State 5, ROM $C472: wake once Mario reaches x-70, home at
+                   one pixel per axis for two 144-frame legs, then escape
+                   diagonally up-left. */
+                if(e->behavior_phase==0&&px>=x-70){e->behavior_phase=1;e->behavior_timer=0;}
+                if(e->behavior_phase==1||e->behavior_phase==2){
                     if(px<x)e->x-=FIX_ONE;else if(px>x)e->x+=FIX_ONE;
                     if(py<y)e->y-=FIX_ONE;else if(py>y)e->y+=FIX_ONE;
+                    if(++e->behavior_timer>=144){
+                        e->behavior_timer=0;
+                        ++e->behavior_phase;
+                    }
+                }else if(e->behavior_phase>=3){
+                    e->x-=FIX_ONE;e->y-=FIX_ONE;
                 }
                 x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
             }else if(e->kind==ENEMY_KIND_STRIKE_SNAKE){ /* hold, rear up, then long strike */
@@ -1962,7 +1985,7 @@ static void draw_game_sprites(void)
         anim=(int)((g_state_frame/8)&1);
         if(e->defeated)anim=v->has_hit_frame?2:1;
         else if(e->kind!=ENEMY_KIND_GENERIC){
-            if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==1)?((e->behavior_timer/12)&1):0;
+            if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==2)?((g_state_frame/12)&1):0;
             else if(e->kind==ENEMY_KIND_PTERODACTYL)
                 /* The hanging pose is selector 0.  Once awake, alternate
                    both wide ROM frames instead of freezing on selector 1. */
@@ -1975,7 +1998,7 @@ static void draw_game_sprites(void)
         if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=FORCE_SNAKE_FRAME;
 #endif
         special_snake=(e->kind==ENEMY_KIND_STRIKE_SNAKE);
-        special_monkey=(e->kind==ENEMY_KIND_MONKEY&&(e->defeated||e->behavior_phase==2));
+        special_monkey=(e->kind==ENEMY_KIND_MONKEY&&(e->defeated||e->behavior_phase==3));
         special_crate=(e->kind==ENEMY_KIND_CRATE_MIMIC&&e->behavior_phase==2&&!e->defeated);
         special_frame=e->defeated?1:0;
 #ifdef FORCE_MONKEY_HURT

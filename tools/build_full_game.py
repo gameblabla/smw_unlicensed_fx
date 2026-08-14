@@ -484,7 +484,7 @@ def build_enemy_variants(r,levels):
     # record so shared behavior never has to infer a species from its stage.
     def enemy_kind(gfx,state):
         if state==18: return 6            # red flying-Koopa handler $B794
-        if gfx==6 and state==7: return 1  # monkey handler $C31A
+        if gfx==6 and state==7: return 1  # monkey handler $C166 ($C31A throws)
         if gfx==4 and state==5: return 2  # hanging pterodactyl
         if gfx==5 and state==6: return 3  # long-strike snake
         if gfx==1 and state==2: return 4  # crate mimic
