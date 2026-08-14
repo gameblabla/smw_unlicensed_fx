@@ -1744,10 +1744,24 @@ enemy_attack_checks:
                 g_grounded=0;
                 g_player_y=(s32)(y-PLAYER_BODY_YOFF-PLAYER_BODY_H)<<FIX_SHIFT;
                 g_vy=-4*FIX_ONE;
-            } else if (g_invuln==0 &&
-                       aabb(px+4,py+5,8,PLAYER_BODY_H-10,
-                            x+4,y+5,e->width-8,h-10)) {
-                hurt_player();
+            } else if (g_invuln==0) {
+                int hurt_x=x+4,hurt_y=y+5,hurt_w=e->width-8,hurt_h=h-10;
+                /* The long-strike snake's final pose is a 64x40 metasprite
+                   drawn at x-32,y+16, rather than its 32x48 standing body.
+                   Its attack must damage across that extended frame; keeping
+                   the normal body hitbox here leaves the visible head unable
+                   to hurt Mario.  Stomps above intentionally remain tied to
+                   the standing body. */
+                if(e->kind==ENEMY_KIND_STRIKE_SNAKE && e->behavior_phase &&
+                   e->behavior_timer>=28) {
+                    hurt_x=x-28;
+                    hurt_y=y+21;
+                    hurt_w=56;
+                    hurt_h=30;
+                }
+                if(aabb(px+4,py+5,8,PLAYER_BODY_H-10,
+                        hurt_x,hurt_y,hurt_w,hurt_h))
+                    hurt_player();
             }
         }
     }
