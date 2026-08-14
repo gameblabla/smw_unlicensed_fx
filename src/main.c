@@ -1268,7 +1268,7 @@ static void update_crates(void)
     int i;
     for (i=0;i<MAX_CRATES;++i) {
         Crate *c=&g_crates[i];
-        int x,y,bottom;
+        int x,y,bottom,old_bottom,crate_top;
         if (!c->active) continue;
         if (c->carried) {
             c->x=g_player_x+(s32)4*FIX_ONE;
@@ -1299,14 +1299,35 @@ static void update_crates(void)
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
         c->vx=0;
         c->x=(c->x>>FIX_SHIFT)<<FIX_SHIFT;
+        y=(int)(c->y>>FIX_SHIFT);
+        old_bottom=y+CRATE_H-1;
         c->vy+=80;
         if (c->vy>5*FIX_ONE) c->vy=5*FIX_ONE;
         c->y+=c->vy;
         x=(int)(c->x>>FIX_SHIFT); y=(int)(c->y>>FIX_SHIFT);
         bottom=y+CRATE_H-1;
+        crate_top=0x7FFF;
+        if (c->vy>=0) {
+            int j;
+            /* Resting and falling crates are solid supports for other crates.
+               Test the fall sweep rather than just the final position so a
+               box cannot skip through another box at terminal velocity. */
+            for (j=0;j<MAX_CRATES;++j) {
+                Crate *support=&g_crates[j];
+                int sx,sy;
+                if (support==c || !support->active || support->carried || support->thrown) continue;
+                sx=(int)(support->x>>FIX_SHIFT); sy=(int)(support->y>>FIX_SHIFT);
+                if (x+CRATE_W-3<=sx || x+3>=sx+CRATE_W) continue;
+                if (old_bottom<=sy+1 && bottom>=sy && sy<crate_top) crate_top=sy;
+            }
+        }
         if (c->vy>=0 && (solid_v(x+3,bottom)||solid_v(x+CRATE_W-4,bottom))) {
             int top=(bottom>>3)<<3;
+            if (crate_top<top) top=crate_top;
             c->y=(s32)(top-CRATE_H)<<FIX_SHIFT;
+            c->vy=0;
+        } else if (crate_top!=0x7FFF) {
+            c->y=(s32)(crate_top-CRATE_H)<<FIX_SHIFT;
             c->vy=0;
         }
     }
@@ -1810,6 +1831,35 @@ static void draw_game_sprites(void)
         set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
 
+    /* SATB entries with lower indices win sprite/sprite overlap.  A carried
+       crate is the one exception to the normal object ordering: it must cover
+       Mario's hands/body, while every world crate remains behind Mario. */
+    if (g_carry_index>=0 && g_carry_index<MAX_CRATES &&
+        g_crates[g_carry_index].active && g_crates[g_carry_index].carried && n<64) {
+        Crate *c=&g_crates[g_carry_index];
+        int sx=(int)(c->x>>FIX_SHIFT)-g_camera_x;
+        int sy=(int)(c->y>>FIX_SHIFT)+bowser_room_object_y_offset();
+        if (sx>=-32 && sx<=255 && sy>=-32 && sy<=239) {
+            u16 addr=CRATE_BASE_WORD,pal=player_pal;
+            int width=2,height=2;
+            if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
+               (g_in_boss&&g_boss_class==1)) {
+                addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
+            } else if(g_in_boss&&g_boss_class==2) {
+                addr=BOSS_CRATE4_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;width=1;
+            } else if(g_in_boss&&g_boss_class==3) {
+                addr=(u16)(BOSS_BOMB_BASE_WORD+((g_state_frame>>3)&1)*256);pal=BOSS_ITEM_SPR_PAL;
+            } else if(g_in_boss&&g_boss_class==4) {
+                addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
+            } else if(g_in_boss&&g_boss_class>0) {
+                addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;
+            }
+            set_sprite_entry(satb,n++,sx,sy,addr,(u16)(VDC_SPR_PRIO_SP |
+                (width==2?VDC_SPR_X_WIDTH_2:0) |
+                (height==2?VDC_SPR_Y_HEIGHT_2:0) | pal));
+        }
+    }
+
     if (g_invuln>0 && g_player_mode==PMODE_NORMAL)
         player_visible=((g_invuln/HURT_FLICKER_HALF_PERIOD)&1)!=0;
     if(g_crate_hide&&g_carry_index>=0)player_visible=0;
@@ -1861,7 +1911,7 @@ static void draw_game_sprites(void)
 
     for (i = 0; i < MAX_CRATES && n < 54; ++i) {
         int sx, sy;
-        if (!g_crates[i].active) continue;
+        if (!g_crates[i].active || g_crates[i].carried) continue;
         sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
         sy = (int)(g_crates[i].y >> FIX_SHIFT) + bowser_room_object_y_offset();
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
