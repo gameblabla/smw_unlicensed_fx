@@ -1987,7 +1987,7 @@ static void draw_game_sprites(void)
     }
 
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
-        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame; unsigned mask; u16 flip;
+        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
@@ -2000,13 +2000,18 @@ static void draw_game_sprites(void)
         if(sx<-56||sx>255||sy<-56||sy>239)continue;
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
         anim=(int)((g_state_frame/8)&1);
-        if(e->defeated)anim=v->has_hit_frame?2:1;
+        /* Frame selector 2 is a valid live wing-flap cel for MATTHEW, so
+           keep the defeated state separate from the frame number. */
+        use_hit_frame=e->defeated&&v->has_hit_frame;
+        if(e->defeated)anim=use_hit_frame?2:1;
         else if(e->kind!=ENEMY_KIND_GENERIC){
             if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==2)?((g_state_frame/12)&1):0;
             else if(e->kind==ENEMY_KIND_PTERODACTYL)
-                /* Selector 0 hangs, selector 1 flies, and selector 2 is the
-                   hurt pose selected by the defeated branch above. */
-                anim=e->behavior_phase?1:0;
+                /* Selector 0 hangs; selectors 1 and 2 are the two wide
+                   flight cels.  Normal enemy storage has room for selectors
+                   0/1 only; selector 2 is deliberately uploaded to the
+                   separate hit bank, where it also serves as the hurt pose. */
+                anim=e->behavior_phase?(1+((e->behavior_timer/8)&1)):0;
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
@@ -2031,11 +2036,15 @@ static void draw_game_sprites(void)
         else if(special_monkey){mask=g_monkey_special_masks[special_frame];cols=rows=grid_cols=3;}
         else if(special_crate){special_frame=(g_state_frame/10)&1;mask=g_crate_walk_masks[special_frame];cols=rows=grid_cols=3;}
         else{mask=(anim==2)?v->mask2:(anim?v->mask1:v->mask0);cols=(e->width+15)>>4;rows=(e->height+15)>>4;grid_cols=3;}
+        if(special_snake)base=(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024);
+        else if(special_monkey)base=(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
+        else if(special_crate)base=(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
+        else if(use_hit_frame||(e->kind==ENEMY_KIND_PTERODACTYL&&anim==2))base=(u16)(ENEMY_HIT_BASE_WORD+li*ENEMY_FRAME_WORDS);
+        else base=(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS);
         flip=((e->kind==ENEMY_KIND_PTERODACTYL)?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
         for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
             int cell=cy*grid_cols+cx,dx;
             if(!(mask&(1u<<cell)))continue;dx=flip?(cols-1-cx)*16:cx*16;
-            u16 base=special_snake?(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024):(special_monkey?(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):(special_crate?(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS):((anim==2)?(u16)(ENEMY_HIT_BASE_WORD+li*ENEMY_FRAME_WORDS):(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS))));
             set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
         }
     }
