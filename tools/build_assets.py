@@ -578,7 +578,7 @@ def build_stage_assets(kit,rom):
 
 
 
-def build_continue_assets(kit):
+def build_continue_assets(kit, project=None):
     """Reconstruct the Mega Drive CONTINUE room from scene ADR_14FA.
 
     Background comes from the extracted 32x28 scene map.  Static metasprites
@@ -586,8 +586,14 @@ def build_continue_assets(kit):
     sprites so their two-frame animation can update without touching the BAT.
     """
     sd=kit/'graphics/static_assets/gameplay'
-    bg=Image.open(sd/'plane_A_initial.png').convert('RGB').resize((256,224),Image.Resampling.NEAREST)
-    row=bg.crop((0,216,256,224)); canvas=Image.new('RGB',(256,240),(0,0,0)); canvas.paste(bg,(0,0)); canvas.paste(row,(0,224)); canvas.paste(row,(0,232))
+    supplied=project/'gameover_256x240.pngplane_A_initial.png' if project else None
+    if supplied and supplied.is_file():
+        canvas=Image.open(supplied).convert('RGB')
+        if canvas.size != (256,240):
+            raise ValueError('%s must be 256x240' % supplied)
+    else:
+        bg=Image.open(sd/'plane_A_initial.png').convert('RGB').resize((256,224),Image.Resampling.NEAREST)
+        row=bg.crop((0,216,256,224)); canvas=Image.new('RGB',(256,240),(0,0,0)); canvas.paste(bg,(0,0)); canvas.paste(row,(0,224)); canvas.paste(row,(0,232))
     gfx=(sd/'gameplay_gfx_ROM_053F8C_len_BFE0.bin').read_bytes()
     common=(kit/'graphics/static_assets/common_gfx_ROM_04E906_len_1000.bin').read_bytes()
     vram=bytearray(0x10000); vram[:len(gfx)]=gfx; vram[0xE000:0xF000]=common
@@ -688,7 +694,7 @@ def main():
     menu_m_pal,menu_m_words,menu_l_pal,menu_l_words=build_menu_character_assets(frontdir,kit)
     reference_player_pal,player_down_words,luigi_down_words,continue_mario_words,continue_luigi_words=build_reference_player_assets(p)
     fg,bg,collision,player_pal,player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies=build_stage_assets(kit,rom)
-    continue_bg,continue_digit_pal,continue_digit_words=build_continue_assets(kit)
+    continue_bg,continue_digit_pal,continue_digit_words=build_continue_assets(kit,p)
     fronts.append(('continue_base',continue_bg))
 
     h=p/'src/assets_generated.h'; c=p/'src/assets_generated.c'
