@@ -2194,6 +2194,8 @@ static void load_continue_hidden(void)
 {
     int x,y,i;
     music_transition_to_continue();
+    tetsu_set_priorities(1, 2, 0, 0, 0, 0, 0);
+    tetsu_set_chroma_key(0, 1, 0, 1, 0, 1);
     /* Never expose a half-loaded BAT/CHR set. Both VDC outputs remain disabled
        until the following TETSU frame boundary. */
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
@@ -2240,6 +2242,7 @@ static void start_boss(int fade_in)
     const BossVisualData *bv;
     const BossRoomData *br;
     g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32;
+    set_gameplay_plane_priorities();
     music_transition_to_boss();
     g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
@@ -3108,6 +3111,7 @@ static void enter_boot(void)
     g_prompt_visible=-1;
     g_menu_choice=MENU_1P;
     g_lives=4; g_continues=5; g_current_level=0; g_in_boss=0;
+    set_gameplay_plane_priorities();
     { int i; for (i=0;i<256;++i) g_title_exact_palette[i]=0x0088; }
 }
 
