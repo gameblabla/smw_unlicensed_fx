@@ -846,67 +846,68 @@ static u16 level_fg_bat_entry(int world_col,int row)
     return relocate_bat(g_stage_set->segment_bat[(seg*30+row)*32+lx],FG_TILE_BASE_INDEX);
 }
 
+static int level_stage_chip(void);
+static int level_backdrop_chip(void);
+
 static void stream_level_column(int world_col, int display_enabled)
 {
-    int row,map_col=world_col&(FG_BAT_W-1);
+    int row,chip=level_stage_chip(),map_col=world_col&(FG_BAT_W-1);
     u16 planes=display_enabled?(u16)(VDC_CR_BB|VDC_CR_SB):0;
     if(world_col<0||world_col>=g_level_width_tiles)return;
 
     /* A BAT column is contiguous when MAWR advances by the 64-word map
        stride. Select the address once, stream the column, then restore the
        normal +1 CHR/BAT mode used by sprite and pattern uploads. */
-    vdc_setreg(FRONT_CHIP,VDC_REG_CR,
+    vdc_setreg(chip,VDC_REG_CR,
                (u16)(planes|VDC_CR_IW_40));
-    vdc_set_vram_write(FRONT_CHIP,(u16)map_col);
+    vdc_set_vram_write(chip,(u16)map_col);
     for(row=0;row<30;++row)
-        vdc_vram_write(FRONT_CHIP,level_fg_bat_entry(world_col,row));
-    vdc_setreg(FRONT_CHIP,VDC_REG_CR,
+        vdc_vram_write(chip,level_fg_bat_entry(world_col,row));
+    vdc_setreg(chip,VDC_REG_CR,
                (u16)(planes|VDC_CR_IW_01));
 }
 
-static void upload_level_back(void)
+static int level_uses_front_backdrop(void)
 {
-    int x,y;
-    vdc_set_vram_write(BACK_CHIP,FG_TILE_BASE_WORD);
-    for(x=0;x<g_stage_set->tile_count*TILE_WORDS;++x)vdc_vram_write(BACK_CHIP,g_stage_set->tile_words[x]);
+    return !g_in_boss && (g_current_level == 6 || g_current_level == 7);
+}
+
+static int level_stage_chip(void)
+{
+    return level_uses_front_backdrop() ? BACK_CHIP : FRONT_CHIP;
+}
+
+static int level_backdrop_chip(void)
+{
+    return level_uses_front_backdrop() ? FRONT_CHIP : BACK_CHIP;
+}
+
+static void upload_level_backdrop(void)
+{
+    int x,y,chip=level_backdrop_chip();
+    vdc_set_vram_write(chip,FG_TILE_BASE_WORD);
+    for(x=0;x<g_stage_set->tile_count*TILE_WORDS;++x)vdc_vram_write(chip,g_stage_set->tile_words[x]);
     for(y=0;y<30;++y){
-        vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));
+        vdc_set_vram_write(chip,(u16)(y*BG_BAT_W));
         /* The background plane is the Mega Drive's full 64-cell width; it
            wraps every 512 pixels, not every 256. */
-        for(x=0;x<64;++x){u16 e=g_level->bg_bat[y*BG_BAT_W+x];vdc_vram_write(BACK_CHIP,relocate_bat(e,FG_TILE_BASE_INDEX));}
+        for(x=0;x<64;++x){u16 e=g_level->bg_bat[y*BG_BAT_W+x];vdc_vram_write(chip,relocate_bat(e,FG_TILE_BASE_INDEX));}
     }
 }
 
 static void init_level_ring(void)
 {
-    int col,i;
+    int col,i,chip;
     g_level=&g_game_levels[g_current_level]; g_stage_set=&g_stage_sets[g_level->set_index]; g_level_width_tiles=g_level->route_len*32;
     clear_bat(BACK_CHIP,BG_BAT_WORDS); clear_bat(FRONT_CHIP,FG_BAT_WORDS);
-    upload_level_back();
-    vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
-    for(i=0;i<g_stage_set->tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_stage_set->tile_words[i]);
+    upload_level_backdrop();
+    chip=level_stage_chip();
+    vdc_set_vram_write(chip,FG_TILE_BASE_WORD);
+    for(i=0;i<g_stage_set->tile_count*TILE_WORDS;++i)vdc_vram_write(chip,g_stage_set->tile_words[i]);
     for(col=0;col<FG_BAT_W;++col)stream_level_column(col,0);
     g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
     vdc_set_scroll(BACK_CHIP,0,0);vdc_set_scroll(FRONT_CHIP,0,0);
     upload_game_sprites(); set_game_palette_fade(16);
-}
-
-static void set_gameplay_plane_priorities(void)
-{
-    /* Mega Drive slots 14 and 15 put the animated water/mist map in front of
-       the playfield.  It is stored on VDC0 in this port, so give that output
-       precedence over VDC1 for these two routes.  Chroma key zero keeps the
-       sparse mist transparent and lets the VDC1 trees, terrain and actors
-       show through everywhere the source overlay is empty. */
-    if (!g_in_boss && (g_current_level == 13 || g_current_level == 14))
-    {
-        tetsu_set_priorities(3, 2, 0, 0, 0, 0, 0);
-        tetsu_set_chroma_key(0, 0, 8, 8, 8, 8);
-    }
-    else {
-        tetsu_set_priorities(1, 2, 0, 0, 0, 0, 0);
-        tetsu_set_chroma_key(0, 1, 0, 1, 0, 1);
-    }
 }
 
 static unsigned char collision_at(int x,int y)
@@ -1184,6 +1185,7 @@ static void update_camera(void)
 
 static void commit_stage_camera(void)
 {
+    int stage_chip,backdrop_chip;
     if(g_in_boss)return;
 
     /* update_camera() runs after gameplay simulation and only publishes a
@@ -1192,8 +1194,10 @@ static void commit_stage_camera(void)
        split from late scroll writes without putting a VRAM-write burst in the
        leading blanking interval, where it can disturb KING ADPCM playback. */
     g_camera_x=g_camera_target_x;
-    vdc_set_scroll(FRONT_CHIP,(u16)(g_camera_x&0x01FF),0);
-    vdc_set_scroll(BACK_CHIP,(u16)((g_camera_x>>1)&0x01FF),0);
+    stage_chip=level_stage_chip();
+    backdrop_chip=level_backdrop_chip();
+    vdc_set_scroll(stage_chip,(u16)(g_camera_x&0x01FF),0);
+    vdc_set_scroll(backdrop_chip,(u16)((g_camera_x>>1)&0x01FF),0);
 }
 
 
@@ -2194,8 +2198,6 @@ static void load_continue_hidden(void)
 {
     int x,y,i;
     music_transition_to_continue();
-    tetsu_set_priorities(1, 2, 0, 0, 0, 0, 0);
-    tetsu_set_chroma_key(0, 1, 0, 1, 0, 1);
     /* Never expose a half-loaded BAT/CHR set. Both VDC outputs remain disabled
        until the following TETSU frame boundary. */
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
@@ -2242,7 +2244,6 @@ static void start_boss(int fade_in)
     const BossVisualData *bv;
     const BossRoomData *br;
     g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32;
-    set_gameplay_plane_priorities();
     music_transition_to_boss();
     g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
@@ -2678,7 +2679,6 @@ static void start_gameplay(int fade_in)
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     init_level_ring();
-    set_gameplay_plane_priorities();
     init_objects();
     ycrop=(g_current_level==2)?8:0;
     g_player_x=(s32)g_level->spawn_x<<FIX_SHIFT;
@@ -3111,7 +3111,6 @@ static void enter_boot(void)
     g_prompt_visible=-1;
     g_menu_choice=MENU_1P;
     g_lives=4; g_continues=5; g_current_level=0; g_in_boss=0;
-    set_gameplay_plane_priorities();
     { int i; for (i=0;i<256;++i) g_title_exact_palette[i]=0x0088; }
 }
 
