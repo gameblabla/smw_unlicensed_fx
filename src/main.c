@@ -185,6 +185,7 @@ extern void pcfx_tetsu_wait_frame(void);
 #define STATE_CONTINUE   7
 #define STATE_CONTINUE_FADE 8
 #define STATE_LEVEL_FADE 9
+#define STATE_STAGE_PREP 10
 
 #define PMODE_NORMAL     0
 #define PMODE_DYING      1
@@ -844,21 +845,22 @@ static u16 level_fg_bat_entry(int world_col,int row)
     return relocate_bat(g_stage_set->segment_bat[(seg*30+row)*32+lx],FG_TILE_BASE_INDEX);
 }
 
-static void stream_level_column(int world_col)
+static void stream_level_column(int world_col, int display_enabled)
 {
     int row,map_col=world_col&(FG_BAT_W-1);
+    u16 planes=display_enabled?(u16)(VDC_CR_BB|VDC_CR_SB):0;
     if(world_col<0||world_col>=g_level_width_tiles)return;
 
     /* A BAT column is contiguous when MAWR advances by the 64-word map
        stride. Select the address once, stream the column, then restore the
        normal +1 CHR/BAT mode used by sprite and pattern uploads. */
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,
-               (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IW_40));
+               (u16)(planes|VDC_CR_IW_40));
     vdc_set_vram_write(FRONT_CHIP,(u16)map_col);
     for(row=0;row<30;++row)
         vdc_vram_write(FRONT_CHIP,level_fg_bat_entry(world_col,row));
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,
-               (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IW_01));
+               (u16)(planes|VDC_CR_IW_01));
 }
 
 static void upload_level_back(void)
@@ -882,7 +884,7 @@ static void init_level_ring(void)
     upload_level_back();
     vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
     for(i=0;i<g_stage_set->tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_stage_set->tile_words[i]);
-    for(col=0;col<FG_BAT_W;++col)stream_level_column(col);
+    for(col=0;col<FG_BAT_W;++col)stream_level_column(col,0);
     g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
     vdc_set_scroll(BACK_CHIP,0,0);vdc_set_scroll(FRONT_CHIP,0,0);
     upload_game_sprites(); set_game_palette_fade(16);
@@ -1152,11 +1154,11 @@ static void update_camera(void)
     new_tile=target>>3;
     while (g_camera_tile<new_tile) {
         ++g_camera_tile;
-        stream_level_column(g_camera_tile+FG_BAT_W-1);
+        stream_level_column(g_camera_tile+FG_BAT_W-1,1);
     }
     while (g_camera_tile>new_tile) {
         --g_camera_tile;
-        stream_level_column(g_camera_tile);
+        stream_level_column(g_camera_tile,1);
     }
     g_camera_target_x=target;
 }
@@ -2928,14 +2930,21 @@ static void show_menu_back(int choice)
     vdc_set_scroll(BACK_CHIP,0,256);
 }
 
-static void menu_overlay_setup(void)
+static void menu_overlay_prepare(void)
 {
-    /* The complete 256x240 menu is on VDC0. VDC1 is sprite-only here. */
+    /* The complete 256x240 menu is on VDC0. Keep both outputs hidden while
+       changing the plane arrangement; publish VDC0 on a later frame. */
     clear_bat(FRONT_CHIP,FG_BAT_WORDS);
     vdc_set_scroll(FRONT_CHIP,0,0);
+    vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
+    vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
+    clear_front_sprites();
+}
+
+static void menu_overlay_enable(void)
+{
     vdc_setreg(BACK_CHIP,VDC_REG_CR,VDC_CR_BB);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,VDC_CR_SB);
-    clear_front_sprites();
 }
 
 static void add_menu_32x48(u16 *satb,int *n,int x,int y,u16 addr,int facing,u16 pal)
@@ -3005,8 +3014,9 @@ static void enter_menu(void)
     g_menu_choice=MENU_1P;
     g_menu_sprite_fade=16;
     show_menu_back(g_menu_choice);
-    menu_overlay_setup();
+    menu_overlay_prepare();
     set_asset_palette_fade(&g_menu_combo_asset,16);
+    menu_overlay_enable();
     g_state=STATE_MENU;
     g_state_frame=0;
     draw_menu_people(0);
@@ -3042,15 +3052,21 @@ static void update_frontend(u16 pressed)
             set_front_sprites_enabled(0);
         } else if (g_state_frame<110) {
             if (g_state_frame==90) {
-                /* Stage menu CHR/BAT only after the title has reached black.
-                   Writing the high VDC0 pattern area during the live reveal
-                   caused the reported one-frame title corruption. */
+                /* Give the output-disable write a complete frame to latch.
+                   Starting the long upload here can otherwise retain one
+                   bright scanline from the old screen at the frame boundary. */
+                vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
+                vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
+                set_title_exact_palette_fade(0);
+            } else if (g_state_frame==91) {
                 load_menu_asset();
                 g_menu_choice=MENU_1P;
                 g_menu_sprite_fade=0;
                 vdc_set_scroll(BACK_CHIP,0,256);
-                menu_overlay_setup();
+                menu_overlay_prepare();
                 set_asset_palette_fade(&g_menu_combo_asset,0);
+            } else if (g_state_frame==92) {
+                menu_overlay_enable();
             }
             clear_front_sprites();
         } else if (g_state_frame<190) {
@@ -3098,12 +3114,25 @@ static void update_frontend(u16 pressed)
             clear_front_sprites();
             set_front_sprites_enabled(0);
         } else if (g_state_frame<204) {
-            int level=16-(int)((g_state_frame-156)*16/48);
+            /* Include both endpoints: frame 156 is fully bright and frame
+               203 is fully black. The old /48 interpolation stopped at
+               level 1, leaving a dim menu frame during the stage handoff. */
+            int level=16-(int)((g_state_frame-156)*16/47);
             if (level<0) level=0;
             set_asset_palette_fade(&g_menu_combo_asset,level);
             clear_front_sprites();
             set_front_sprites_enabled(0);
         } else {
+            /* Let both disabled outputs persist for one full frame before the
+               multi-frame stage upload begins. */
+            vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
+            vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
+            g_state=STATE_STAGE_PREP;
+            g_state_frame=0;
+            return;
+        }
+    } else if (g_state==STATE_STAGE_PREP) {
+        if (g_state_frame>=1) {
 #ifdef FORCE_BOSS
             start_boss(1);
 #else
@@ -3112,8 +3141,9 @@ static void update_frontend(u16 pressed)
             return;
         }
     } else if (g_state==STATE_STAGE_LOAD) {
-        /* CHR/BAT/SATB were completed while outputs were hidden last frame. */
-        if (g_state_frame>=1) {
+        /* CHR/BAT/SATB uploads can span a frame. Keep one additional complete
+           black frame after they return before publishing both VDC planes. */
+        if (g_state_frame>=2) {
             vdc_setreg(BACK_CHIP,VDC_REG_CR,VDC_CR_BB);
             vdc_setreg(FRONT_CHIP,VDC_REG_CR,(u16)(VDC_CR_BB|VDC_CR_SB));
             g_state=STATE_PLAY; g_state_frame=0;
