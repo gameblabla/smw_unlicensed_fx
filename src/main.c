@@ -891,6 +891,24 @@ static void init_level_ring(void)
     upload_game_sprites(); set_game_palette_fade(16);
 }
 
+static void set_gameplay_plane_priorities(void)
+{
+    /* Mega Drive slots 14 and 15 put the animated water/mist map in front of
+       the playfield.  It is stored on VDC0 in this port, so give that output
+       precedence over VDC1 for these two routes.  Chroma key zero keeps the
+       sparse mist transparent and lets the VDC1 trees, terrain and actors
+       show through everywhere the source overlay is empty. */
+    if (!g_in_boss && (g_current_level == 13 || g_current_level == 14))
+    {
+        tetsu_set_priorities(3, 2, 0, 0, 0, 0, 0);
+        tetsu_set_chroma_key(0, 0, 8, 8, 8, 8);
+    }
+    else {
+        tetsu_set_priorities(1, 2, 0, 0, 0, 0, 0);
+        tetsu_set_chroma_key(0, 1, 0, 1, 0, 1);
+    }
+}
+
 static unsigned char collision_at(int x,int y)
 {
     int tx,ty,screen,seg,lx;
@@ -2657,6 +2675,7 @@ static void start_gameplay(int fade_in)
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     init_level_ring();
+    set_gameplay_plane_priorities();
     init_objects();
     ycrop=(g_current_level==2)?8:0;
     g_player_x=(s32)g_level->spawn_x<<FIX_SHIFT;
