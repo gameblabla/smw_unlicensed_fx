@@ -2524,7 +2524,7 @@ static void update_boss_actor(void)
         /* Source HP-zero path at $16398 changes the boss state instead of
            erasing it. Keep the sprite visible while it launches/falls away. */
         g_boss_vy+=72;if(g_boss_vy>7*FIX_ONE)g_boss_vy=7*FIX_ONE;g_boss_y+=g_boss_vy;
-        if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();set_front_sprites_enabled(0);g_state=STATE_LEVEL_FADE;g_state_frame=0;}
+        if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();g_state=STATE_LEVEL_FADE;g_state_frame=0;}
         return;
     }
     if(g_boss_invuln>0)--g_boss_invuln;
@@ -2827,7 +2827,6 @@ static void update_play(u16 btn, u16 pressed)
         g_after_boss=0;
         if(g_boss_level_flags[g_current_level]) music_stop_for_transition();
         else music_prepare_level_transition(next_level);
-        set_front_sprites_enabled(0);
         g_state=STATE_LEVEL_FADE; g_state_frame=0; return;
     }
 
@@ -3238,8 +3237,12 @@ static void update_frontend(u16 pressed)
         }
     } else if (g_state==STATE_LEVEL_FADE) {
         int level=16-(int)(g_state_frame*16/32); if(level<0)level=0;
-        set_game_palette_fade(level); clear_front_sprites(); set_front_sprites_enabled(0);
+        set_game_palette_fade(level); draw_game_sprites();
         if(g_state_frame>=32){
+            /* Keep the live SATB visible through the fade.  Once both the
+               background and sprite palettes have reached black, blank the
+               sprite plane before replacing the scene underneath it. */
+            clear_front_sprites(); set_front_sprites_enabled(0);
             if(g_after_boss){
                 ++g_current_level; g_in_boss=0; g_after_boss=0;
                 if(g_current_level>=19){enter_boot();return;}
