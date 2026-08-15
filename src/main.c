@@ -302,7 +302,7 @@ static int g_boss_action,g_boss_action_timer,g_boss_action_dir;
 static const unsigned char g_bowser_action_script[12]={1,5,2,6,3,4,1,5,2,5,3,4};
 static const unsigned char g_bowser_direction_script[12]={0,1,1,1,0,1,0,1,1,0,0,1};
 static int g_boss_script_index;
-static int g_boss8_slow_count,g_boss8_spin_toggle;
+static int g_boss8_crate=-1;
 static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx,g_boss_shot_vy;
 static int g_boss_shot_active;
 static unsigned g_boss_drop_rng;
@@ -313,12 +313,17 @@ static int g_boss_random_drop_timer;
    Keep the recovered data here instead of approximating it with a velocity
    pattern; the direction flag is also the value used by the original sprite
    selector. */
-/* The pig's mask is 4 cells wide by 5 tall, so a 64x80 body.  These bounds
-   keep every cell inside the 256x240 room while it spins. */
-#define BOSS8_MIN_X 8
-#define BOSS8_MAX_X 184
-#define BOSS8_MIN_Y 8
-#define BOSS8_MAX_Y 152
+/* Boss 3 room geometry, in room space.  X is the source object coordinate
+   minus $A0 (the ordinary -$80 room offset plus the pig metasprite's -32
+   bbox origin); Y keeps the plain -$80 offset because the port's boss room
+   is not the full-height MD plane.  $A8/$158 -> 8/184, $C8/$130 -> 72/176. */
+#define BOSS8_LEFT_X   8
+#define BOSS8_RIGHT_X  184
+#define BOSS8_TOP_Y    72
+#define BOSS8_BOTTOM_Y 176
+/* $827C refuses to spawn a drop below $F0; $82DA splashes it at $15E. */
+#define BOSS8_DROP_MAX_Y   112
+#define BOSS8_DROP_END_Y   222
 
 static const unsigned char g_boss8_arc[45]={
     1,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3,
@@ -2397,11 +2402,15 @@ static void start_boss(int fade_in)
        capture origin. Move the actor itself so the visual, hitbox and sweep
        all share the corrected Y axis. */
     if(g_boss_class==2)y+=17;
+    /* Boss 3's object X is drawn through a bottom-centre metasprite anchor
+       (bbox x0 = -32).  Fold that into the actor so motion, art and hitbox
+       all share one coordinate. */
+    if(g_boss_class==1)x-=32;
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
-    g_boss8_slow_count=0;g_boss8_spin_toggle=0;
+    g_boss8_crate=-1;
 
     /* Exact 1P HP table $6D6E: 8,8,10,10,12,12,12 for the seven bosses.
        $6D94 is also exported for the later two-player implementation. */
@@ -2430,17 +2439,6 @@ static void boss_fire_at_player(int speed)
     g_boss_shot_y=g_boss_y+(s32)36*FIX_ONE;
     g_boss_shot_vx=((g_player_x<g_boss_x)?-speed:speed)*FIX_ONE;
     g_boss_shot_vy=0;
-}
-
-static void boss_drop_water(void)
-{
-    if(g_boss_shot_active)return;
-    g_boss_shot_active=1;
-    /* Source metasprite 8 places the drop below the pig's top-left anchor. */
-    g_boss_shot_x=g_boss_x+(s32)9*FIX_ONE;
-    g_boss_shot_y=g_boss_y+(s32)71*FIX_ONE;
-    g_boss_shot_vx=0;
-    g_boss_shot_vy=2*FIX_ONE;
 }
 
 static unsigned boss_random(void)
@@ -2476,6 +2474,58 @@ static void boss_drop_bomb(void)
         c->x=(s32)x<<FIX_SHIFT;c->y=(s32)(by+40)<<FIX_SHIFT;
         c->vx=0;c->vy=FIX_ONE;
         return;
+    }
+}
+
+/* --- Boss 3 ($806A) crate and water-drop objects ------------------------ */
+
+/* $8564 keeps its crate in one dedicated object slot.  Track the same way so
+   the handler can walk it down and know when it has landed. */
+static int boss8_crate_index(void)
+{
+    if(g_boss8_crate<0)return -1;
+    if(!g_crates[g_boss8_crate].active||g_crates[g_boss8_crate].carried||
+       g_crates[g_boss8_crate].thrown){g_boss8_crate=-1;return -1;}
+    return g_boss8_crate;
+}
+
+static int boss8_drop_crate(void)
+{
+    int i;
+    /* $8570: a crate already resting in the room makes the source skip the
+       whole action rather than stack a second one. */
+    for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active)return 0;
+    for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
+        Crate *c=&g_crates[i];
+        c->active=1;c->carried=0;c->thrown=0;c->extra=1;c->flight_timer=0;
+        /* Crate metasprite $B3 is 24x24 and spawns on the pig's own origin.
+           The port anchors the 64x80 pig art by its top-left, so centre the
+           box on the body and start it just under the belly. */
+        c->x=g_boss_x+(s32)20*FIX_ONE;
+        c->y=g_boss_y+(s32)56*FIX_ONE;
+        c->vx=0;c->vy=2*FIX_ONE;
+        g_boss8_crate=i;
+        return 1;
+    }
+    return 0;
+}
+
+/* $8270.  Every action falls through here.  With no drop live the source
+   samples the VDP HV counter, masks $45, and spawns the small water drop
+   below itself; otherwise it walks the existing drop down three pixels a
+   frame until it splashes at $15E. */
+static void boss8_common_tail(void)
+{
+    if(!g_boss_shot_active){
+        if((int)(g_boss_y>>FIX_SHIFT)>BOSS8_DROP_MAX_Y)return;
+        if(boss_random()&0x45u)return;
+        g_boss_shot_active=1;
+        /* $82AA offsets the drop +$14 or -$1C from the object origin; both
+           land under the body once the port's top-left anchor is added. */
+        g_boss_shot_x=g_boss_x+(s32)(g_boss_action_dir?52:4)*FIX_ONE;
+        g_boss_shot_y=g_boss_y+(s32)64*FIX_ONE;
+        g_boss_shot_vx=0;
+        g_boss_shot_vy=3*FIX_ONE;
     }
 }
 
@@ -2531,64 +2581,60 @@ static void update_boss_motion(void)
         g_boss_vx=0;g_boss_vy=0;
         break;
     }
-    case 1: { /* level 8/$806A: exact action script and spin phases */
+    case 1: { /* level 8/$806A, transcribed from the 68000 handler */
         int state,dir,step,duration,vx,vy;
         const unsigned char *p;
 
-        /* The source object's init bit is represented by a negative timer.
+        /* Object coordinates are the source's, shifted into room space.  The
+           pig's metasprite (IDs 435-438) is anchored bottom-centre with bbox
+           x0 = -32, so the drawn top-left is the object x minus 32 on top of
+           the ordinary -$80 room offset: room_x = md_x - 160.  That is what
+           puts the source's $A8..$158 patrol range at 8..184 here, which is
+           exactly the 64-pixel-wide body fitting a 256-pixel room. */
+
+        /* $806A: the source's init bit is represented by a negative timer.
            Keeping the previous state through the transition preserves its
            final pose for the frame in which the source resets that bit. */
         if(g_boss_action_timer<0){
-            /* The source script only spins about once every twenty-five
-               actions.  Alternate instead: four slow patrol actions, then one
-               of the two fast spin paths. */
-            if(g_boss8_slow_count>=4){
-                g_boss_action=g_boss8_spin_toggle?7:6;
-                g_boss8_spin_toggle^=1;
-                g_boss_action_dir=0;
-                g_boss8_slow_count=0;
-            }else{
-                for(;;){
-                    p=&g_boss8_script[g_boss_script_index*2];
-                    if(p[0]==0x88){g_boss_script_index=0;continue;}
-                    ++g_boss_script_index;
-                    if(p[0]==6||p[0]==7)continue; /* spins are scheduled above */
-                    break;
-                }
-                g_boss_action=p[0];g_boss_action_dir=p[1];
-                ++g_boss8_slow_count;
-            }
+            p=&g_boss8_script[g_boss_script_index*2];
+            if(p[0]==0x88){g_boss_script_index=0;p=g_boss8_script;}
+            g_boss_action=p[0];g_boss_action_dir=p[1];++g_boss_script_index;
             g_boss_action_timer=0;g_boss_phase=0;
             /* The cleaned strip is stored in the opposite base orientation
                from the MD direction bit: dir 0 moves left and is unflipped. */
             g_boss_face=g_boss_action_dir?-1:1;
         }
         state=g_boss_action;dir=g_boss_action_dir;
-        if(state==1){
+        g_boss_vx=0;g_boss_vy=0;
+        if(state==1){ /* $8110 */
             g_boss_x-=(s32)2*FIX_ONE;g_boss_y-=(s32)FIX_ONE;
             g_boss_vx=-2*FIX_ONE;g_boss_vy=-FIX_ONE;
             ++g_boss_action_timer;
             if(g_boss_action_timer>=44){
                 g_boss_y+=(s32)2*FIX_ONE;
-                if((int)(g_boss_x>>FIX_SHIFT)<=40){g_boss_x=(s32)40<<FIX_SHIFT;g_boss_action_timer=-1;}
+                if((int)(g_boss_x>>FIX_SHIFT)<=BOSS8_LEFT_X){
+                    g_boss_x=(s32)BOSS8_LEFT_X<<FIX_SHIFT;g_boss_action_timer=-1;
+                }
             }
-        }else if(state==2){
+        }else if(state==2){ /* $814A */
             g_boss_x+=(s32)2*FIX_ONE;g_boss_y+=(s32)FIX_ONE;
             g_boss_vx=2*FIX_ONE;g_boss_vy=FIX_ONE;
             ++g_boss_action_timer;
             if(g_boss_action_timer>=44){
                 g_boss_y-=(s32)2*FIX_ONE;
-                if((int)(g_boss_x>>FIX_SHIFT)>=216){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_action_timer=-1;}
+                if((int)(g_boss_x>>FIX_SHIFT)>=BOSS8_RIGHT_X){
+                    g_boss_x=(s32)BOSS8_RIGHT_X<<FIX_SHIFT;g_boss_action_timer=-1;
+                }
             }
-        }else if(state==3||state==4){
+        }else if(state==3||state==4){ /* $8184 / $81FA, arc table $868A */
             step=g_boss_action_timer;
-            if(step>=44){
+            if(g_boss8_arc[step]==0x88){
                 if(state==3){
-                    if(dir){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_y=(s32)72<<FIX_SHIFT;}
-                    else{g_boss_x=(s32)40<<FIX_SHIFT;g_boss_y=(s32)176<<FIX_SHIFT;}
+                    if(dir){g_boss_x=(s32)BOSS8_RIGHT_X<<FIX_SHIFT;g_boss_y=(s32)BOSS8_TOP_Y<<FIX_SHIFT;}
+                    else{g_boss_x=(s32)BOSS8_LEFT_X<<FIX_SHIFT;g_boss_y=(s32)BOSS8_BOTTOM_Y<<FIX_SHIFT;}
                 }else{
-                    if(dir){g_boss_x=(s32)216<<FIX_SHIFT;g_boss_y=(s32)176<<FIX_SHIFT;}
-                    else{g_boss_x=(s32)40<<FIX_SHIFT;g_boss_y=(s32)72<<FIX_SHIFT;}
+                    if(dir){g_boss_x=(s32)BOSS8_RIGHT_X<<FIX_SHIFT;g_boss_y=(s32)BOSS8_BOTTOM_Y<<FIX_SHIFT;}
+                    else{g_boss_x=(s32)BOSS8_LEFT_X<<FIX_SHIFT;g_boss_y=(s32)BOSS8_TOP_Y<<FIX_SHIFT;}
                 }
                 g_boss_action_timer=-1;
             }else{
@@ -2603,57 +2649,49 @@ static void update_boss_motion(void)
                 }
                 ++g_boss_action_timer;
             }
-        }else if(state==6||state==7){
-            /* States 6 and 7 are the two source spin paths.  Their phases
-               deliberately do not change the direction flag; the MD keeps
-               the selected facing throughout each spin action. */
-            vx=vy=0;duration=0;
-            if(state==6){
-                switch(g_boss_phase){
-                case 0:vx=-4;vy=4;duration=28;break;
-                case 1:vx=-4;vy=-4;duration=20;break;
-                case 2:vx=4;vy=-4;duration=16;break;
-                default:vx=4;vy=4;duration=34;break;
-                }
-            }else{
-                switch(g_boss_phase){
-                case 0:vx=4;vy=4;duration=22;break;
-                case 1:vx=4;vy=-4;duration=24;break;
-                case 2:vx=-4;vy=-4;duration=6;break;
-                case 3:vx=-4;vy=4;duration=38;break;
-                case 4:vx=-4;vy=-4;duration=8;break;
-                case 5:vx=4;vy=-4;duration=28;break;
-                default:vx=4;vy=2;duration=22;break;
-                }
-            }
-            g_boss_vx=(s32)vx*FIX_ONE;g_boss_vy=(s32)vy*FIX_ONE;
-            g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;
-            /* The raw source phase lengths carry the 80x80 body far past the
-               right edge, which read as the spin having no graphics at all.
-               Keep the whole sprite inside the room instead. */
-            if(g_boss_x<(s32)BOSS8_MIN_X*FIX_ONE)g_boss_x=(s32)BOSS8_MIN_X*FIX_ONE;
-            if(g_boss_x>(s32)BOSS8_MAX_X*FIX_ONE)g_boss_x=(s32)BOSS8_MAX_X*FIX_ONE;
-            if(g_boss_y<(s32)BOSS8_MIN_Y*FIX_ONE)g_boss_y=(s32)BOSS8_MIN_Y*FIX_ONE;
-            if(g_boss_y>(s32)BOSS8_MAX_Y*FIX_ONE)g_boss_y=(s32)BOSS8_MAX_Y*FIX_ONE;
-            ++g_boss_action_timer;
-            if(g_boss_action_timer>=duration){
-                g_boss_action_timer=0;++g_boss_phase;
-                if((state==6&&g_boss_phase>=4)||(state==7&&g_boss_phase>=7)){
-                    g_boss_x=(s32)216<<FIX_SHIFT;g_boss_y=(s32)72<<FIX_SHIFT;
-                    g_boss_action_timer=-1;g_boss_phase=0;
+        }else if(state==6||state==7){ /* $82F4 / $83E4 */
+            /* Both spin handlers open with "if the drop object is live, fall
+               through to the common tail" - the pig holds its spin pose and
+               does not move while a water drop is still falling.  Skipping
+               that check is what made the spin overshoot the room. */
+            if(!g_boss_shot_active){
+                static const signed char spin6[4][3]={{-4,4,28},{-4,-4,20},{4,-4,16},{4,4,34}};
+                static const signed char spin7[7][3]={{4,4,22},{4,-4,24},{-4,-4,6},{-4,4,38},
+                                                      {-4,-4,8},{4,-4,28},{4,2,22}};
+                const signed char *ph=(state==6)?spin6[g_boss_phase&3]:spin7[(g_boss_phase>6)?6:g_boss_phase];
+                vx=ph[0];vy=ph[1];duration=ph[2];
+                g_boss_vx=(s32)vx*FIX_ONE;g_boss_vy=(s32)vy*FIX_ONE;
+                g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;
+                ++g_boss_action_timer;
+                if(g_boss_action_timer>=duration){
+                    g_boss_action_timer=0;++g_boss_phase;
+                    if((state==6&&g_boss_phase>=4)||(state==7&&g_boss_phase>=7)){
+                        /* $83C2 lands on $158/$130, $8542 on $158/$C8. */
+                        g_boss_x=(s32)BOSS8_RIGHT_X<<FIX_SHIFT;
+                        g_boss_y=(s32)((state==6)?BOSS8_BOTTOM_Y:BOSS8_TOP_Y)<<FIX_SHIFT;
+                        g_boss_action_timer=-1;g_boss_phase=0;
+                    }
                 }
             }
-        }else if(state==8){
-            /* The source creates its external effect once, then returns to
-               the common dispenser path after its 44-pixel rise.  The PC-FX
-               projectile is the equivalent visible effect. */
-            ++g_boss_action_timer;
-            if(g_boss_action_timer>=44)g_boss_action_timer=-1;
-        }else{
-            /* State 5 is the source's common/dispenser state. */
-            g_boss_vx=0;g_boss_vy=0;
-            ++g_boss_action_timer;
+        }else if(state==8){ /* $8564: hold still and lower a crate */
+            /* The source parks a crate object on its own origin, walks it
+               down two pixels a frame, and only releases the action once the
+               crate has come to rest.  A crate already in the room makes it
+               skip the action outright.  Landing is left to the port's own
+               crate physics so the box settles on this room's terrain rather
+               than the source's hard-coded $120. */
+            int ci;
+            if(g_boss_action_timer==0){
+                g_boss_action_timer=1;
+                if(!boss8_drop_crate())g_boss_action_timer=-1;
+            }else if((ci=boss8_crate_index())<0)g_boss_action_timer=-1;
+            else if(g_crates[ci].vy==0&&g_boss_action_timer>2)g_boss_action_timer=-1;
+            else ++g_boss_action_timer;
         }
+        /* $8270: every state but the two spins branches into the common
+           tail.  $82F4/$83E4 reach it only when a drop is already live, and
+           then only to advance it - which is why a spin never starts one. */
+        if(state!=6&&state!=7)boss8_common_tail();
         break;
     }
     case 2: /* level 10: whole-screen sweeps visible in $886E/$88A2 */
@@ -2735,18 +2773,9 @@ static void update_boss_actor(void)
             g_boss_random_drop_timer=72+(int)(boss_random()&95);
         }
     }
-    /* Boss 3 splits its two attacks by movement mode: water drops while it
-       patrols slowly, crates only while it spins. */
-    if(g_boss_class==1&&g_boss_invuln==0&&!boss8_spinning()){
-        if(g_boss_random_drop_timer>0)--g_boss_random_drop_timer;
-        if(g_boss_random_drop_timer<=0&&!g_boss_shot_active){
-            boss_drop_water();g_boss_random_drop_timer=56;
-        }
-    }
     /* The source dispenser ($7958) waits while its previous crate object is
        live.  Do the same so unused ammunition cannot carpet the catwalk. */
-    if(g_boss_class!=3&&g_boss_invuln==0&&
-       (g_boss_class==1?(boss8_spinning()&&(g_boss_timer%48)==1):((g_boss_timer%120)==1))){
+    if(g_boss_class!=3&&g_boss_class!=1&&g_boss_invuln==0&&(g_boss_timer%120)==1){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
         if(!any_crate)for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
@@ -2754,15 +2783,8 @@ static void update_boss_actor(void)
                 /* Later bosses always dispense their own throwable.  Zero is
                    reserved for Bowser's ordinary wooden crate. */
                 g_crates[i].extra=(unsigned char)g_boss_class;
-                if(g_boss_class==1){
-                    /* Spin drops fall from wherever the pig currently is. */
-                    int cx=(int)(g_boss_x>>FIX_SHIFT)+24;
-                    if(cx<16)cx=16;if(cx>224)cx=224;
-                    g_crates[i].x=(s32)cx<<FIX_SHIFT;
-                }else
                 g_crates[i].x=(s32)(32+((g_boss_timer/120)%6)*32)<<FIX_SHIFT;
-                g_crates[i].y=(g_boss_class==1)?(g_boss_y+(s32)64*FIX_ONE):((s32)-16*FIX_ONE);
-                g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
+                g_crates[i].y=(s32)-16*FIX_ONE;g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
         }
     }
     if(g_boss_shot_active){
@@ -2771,7 +2793,7 @@ static void update_boss_actor(void)
         sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT);
         py=player_body_y()+bowser_room_object_y_offset();
         if(g_boss_class==1){
-            if(sx<-16||sx>272||sy>240)g_boss_shot_active=0;
+            if(sx<-16||sx>272||sy>=BOSS8_DROP_END_Y)g_boss_shot_active=0;
             else if(g_invuln==0&&aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx,sy,7,16)){hurt_player();g_boss_shot_active=0;}
         }else{
             sy-=16;
