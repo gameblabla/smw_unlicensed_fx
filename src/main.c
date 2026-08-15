@@ -1918,14 +1918,12 @@ static int later_boss_frame(const BossVisualData *v)
        object is live. */
     switch(g_boss_class){
     case 1:
-        /* Pig strip: 0/1 are the two propeller-flight poses, 2 and 4 the two
-           tucked spin poses, 5 hurt, 6 death.  Frame 3 draws the pig already
-           gripping a crate, which the port supplies as its own falling object,
-           so it stays out of the cycle.  Both cycles are two frames - picking
-           one pose per action left the pig standing completely still. */
+        /* Pig strip: 0/1 are the two propeller-flight poses, 2/3/4 the three
+           tucked spin poses, 5 hurt, 6 death.  Flight used to pick one static
+           pose per action, so the propeller never turned. */
         if(g_boss_defeated)frame=6;
         else if(g_boss_invuln>0)frame=5;
-        else if(boss8_spinning())frame=((t/4)&1)?4:2;
+        else if(boss8_spinning())frame=2+(t/4)%3;
         else frame=(t/4)&1;
         break; /* Pig */
     case 2: frame=(t/8)%3;break;                              /* ostrich */
