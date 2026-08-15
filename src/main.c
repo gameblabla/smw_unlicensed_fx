@@ -8,7 +8,7 @@
  *   TETSU  : 262-line, 5 MHz dot clock
  *   VDC0   : Mega Drive Plane B analogue (background/parallax)
  *   VDC1   : Mega Drive Plane A analogue + sprites/HUD
- *   KING/RAINBOW unused; KRAM page 1 holds 16 kHz ADPCM effects and music is
+ *   KING/RAINBOW unused; KRAM page 1 holds 32 kHz ADPCM effects and music is
  *   Red Book CD-DA.
  *
  * Source geometry is not vertically centered. The MD V28 active picture starts
@@ -70,15 +70,26 @@ extern void pcfx_tetsu_wait_frame(void);
 #define ENEMY_BASE_WORD  0x7400
 #define ENEMY_HIT_BASE_WORD 0xC800
 #define ENEMY_BANANA_BASE_WORD 0xDA00
-#define STRIKE_SNAKE_BASE_WORD 0x9800
 #define MONKEY_SPECIAL_BASE_WORD 0x9800
 #define CRATE_MIMIC_WALK_BASE_WORD 0x9C80
+/* Level 8 contains both monkeys and the long-strike snake.  Keep the snake's
+ * three 0x400-word frames after both shared special banks; placing it at
+ * 0x9800 let the monkey upload destroy frame 0 and part of frame 1. */
+#define STRIKE_SNAKE_BASE_WORD 0xA100
 #define FIREBALL_BASE_WORD 0x6E00
 #define HUD_HEART_BASE_WORD 0x7000
 #define HUD_DIGIT_BASE_WORD 0x7040
 /* Level-2 moving platform pattern: 192 words at 0x7300..0x73bf,
  * deliberately between HUD digits (ending 0x72bf) and enemies (0x7400). */
 #define PLATFORM_BASE_WORD 0x7300
+/* Level-8 wedges. The 0xE000 auxiliary bank belongs to the boss rooms, which
+   never run a normal level, so the two grass-topped ledges can share it.
+   32-pixel-wide sprite patterns must stay 128-word aligned: the four 32x16
+   strips come first, the 16-wide remainder columns after them. */
+#define LEVEL8_WEDGE_R_BASE_WORD 0xE000
+#define LEVEL8_WEDGE_R_RIGHT_WORD (LEVEL8_WEDGE_R_BASE_WORD+512)
+#define LEVEL8_WEDGE_L_BASE_WORD 0xE300
+#define LEVEL8_OBJ_SPR_PAL 12
 #define CONTINUE_TILE_BASE_WORD 0x2000
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
 #define CONTINUE_DIGIT_BASE_WORD 0xA000
@@ -164,9 +175,22 @@ extern void pcfx_tetsu_wait_frame(void);
 #define MAX_GEMS 72
 #define MAX_ENEMIES 32
 #define MAX_FIREBALLS 3
-#define MAX_MOVING_PLATFORMS 3
+/* Level 8 streams 37 carrier records across its route; the engine has no
+   trigger-driven spawner, so every record is instantiated at level load and
+   simulated only while it is near the camera. */
+#define MAX_MOVING_PLATFORMS 40
 #define MOVING_PLATFORM_W 48
 #define MOVING_PLATFORM_H 16
+
+/* Level-8 carrier kinds, named after the $F4FA handler each record selects.
+   0 is the vertical 48x8 beam used by levels 2/6 and the $8CEC boss room. */
+#define PLATFORM_KIND_LIFT      0   /* handler 1  */
+#define PLATFORM_KIND_BRICK     1   /* handler 16: 48x16, bobs +/-32 */
+#define PLATFORM_KIND_WEDGE_R   2   /* handler 14: 48x64, slides down-right */
+#define PLATFORM_KIND_WEDGE_L   3   /* handler 15: 32x48, slides down-left */
+#define PLATFORM_STATE_IDLE  0
+#define PLATFORM_STATE_SLIDE 1
+#define PLATFORM_STATE_FALL  2
 #define PLAYER_MAX_HEARTS 5
 #define HURT_FRAMES 60
 #define HURT_FLICKER_HALF_PERIOD 6
@@ -245,6 +269,11 @@ typedef struct {
     short min_y, max_y;
     signed char dir;
     unsigned char speed;
+    /* Level-8 carriers ($11120) additionally keep their record position so a
+       consumed wedge is restored once it has left the camera, exactly as the
+       Mega Drive respawns the object on the next tile trigger. */
+    s32 home_x, home_y;
+    unsigned char kind, state, timer;
 } MovingPlatform;
 
 /* Exact Level-2 carrier metasprite 741 ($01D956): tiles 491..496 form a
@@ -380,6 +409,8 @@ static MovingPlatform g_moving_platforms[MAX_MOVING_PLATFORMS];
 static int g_moving_platform_count;
 static int g_on_moving_platform=-1;
 static int g_drop_platform_timer;
+static int platform_width(const MovingPlatform *p);
+static int platform_height(const MovingPlatform *p);
 static int g_debug_mode;
 static int g_crate_hide;
 static int g_paused;
@@ -434,6 +465,11 @@ static void clear_bat(int chip, int words)
 static void show_black(void)
 {
     int i;
+    /* Hide both VDC background planes before clearing their BATs.  This is
+       used when returning to the title from gameplay, so clearing visible
+       BATs in place can otherwise expose a partially-written frame. */
+    vdc_setreg(BACK_CHIP, VDC_REG_CR, 0);
+    vdc_setreg(FRONT_CHIP, VDC_REG_CR, 0);
     clear_bat(BACK_CHIP, BG_BAT_WORDS);
     clear_bat(FRONT_CHIP, FG_BAT_WORDS);
     for (i = 0; i < 256; ++i) tetsu_set_palette((u16)i, 0x0088);
@@ -746,10 +782,19 @@ static void upload_game_sprites(void)
     vdc_set_vram_write(FRONT_CHIP,FIREBALL_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_fireball_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_HEART_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_heart_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_DIGIT_BASE_WORD); for(i=0;i<640;++i)vdc_vram_write(FRONT_CHIP,g_hud_digit_words[i]);
-    if (!g_in_boss && (g_current_level==1 || g_current_level==5)) {
-        const u16 *platform_words=(g_current_level==5)?g_level6_platform_words:g_level2_platform_words;
+    if (!g_in_boss && (g_current_level==1 || g_current_level==5 || g_current_level==7)) {
+        const u16 *platform_words=(g_current_level==5)?g_level6_platform_words:
+                                  (g_current_level==7)?g_level8_platform_words:
+                                  g_level2_platform_words;
         vdc_set_vram_write(FRONT_CHIP,PLATFORM_BASE_WORD);
         for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,platform_words[i]);
+    }
+    /* Level 8's two sliding wedges (metasprites 168/169). */
+    if (!g_in_boss && g_current_level==7) {
+        vdc_set_vram_write(FRONT_CHIP,LEVEL8_WEDGE_R_BASE_WORD);
+        for(i=0;i<768;++i)vdc_vram_write(FRONT_CHIP,g_level8_wedge_right_words[i]);
+        vdc_set_vram_write(FRONT_CHIP,LEVEL8_WEDGE_L_BASE_WORD);
+        for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_level8_wedge_left_words[i]);
     }
 
     /* F3AE/F3E4 in the 68000 disassembly load an enemy palette from F426 ->
@@ -829,6 +874,9 @@ static void set_game_palette_fade(int level)
        palette on a dedicated sprite line. */
     if(!g_in_boss&&g_current_level>=6&&g_current_level<=8)
         for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_pot_palette[i],level));
+    /* Level 8's carriers and wedges are all on source palette line 2. */
+    if(!g_in_boss&&g_current_level==7)
+        for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),fade_yuv(g_level8_object_palette[i],level));
     /* Boss bodies own palette line 14, which the continue room normally uses
        for the separately indexed crouch art. Keep an independent boss-room
        copy after every boss/background palette update. */
@@ -1068,7 +1116,7 @@ static void resolve_player_vertical(s32 next_y)
         for (i=0;i<g_moving_platform_count && g_drop_platform_timer==0;++i) {
             MovingPlatform *p=&g_moving_platforms[i];
             int px=(int)(p->x>>FIX_SHIFT), top=(int)(p->y>>FIX_SHIFT);
-            int platform_w=(g_in_boss&&g_boss_class==3)?64:MOVING_PLATFORM_W;
+            int platform_w=platform_width(p);
             if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+platform_w) continue;
             if (old_bottom<=top+2 && new_bottom+1>=top && top<best_top) {
                 best_top=top;
@@ -1171,7 +1219,11 @@ static void update_camera(void)
     /* Prepare wrapped BAT columns before publishing the target. These cells
        are outside the committed viewport, so the VRAM burst is not visible
        and does not consume the leading blanking interval used by KING. */
-    new_tile=target>>3;
+    /* Keep one complete tile behind the logical viewport before recycling its
+       BAT column.  The VDC fetch window retains a few pixels to the left of
+       BXR, so replacing a column at the exact 8-pixel boundary exposes a
+       sliver of the far-ahead column as scrolling garbage on the left edge. */
+    new_tile=(target>=16)?((target>>3)-1):0;
     while (g_camera_tile<new_tile) {
         ++g_camera_tile;
         stream_level_column(g_camera_tile+FG_BAT_W-1,1);
@@ -1201,9 +1253,30 @@ static void commit_stage_camera(void)
 }
 
 
+/* Screen width of each carrier kind; also the width of its standing surface. */
+static int platform_width(const MovingPlatform *p)
+{
+    if (g_in_boss && g_boss_class==3) return 64;
+    if (p->kind==PLATFORM_KIND_WEDGE_L) return 32;
+    return MOVING_PLATFORM_W;
+}
+
+static int platform_height(const MovingPlatform *p)
+{
+    if (p->kind==PLATFORM_KIND_WEDGE_R) return 64;
+    if (p->kind==PLATFORM_KIND_WEDGE_L) return 48;
+    return MOVING_PLATFORM_H;
+}
+
 static void init_moving_platforms(void)
 {
     MovingPlatform *p;
+    int i;
+    for(i=0;i<MAX_MOVING_PLATFORMS;++i){
+        g_moving_platforms[i].kind=PLATFORM_KIND_LIFT;
+        g_moving_platforms[i].state=PLATFORM_STATE_IDLE;
+        g_moving_platforms[i].timer=0;
+    }
     g_moving_platform_count=0;
     g_on_moving_platform=-1;
     g_drop_platform_timer=0;
@@ -1233,22 +1306,75 @@ static void init_moving_platforms(void)
            metasprite 742, handler 1 -> world (1408,72). */
         p=&g_moving_platforms[g_moving_platform_count++];
         p->x=(s32)1408<<FIX_SHIFT;p->y=(s32)72<<FIX_SHIFT;p->min_y=72;p->max_y=172;p->dir=1;p->speed=1;
+    } else if (g_current_level==7) {
+        /* Level 8 record table $11120: the bobbing brick carriers (handler
+           16) plus the pairs of grass wedges that handlers 14/15 slide out
+           from under the player. */
+        for (i=0;i<(int)g_level8_carrier_count && g_moving_platform_count<MAX_MOVING_PLATFORMS;++i) {
+            const short *rec=g_level8_carriers[i];
+            p=&g_moving_platforms[g_moving_platform_count++];
+            p->x=p->home_x=(s32)rec[0]<<FIX_SHIFT;
+            p->y=p->home_y=(s32)rec[1]<<FIX_SHIFT;
+            p->kind=(unsigned char)rec[2];
+            p->state=PLATFORM_STATE_IDLE;p->timer=0;
+            p->dir=1;p->speed=1;
+            p->min_y=rec[1];p->max_y=(short)(rec[1]+32);
+        }
     }
 }
 
 static void update_moving_platforms(void)
 {
     int i;
+    /* $1077C/$105D4/$106C6 all gate their one-pixel steps on bit 0 of the
+       global frame counter, so every level-8 carrier moves at half speed. */
+    int half=((g_state_frame&1)==0);
     for (i=0;i<g_moving_platform_count;++i) {
         MovingPlatform *p=&g_moving_platforms[i];
-        s32 old_y=p->y;
-        p->y+=(s32)p->dir*(s32)p->speed*FIX_ONE;
-        if ((int)(p->y>>FIX_SHIFT)<=p->min_y) {
-            p->y=(s32)p->min_y<<FIX_SHIFT; p->dir=1;
-        } else if ((int)(p->y>>FIX_SHIFT)>=p->max_y) {
-            p->y=(s32)p->max_y<<FIX_SHIFT; p->dir=-1;
+        s32 old_y=p->y,old_x=p->x;
+        if (p->kind==PLATFORM_KIND_LIFT) {
+            p->y+=(s32)p->dir*(s32)p->speed*FIX_ONE;
+            if ((int)(p->y>>FIX_SHIFT)<=p->min_y) {
+                p->y=(s32)p->min_y<<FIX_SHIFT; p->dir=1;
+            } else if ((int)(p->y>>FIX_SHIFT)>=p->max_y) {
+                p->y=(s32)p->max_y<<FIX_SHIFT; p->dir=-1;
+            }
+        } else {
+            int sx=(int)(p->x>>FIX_SHIFT)-g_camera_x;
+            /* Off-camera records return to their table position; the source
+               respawns the object when its tile trigger is crossed again. */
+            if (p->state!=PLATFORM_STATE_IDLE && (sx<-192 || sx>448)) {
+                if (g_on_moving_platform==i) g_on_moving_platform=-1;
+                p->x=p->home_x; p->y=p->home_y;
+                p->state=PLATFORM_STATE_IDLE; p->timer=0; p->dir=1;
+            } else if (p->kind==PLATFORM_KIND_BRICK) {
+                if (half) {
+                    p->y+=(s32)p->dir*FIX_ONE;
+                    if (++p->timer>=32) { p->timer=0; p->dir=(signed char)-p->dir; }
+                }
+            } else if (p->state==PLATFORM_STATE_IDLE) {
+                /* Handlers 14/15 stay parked until a player stands on them. */
+                if (g_on_moving_platform==i) { p->state=PLATFORM_STATE_SLIDE; p->timer=0; }
+            } else if (p->state==PLATFORM_STATE_SLIDE) {
+                int span=(p->kind==PLATFORM_KIND_WEDGE_R)?48:32;
+                if (half) {
+                    p->y+=FIX_ONE;
+                    p->x+=(p->kind==PLATFORM_KIND_WEDGE_R)?FIX_ONE:-FIX_ONE;
+                    if (++p->timer>=span) { p->timer=0; p->state=PLATFORM_STATE_FALL; }
+                }
+            } else {
+                p->y+=2*FIX_ONE;
+                if ((int)(p->y>>FIX_SHIFT)>=352) {
+                    if (g_on_moving_platform==i) { g_on_moving_platform=-1; g_grounded=0; }
+                    p->x=p->home_x; p->y=p->home_y;
+                    p->state=PLATFORM_STATE_IDLE; p->timer=0;
+                }
+            }
         }
-        if (g_on_moving_platform==i && g_grounded) g_player_y+=p->y-old_y;
+        if (g_on_moving_platform==i && g_grounded) {
+            g_player_y+=p->y-old_y;
+            g_player_x+=p->x-old_x;
+        }
     }
 }
 
@@ -1270,9 +1396,9 @@ static void init_objects(void)
             g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
-            /* Only state 18 reaches $B794.  State 5 has its own airborne
-               handler at $C472 and must not be routed through the Koopa path. */
-            g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA);
+            /* Flying Koopas and CHIP use the terrain-independent patrol.
+               State-5 pterodactyls retain their separate $C472 behavior. */
+            g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA||e[7]==ENEMY_KIND_CHIP);
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
             g_enemies[i].face_right=0;
@@ -1594,7 +1720,7 @@ static void update_enemies(void)
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
 
-        if(e->kind!=ENEMY_KIND_GENERIC){
+        if(e->kind!=ENEMY_KIND_GENERIC&&e->kind!=ENEMY_KIND_CHIP){
             int near=iabs_i(px-x);
             if(e->kind==ENEMY_KIND_MONKEY){
                 e->vx=e->vy=0;
@@ -1650,7 +1776,6 @@ static void update_enemies(void)
                 else if(e->behavior_phase&&++e->behavior_timer>=72){e->behavior_phase=0;e->behavior_timer=0;}
                 goto enemy_attack_checks;
             }else if(e->kind==ENEMY_KIND_CRATE_MIMIC){ /* reveal, pause, then walk */
-                e->vy=0;
 #ifdef FORCE_CRATE_STAND
                 e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
 #else
@@ -1659,12 +1784,12 @@ static void update_enemies(void)
                     if(near<=60){e->behavior_phase=1;e->behavior_timer=0;}
                 }
                 else if(e->behavior_phase==1&&++e->behavior_timer>=24){e->behavior_phase=2;e->behavior_timer=0;e->vx=-FIX_ONE;}
-                else if(e->behavior_phase==2){
-                    if(enemy_crate_blocked(e,e->x+e->vx,y)) e->vx=-e->vx;
-                    else e->x+=e->vx;
-                }
 #endif
-                x=(int)(e->x>>FIX_SHIFT);goto enemy_attack_checks;
+                /* Its reveal state only controls the animation.  Once it is
+                   awake it deliberately falls through to the normal enemy
+                   solver, so it walks left/right, lands on terrain and turns
+                   at walls/crates just like a Goomba instead of hovering at
+                   its authored Y coordinate. */
             }else if(e->kind==ENEMY_KIND_FLOOR_SNAKE){ /* fixed until its near-range strike */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0&&near<=64){e->behavior_phase=1;e->behavior_timer=0;}
@@ -1995,10 +2120,30 @@ static void draw_game_sprites(void)
     /* Traversal-critical Level-2 moving platforms get SATB priority over
        enemies so a busy screen cannot make the floor disappear. */
     for (i=0;i<g_moving_platform_count && n<58;++i) {
-        int sx=(int)(g_moving_platforms[i].x>>FIX_SHIFT)-g_camera_x;
-        int sy=(int)(g_moving_platforms[i].y>>FIX_SHIFT);
-        if (sx<-MOVING_PLATFORM_W || sx>255 || sy<-MOVING_PLATFORM_H || sy>239) continue;
-        if(g_in_boss&&g_boss_class==3){
+        MovingPlatform *mp=&g_moving_platforms[i];
+        int sx=(int)(mp->x>>FIX_SHIFT)-g_camera_x;
+        int sy=(int)(mp->y>>FIX_SHIFT);
+        if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
+        if(mp->kind==PLATFORM_KIND_BRICK){
+            set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,
+                (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
+            if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),
+                (u16)(VDC_SPR_PRIO_SP|LEVEL8_OBJ_SPR_PAL));
+        }else if(mp->kind==PLATFORM_KIND_WEDGE_R){
+            /* 48x64: four 32x16 strips plus the 16-wide right column. */
+            int s;
+            for(s=0;s<4&&n<58;++s){
+                set_sprite_entry(satb,n++,sx,sy+s*16,(u16)(LEVEL8_WEDGE_R_BASE_WORD+s*128),
+                    (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
+                if(n<58)set_sprite_entry(satb,n++,sx+32,sy+s*16,(u16)(LEVEL8_WEDGE_R_RIGHT_WORD+s*64),
+                    (u16)(VDC_SPR_PRIO_SP|LEVEL8_OBJ_SPR_PAL));
+            }
+        }else if(mp->kind==PLATFORM_KIND_WEDGE_L){
+            int s;
+            for(s=0;s<3&&n<58;++s)
+                set_sprite_entry(satb,n++,sx,sy+s*16,(u16)(LEVEL8_WEDGE_L_BASE_WORD+s*128),
+                    (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
+        }else if(g_in_boss&&g_boss_class==3){
             set_sprite_entry(satb,n++,sx,sy,BOSS13_PLATFORM_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
             if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(BOSS13_PLATFORM_BASE_WORD+256),(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
         }else{
@@ -2025,7 +2170,7 @@ static void draw_game_sprites(void)
            keep the defeated state separate from the frame number. */
         use_hit_frame=e->defeated&&v->has_hit_frame;
         if(e->defeated)anim=use_hit_frame?2:1;
-        else if(e->kind!=ENEMY_KIND_GENERIC){
+        else if(e->kind!=ENEMY_KIND_GENERIC&&e->kind!=ENEMY_KIND_CHIP){
             if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==2)?((g_state_frame/12)&1):0;
             else if(e->kind==ENEMY_KIND_PTERODACTYL)
                 /* Selector 0 hangs; selectors 1 and 2 are the two wide
@@ -2658,10 +2803,10 @@ static void update_boss_actor(void)
         if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
         if(g_boss_hit_offsets[g_current_level*2+1]>0)hith=g_boss_hit_offsets[g_current_level*2+1];
         if(hith<48)hith=64;if(hith>88)hith=88;
-        /* Bowser is perched on a one-way ledge.  The generic extracted body
-           started eight pixels too high, which let Mario touch it through
-           the ledge from below. */
-        hity+=8;hith-=8;}
+        /* Bowser is perched on a one-way ledge.  Trim the upper 16 pixels of
+           the recovered body so a crate thrown on the platform above cannot
+           hit him while he is below it.  Keep the bottom edge unchanged. */
+        hity+=16;hith-=16;}
     if(g_boss_invuln==0){
         for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
         for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT)+bowser_room_object_y_offset();if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
@@ -2684,6 +2829,9 @@ static void start_gameplay(int fade_in)
     g_player_y=(s32)(g_level->spawn_y-ycrop)<<FIX_SHIFT;
 #ifdef FORCE_PLAYER_X
     g_player_x=(s32)FORCE_PLAYER_X<<FIX_SHIFT;
+#endif
+#ifdef FORCE_PLAYER_Y
+    g_player_y=(s32)FORCE_PLAYER_Y<<FIX_SHIFT;
 #endif
     g_vx=g_vy=0;
     g_grounded=1;
