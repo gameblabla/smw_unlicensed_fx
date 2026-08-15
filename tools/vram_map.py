@@ -44,6 +44,7 @@ BANKS = [
     ('FG_TILE_BASE_WORD',           FRONT, 0x0800, 'sized:stage_tiles', (PLAY, BOSS), 'stage/boss foreground tile set'),
     ('BOOT_MARIO_BASE_WORD',        FRONT, 0x1000, PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS, (BOOT, TITLE), 'opening animation Mario'),
     ('BOOT_LUIGI_BASE_WORD',        FRONT, 0x3000, PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS, (BOOT, TITLE), 'opening animation Luigi'),
+    ('HUD_BAND_BLACK_TILE_WORD',    FRONT, 0x4640, 16,     (PLAY,), 'opaque black cell for the 224..239 HUD band'),
     ('PLAYER_BASE_WORD',            FRONT, 0x4800, PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS, (PLAY, BOSS), 'gameplay player poses'),
     ('PUSH_BASE_WORD',              FRONT, 0x5E00, 384,    (TITLE, MENU), 'PUSH START sprite'),
     ('STAR_BASE_WORD',              FRONT, 0x5F80, 128,    (TITLE, MENU), 'menu star'),

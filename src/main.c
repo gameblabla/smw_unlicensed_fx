@@ -41,6 +41,8 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BG_BAT_H 64
 #define BG_BAT_WORDS (BG_BAT_W * BG_BAT_H)
 #define TILE_WORDS 16
+/* Black in the Y8U4V4 form tools/build_assets.py emits for RGB 0,0,0. */
+#define YUV_BLACK 0x0088
 
 #define BOSS_BG_TILE_BASE_WORD BG_TILE_BASE_WORD
 #define BOSS_BG_TILE_BASE_INDEX (BOSS_BG_TILE_BASE_WORD/TILE_WORDS)
@@ -847,6 +849,9 @@ static void set_game_palette_fade(int level)
     g_game_fade_level=level;
 }
 
+static int level_stage_chip(void);
+static int level_backdrop_chip(void);
+
 /* Level 6 draws its jungle scenery on the front VDC (level_uses_front_backdrop),
    the same chip the sprites live on, so the canopy only hangs in front of the
    cast if the sprites give up their in-front-of-background priority bit. */
@@ -857,32 +862,68 @@ static int level_front_scenery_over_sprites(void)
 
 /* Tile rows 28 and 29 sit below the Mega Drive's 224-line V28 picture.  The
    source has no art there, so the generator continues the row-27 texture into
-   them; behind the HUD that reads as a band of repeated scenery.  Blank both
-   planes instead, which leaves palette entry 0 -- black in every level palette
-   -- showing under the HUD sprites. */
+   them; behind the HUD that reads as a band of repeated scenery.  Cover the
+   band with a solid black cell instead.  It has to be a real opaque cell: a
+   blank one leaves colour index 0, which the VDC treats as transparent, so the
+   other chip's plane would simply show through it. */
 #define HUD_BAND_FIRST_ROW 28
+static u16 g_hud_band_cell;
+
+/* Named for what the band shows, not for how: the stage plane keeps its own
+   cells there and is simply covered. */
 static int level_blank_hud_band(void)
 {
     return !g_in_boss && g_current_level==6;
+}
+
+/* Palette entry for the band, as a BAT palette line in 0..3 plus a colour
+   index in 1..15.  Only the level's own four background lines are searched:
+   lines 4 and up are handed to the enemy variants by set_game_palette_fade().
+   Colour 0 of any line is the transparent one, so it cannot be used. */
+static int level_black_palette_entry(void)
+{
+    int i;
+    if(!g_level)return 0;
+    for(i=1;i<64;++i)
+        if((i&15)&&g_level->palette[i]==YUV_BLACK)return i;
+    return 0;
+}
+
+/* Build the band cell and upload its pattern.  The cell is one flat colour, so
+   every bitplane row is either all ones or all zeros.  Levels that blank the
+   band are exactly the ones whose backdrop is on VDC1 (level 6), which is
+   where HUD_BAND_BLACK_TILE_WORD is reserved. */
+static void prepare_hud_band_cell(void)
+{
+    int entry=level_black_palette_entry(),i;
+    g_hud_band_cell=0;
+    if(!entry||level_backdrop_chip()!=FRONT_CHIP)return;
+    vdc_set_vram_write(FRONT_CHIP,HUD_BAND_BLACK_TILE_WORD);
+    for(i=0;i<8;++i)
+        vdc_vram_write(FRONT_CHIP,(u16)(((entry&1)?0x00FFu:0)|((entry&2)?0xFF00u:0)));
+    for(i=0;i<8;++i)
+        vdc_vram_write(FRONT_CHIP,(u16)(((entry&4)?0x00FFu:0)|((entry&8)?0xFF00u:0)));
+    g_hud_band_cell=(u16)(((entry>>4)<<12)|(HUD_BAND_BLACK_TILE_WORD/TILE_WORDS));
 }
 
 static u16 level_fg_bat_entry(int world_col,int row)
 {
     int screen,seg,lx;
     if(!g_level||!g_stage_set||world_col<0||world_col>=g_level_width_tiles||row<0||row>=30)return FG_TILE_BASE_INDEX;
-    if(row>=HUD_BAND_FIRST_ROW&&level_blank_hud_band())return FG_TILE_BASE_INDEX;
     screen=world_col>>5; lx=world_col&31; if(screen>=g_level->route_len)return FG_TILE_BASE_INDEX;
     seg=g_level->route[screen]; if(seg==255||seg>=g_stage_set->segment_count)return FG_TILE_BASE_INDEX;
     return relocate_bat(g_stage_set->segment_bat[(seg*30+row)*32+lx],FG_TILE_BASE_INDEX);
 }
 
-static int level_stage_chip(void);
-static int level_backdrop_chip(void);
-
 static void stream_level_column(int world_col, int display_enabled)
 {
     int row,chip=level_stage_chip(),map_col=world_col&(FG_BAT_W-1);
-    u16 planes=display_enabled?(u16)(VDC_CR_BB|VDC_CR_SB):0;
+    /* Only VDC1 carries the SATB.  Levels 6 and 7 stream their stage plane
+       into VDC0, so restoring a blanket BB|SB here switched sprites on for a
+       chip with no sprite table, which drew shifting garbage over the scenery
+       from the first scrolled column onward. */
+    u16 planes=display_enabled
+        ? (u16)(VDC_CR_BB|((chip==FRONT_CHIP)?VDC_CR_SB:0)) : 0;
     if(world_col<0||world_col>=g_level_width_tiles)return;
 
     /* A BAT column is contiguous when MAWR advances by the 64-word map
@@ -915,16 +956,17 @@ static int level_backdrop_chip(void)
 static void upload_level_backdrop(void)
 {
     int x,y,chip=level_backdrop_chip();
+    prepare_hud_band_cell();
     vdc_set_vram_write(chip,FG_TILE_BASE_WORD);
     for(x=0;x<g_stage_set->tile_count*TILE_WORDS;++x)vdc_vram_write(chip,g_stage_set->tile_words[x]);
     for(y=0;y<30;++y){
         vdc_set_vram_write(chip,(u16)(y*BG_BAT_W));
         /* The background plane is the Mega Drive's full 64-cell width; it
            wraps every 512 pixels, not every 256. */
+        int band=(y>=HUD_BAND_FIRST_ROW)&&level_blank_hud_band()&&g_hud_band_cell;
         for(x=0;x<64;++x){
-            u16 e=g_level->bg_bat[y*BG_BAT_W+x];
-            if(y>=HUD_BAND_FIRST_ROW&&level_blank_hud_band())e=0;
-            vdc_vram_write(chip,relocate_bat(e,FG_TILE_BASE_INDEX));
+            if(band)vdc_vram_write(chip,g_hud_band_cell);
+            else vdc_vram_write(chip,relocate_bat(g_level->bg_bat[y*BG_BAT_W+x],FG_TILE_BASE_INDEX));
         }
     }
 }

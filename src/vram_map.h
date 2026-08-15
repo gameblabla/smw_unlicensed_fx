@@ -16,6 +16,8 @@
 #define BOOT_MARIO_BASE_WORD 0x1000
 /* 0x3000..0x4E00 [boot,title] opening animation Luigi */
 #define BOOT_LUIGI_BASE_WORD 0x3000
+/* 0x4640..0x4650 [play] opaque black cell for the 224..239 HUD band */
+#define HUD_BAND_BLACK_TILE_WORD 0x4640
 /* 0x4800..0x6600 [play,boss] gameplay player poses */
 #define PLAYER_BASE_WORD 0x4800
 /* 0x5E00..0x5F80 [title,menu] PUSH START sprite */
