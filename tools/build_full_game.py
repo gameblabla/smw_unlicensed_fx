@@ -457,6 +457,12 @@ def build_enemy_variants(r,levels):
         for e in lev['enemies']:
             k=(e[2],e[3],e[4])
             if k not in keys: keys.append(k)
+    # Only the throwing handlers ever put an object into animation state 1, so
+    # only their variants need the attack cels in VRAM.  Packing them for every
+    # variant overflowed the ENEMY_ALT arena many times over, and the runtime's
+    # bounds check then silently dropped whichever banks came last -- including
+    # the two the level 9 throwers actually draw.
+    atk_keys={(e[2],e[3],e[4]) for lev in levels for e in lev['enemies'] if e[5] in (8,13)}
     variants=[]
     for idx,(gfx,base,sub) in enumerate(keys):
         tbl=b32(r,0x7246C+gfx*4)
@@ -514,13 +520,23 @@ def build_enemy_variants(r,levels):
         # select by writing 1 to the object's animation-state word before they
         # throw.  Families whose second walk cel already *is* that pose (1 and
         # 4 above) do not need a second copy of it.
-        atk=scripts[1][0] if scripts[1] and gfx not in (1,4) else None
+        atk=scripts[1][0] if scripts[1] and gfx not in (1,4) and (gfx,base,sub) in atk_keys else None
         if atk and (atk==walk[0] or atk==walk[1]): atk=None
+        # The attack scripts are not one still pose.  Family 7 runs
+        # $E1 (15f) -> $F9 (7f) -> $E1 (31f) and family 12 runs
+        # $F9 (7f) -> $F9+sel4 (7f) -> $F9, so each throwing family owns a
+        # *second* attack cel -- the one drawn on the frame the rock or the
+        # spear actually leaves the hand.  Only the first was captured before,
+        # which is why the attack read as a single frame in game.
+        atk2=scripts[1][1] if atk and len(scripts[1])>1 else None
+        if atk2 and atk2 in (atk,walk[0],walk[1]): atk2=None
 
         poses=[(sel,script_shape(allm,byid,ms,want_tile)) for sel,ms in walk]
         poses.append((hit[0],script_shape(allm,byid,hit[1],want_tile)) if has_hit_frame else poses[0])
-        if alt: poses.append((alt[0],script_shape(allm,byid,alt[1],want_tile)))
-        if atk: poses.append((atk[0],script_shape(allm,byid,atk[1],want_tile)))
+        alt_i=atk_i=atk2_i=None
+        if alt: alt_i=len(poses); poses.append((alt[0],script_shape(allm,byid,alt[1],want_tile)))
+        if atk: atk_i=len(poses); poses.append((atk[0],script_shape(allm,byid,atk[1],want_tile)))
+        if atk2: atk2_i=len(poses); poses.append((atk2[0],script_shape(allm,byid,atk2[1],want_tile)))
 
         # One cell grid has to cover every pose the variant can strike, so it
         # is the union of their shapes rather than the walking size.  Family 9
@@ -534,8 +550,10 @@ def build_enemy_variants(r,levels):
             words,mask=pack(sel,m,cols,rows); frames.extend(words); masks.append(mask)
         alt_words=alt_mask=None
         atk_words=atk_mask=None
-        if alt: alt_words,alt_mask=pack(*poses[3],cols,rows)
-        if atk: atk_words,atk_mask=pack(*poses[-1],cols,rows)
+        atk2_words=atk2_mask=None
+        if alt: alt_words,alt_mask=pack(*poses[alt_i],cols,rows)
+        if atk: atk_words,atk_mask=pack(*poses[atk_i],cols,rows)
+        if atk2: atk2_words,atk2_mask=pack(*poses[atk2_i],cols,rows)
 
         # Collision keeps the walking silhouette; the taller hit pose must not
         # widen the box Mario stomps.
@@ -548,6 +566,7 @@ def build_enemy_variants(r,levels):
                              cols=cols,rows=rows,has_hit_frame=has_hit_frame,
                              alt_words=alt_words,alt_mask=alt_mask or 0,
                              atk_words=atk_words,atk_mask=atk_mask or 0,
+                             atk2_words=atk2_words,atk2_mask=atk2_mask or 0,
                              shot_words=make_enemy_shot(r,gfx,*shot) if shot else None,
                              shot_cols=shot[1] if shot else 0))
         print('variant',idx,(gfx,base,sub),'wh',width,height,'grid',cols,rows,'mask',masks)
@@ -1215,7 +1234,7 @@ def main():
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
         '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_KIND_THROWER 8\n#define ENEMY_KIND_SPEARMAN 9\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1;',
-                  'const unsigned short *words,*palette,*alt_words,*atk_words,*shot_words; unsigned short mask0,mask1,mask2,alt_mask,atk_mask;')
+                  'const unsigned short *words,*palette,*alt_words,*atk_words,*atk2_words,*shot_words; unsigned short mask0,mask1,mask2,alt_mask,atk_mask,atk2_mask;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
                   'unsigned char width,height,cols,rows,has_hit_frame,shot_cols; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
@@ -1245,10 +1264,20 @@ def main():
             route,modes,quads=routes[slot]; emit_u8(f,f'level{slot:02d}_route',route,static=True);emit_u8(f,f'level{slot:02d}_modes',modes,static=True);emit_u8(f,f'level{slot:02d}_quads',quads,static=True);emit_u16(f,f'level{slot:02d}_pal',palettes[slot],static=True)
             lev=levels[slot-1];emit_s16(f,f'level{slot:02d}_crates',lev['crates'],static=True);emit_s16(f,f'level{slot:02d}_gems',lev['gems'],static=True);emit_s16(f,f'level{slot:02d}_enemies',lev['enemy_records'],static=True);emit_u8(f,f'level{slot:02d}_variants',lev['variant_ids'],static=True)
         shot_syms={}
+        # The extra live cels are identical across a family's three DMA-buffer
+        # variants, so emit one array per distinct image and let the variants
+        # share it.  The runtime dedupes its VRAM upload on the pointer, which
+        # is what keeps level 9's four attack cels inside the ENEMY_ALT arena.
+        extra_syms={}; extra_pool={}
         for i,v in enumerate(variants):
             emit_u16(f,f'enemy_variant_{i:02d}_words',v['words'],static=True);emit_u16(f,f'enemy_variant_{i:02d}_pal',v['palette'],static=True)
-            if v['alt_words']: emit_u16(f,f'enemy_variant_{i:02d}_alt',v['alt_words'],static=True)
-            if v['atk_words']: emit_u16(f,f'enemy_variant_{i:02d}_atk',v['atk_words'],static=True)
+            for tag in ('alt','atk','atk2'):
+                w=v[tag+'_words']
+                if not w: continue
+                k=tuple(w)
+                if k not in extra_pool:
+                    extra_pool[k]=f'enemy_variant_{i:02d}_{tag}'; emit_u16(f,extra_pool[k],w,static=True)
+                extra_syms[(i,tag)]=extra_pool[k]
             # Every variant of a throwing family carries the same projectile,
             # so emit one array per family and let them share it: the runtime
             # dedupes the VRAM upload on the pointer.
@@ -1261,10 +1290,11 @@ def main():
         f.write(f'const unsigned short g_enemy_variant_count={len(variants)};\n')
         f.write('const EnemyVariantData g_enemy_variants[] = {\n')
         for i,v in enumerate(variants):
-            alt=f'enemy_variant_{i:02d}_alt' if v['alt_words'] else '0'
-            atk=f'enemy_variant_{i:02d}_atk' if v['atk_words'] else '0'
+            alt=extra_syms.get((i,'alt'),'0')
+            atk=extra_syms.get((i,'atk'),'0')
+            atk2=extra_syms.get((i,'atk2'),'0')
             shot=shot_syms.get(v['key'][0],'0') if v['shot_words'] else '0'
-            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},{atk},{shot},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},0x{v["atk_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])},{v["shot_cols"]}}},\n')
+            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},{atk},{atk2},{shot},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},0x{v["atk_mask"]:04X},0x{v["atk2_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])},{v["shot_cols"]}}},\n')
         f.write('};\n\n');emit_u16(f,'g_monkey_banana_words',bananawords)
         for i,so in enumerate(stageobjs):
             if not so['records']: continue

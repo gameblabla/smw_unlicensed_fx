@@ -77,16 +77,25 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--first", type=lambda x: int(x, 0), default=0x90)
     parser.add_argument("--last", type=lambda x: int(x, 0), default=0xF8)
+    parser.add_argument("--commands",
+                        help="comma-separated command bytes (for example 90,96,A8)")
     parser.add_argument("--frames", type=int, default=3000,
                         help="absolute ending frame; must exceed the state's frame counter")
     parser.add_argument("--mix-subtraction", action="store_true",
                         help="legacy mode: subtract a no-command music capture")
+    parser.add_argument("--no-baseline-cancel", action="store_true",
+                        help="keep the deterministic post-stop emulator floor")
     args = parser.parse_args()
 
     args.output.mkdir(parents=True, exist_ok=True)
     original = args.state.read_bytes()
     rows = []
-    commands = ([0] if args.mix_subtraction else []) + list(range(args.first, args.last + 1))
+    cancel_baseline = args.mix_subtraction or not args.no_baseline_cancel
+    requested = ([int(value.strip(), 16) for value in args.commands.split(",")]
+                 if args.commands else list(range(args.first, args.last + 1)))
+    if any(command < 0 or command > 0xff for command in requested):
+        parser.error("commands must be bytes from 00 through FF")
+    commands = ([0] if cancel_baseline else []) + requested
     baseline = args.output / ".baseline.wav"
     for command in commands:
         state = args.output / f".command_{command:02X}.state"
@@ -102,19 +111,28 @@ def main() -> None:
             text=True,
         )
         state.unlink(missing_ok=True)
-        if command == 0 and args.mix_subtraction:
+        if command == 0 and cancel_baseline:
             print(f"baseline: rc={proc.returncode} wav={raw_wav.exists()}")
             continue
         try:
-            if args.mix_subtraction:
+            if cancel_baseline:
                 peak, frames = subtract_wav(raw_wav, baseline, wav)
             else:
                 raw_wav.replace(wav)
                 with wave.open(str(wav), "rb") as isolated:
                     if ((isolated.getnchannels(), isolated.getsampwidth(),
-                         isolated.getframerate(), isolated.getnframes()) !=
-                            (2, 2, 48000, 50176)):
+                         isolated.getframerate()) != (2, 2, 48000) or
+                            isolated.getnframes() <= 0):
                         raise ValueError(f"unexpected WAV parameters: {isolated.getparams()}")
+                    # The broken headless backend emits 1024-frame blocks even
+                    # though an NTSC emulation frame contains 800 output samples.
+                    # Its final 224 samples are stale data and must never become
+                    # a source asset again.
+                    if (isolated.getnframes() % 1024 == 0 and
+                            isolated.getnframes() % 800 != 0):
+                        raise ValueError(
+                            "corrupt 1024-frame headless audio blocks; build and "
+                            "use kit_blastem/md_sfx_renderer_fixed")
                     samples = array.array("h", isolated.readframes(isolated.getnframes()))
                     peak = max((abs(x) for x in samples), default=0)
                     frames = isolated.getnframes()

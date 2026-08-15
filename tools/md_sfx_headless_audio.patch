@@ -1,0 +1,20 @@
+--- a/render_headless.c
++++ b/render_headless.c
+@@ -220,10 +220,13 @@ void render_init(int width, int height, char *title, uint8_t fullscreen)
+ 	is_fullscreen = fullscreen;
+ 	load_overscan_config();
+ 	uint32_t audio_rate = get_config_int("audio\0rate\0", 48000);
+-	uint32_t audio_samples = get_config_int("audio\0buffer\0", 512) * 2;
+-	if (!audio_samples) {
+-		audio_samples = 1024;
+-	}
++	/* Offline audio is consumed once per emulated video frame.  A 1024-frame
++	 * mix buffer does not match the 800 samples generated per NTSC frame and
++	 * appends 224 stale samples to every block. */
++	uint32_t syncs_per_second = render_audio_syncs_per_sec();
++	uint32_t audio_samples = syncs_per_second
++		? audio_rate / syncs_per_second
++		: get_config_int("audio\0buffer\0", 512);
+ 	audio_mix_bytes = audio_samples * 2 * sizeof(int16_t);
+ 	audio_mix_buffer = malloc(audio_mix_bytes);
+ 	render_audio_initialized(RENDER_AUDIO_S16, audio_rate, 2, audio_samples, sizeof(int16_t));

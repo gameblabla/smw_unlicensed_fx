@@ -362,7 +362,10 @@ static u16 g_enemy_vram[16],g_enemy_hit_vram[16],g_enemy_alt_vram[16];
 /* Attack poses share the ENEMY_ALT arena: only two variants ever own a third
    live cel, so the rest of that bank is free for the state-1 script pose the
    throwing handlers select. */
-static u16 g_enemy_atk_vram[16],g_enemy_shot_vram[16];
+static u16 g_enemy_atk_vram[16],g_enemy_atk2_vram[16],g_enemy_shot_vram[16];
+/* $D244/$D3F8 cel durations: 15 ticks of wind-up, then 7 on the release cel. */
+#define THROWER_WINDUP_TICKS  15
+#define THROWER_RELEASE_TICKS  7
 /* Size of the ENEMY_ALT and ENEMY_SHOT banks in tools/vram_map.py. */
 #define ENEMY_ALT_WORDS 2304
 #define ENEMY_SHOT_WORDS 256
@@ -792,7 +795,7 @@ static int palettes_equal(const unsigned short *a, const unsigned short *b)
 
 static void upload_game_sprites(void)
 {
-    int i,j,uniq=0,walk_top=0,hit_top=0,alt_top=0,shot_top=0;
+    int i,j,k,uniq=0,walk_top=0,hit_top=0,alt_top=0,shot_top=0;
     const unsigned short *seen[12];
     /* Keep a dedicated copy of the player palette for boss rooms. Normal
        stages use source palette line 0 directly; every generated level carries
@@ -877,21 +880,29 @@ static void upload_game_sprites(void)
                 for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->words[fw*2+j]);
                 hit_top+=fw;
             }
-            g_enemy_alt_vram[i]=(u16)alt_top;
-            if(v->alt_words&&alt_top+fw<=ENEMY_ALT_BASE_WORD+ENEMY_ALT_WORDS){
+            /* The three extra live cels are shared arrays: a family's DMA
+               buffer variants decode to the same image, so upload each
+               distinct one once and point the rest of the family at it.  The
+               arena only holds four 3x3 cels and level 9 needs exactly four,
+               which does not fit without this. */
+            for(k=0;k<3;++k){
+                const u16 *src=(k==0)?v->alt_words:(k==1)?v->atk_words:v->atk2_words;
+                u16 *slot=(k==0)?&g_enemy_alt_vram[i]:(k==1)?&g_enemy_atk_vram[i]:&g_enemy_atk2_vram[i];
+                *slot=0;
+                if(!src)continue;
+                for(j=0;j<i;++j){
+                    const EnemyVariantData *p=&g_enemy_variants[g_level->variant_ids[j]];
+                    if(p->alt_words==src){*slot=g_enemy_alt_vram[j];break;}
+                    if(p->atk_words==src){*slot=g_enemy_atk_vram[j];break;}
+                    if(p->atk2_words==src){*slot=g_enemy_atk2_vram[j];break;}
+                }
+                if(*slot)continue;
+                if(alt_top+fw>ENEMY_ALT_BASE_WORD+ENEMY_ALT_WORDS)continue;
+                *slot=(u16)alt_top;
                 vdc_set_vram_write(FRONT_CHIP,(u16)alt_top);
-                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->alt_words[j]);
+                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,src[j]);
                 alt_top+=fw;
             }
-            g_enemy_atk_vram[i]=(u16)alt_top;
-            if(v->atk_words&&alt_top+fw<=ENEMY_ALT_BASE_WORD+ENEMY_ALT_WORDS){
-                vdc_set_vram_write(FRONT_CHIP,(u16)alt_top);
-                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->atk_words[j]);
-                alt_top+=fw;
-            }else g_enemy_atk_vram[i]=0;
-            /* Each throwing family carries its own copy of the projectile at
-               the tail of graphics selector 3, so the rock and the spear are
-               uploaded per variant rather than once per level. */
             /* Every variant of a throwing family shares one projectile array,
                so upload it once and point the rest of the family at it. */
             g_enemy_shot_vram[i]=0;
@@ -1327,11 +1338,17 @@ static void resolve_player_vertical(s32 next_y)
 }
 
 /* ROM $17948: signed per-frame displacement for the original normal jump.
- * Full hold rises 75 pixels; releasing I during the rising half mirrors into
- * the falling half, reproducing the original short-jump behaviour. */
+ * Full hold rises 83 pixels; releasing I during the rising half mirrors into
+ * the falling half, reproducing the original short-jump behaviour.
+ *
+ * The four entries marked below are -2 in the Mega Drive table.  Carrying the
+ * -4 run through them adds half a tile of clearance, which the port needs
+ * because its terrain lands the level 8 ledges an 8px row above the original
+ * and the 75px arc stops just short of the second one.  The apex and the
+ * descent are untouched, so the mirrored short jump still behaves. */
 static const signed char g_md_jump_dy[45]={
     -6,-6,-5,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,
-    -2,-2,-2,-2,-2,-2,-2,0,0,0,2,2,2,2,2,2,2,
+    -4,-4,-4,-4,-2,-2,-2,0,0,0,2,2,2,2,2,2,2,
     4,4,4,4,4,4,4,4,4,4,4,5,6,6
 };
 
@@ -2200,18 +2217,28 @@ static void update_enemies(void)
                    frames, turns to face the player, plays the attack pose
                    while $C25C carries its rock, then recovers for 48 more.
                    The port used to run it through the generic Goomba solver,
-                   which is why it wandered off its authored spot. */
+                   which is why it wandered off its authored spot.
+
+                   Its attack script at $D244 is two cels, not one: $E1 for
+                   15 ticks of wind-up, $F9 for 7 while the rock leaves the
+                   hand, then $E1 again.  Phase 1 is that wind-up, so the
+                   throw now lands on the second cel the way the ROM does. */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0){
                     if(++e->behavior_timer>=96){
                         e->behavior_timer=0;e->behavior_phase=1;
                         e->face_right=(unsigned char)(px>=x);
-                        e->shot_slot=(unsigned char)(throw_enemy_shot(e,18,0,6,SHOT_MODE_ROCK)+1);
                     }
                 }else if(e->behavior_phase==1){
+                    if(++e->behavior_timer>=THROWER_WINDUP_TICKS){
+                        e->behavior_timer=0;e->behavior_phase=2;
+                        e->shot_slot=(unsigned char)(throw_enemy_shot(e,18,0,6,SHOT_MODE_ROCK)+1);
+                    }
+                }else if(e->behavior_phase==2){
                     /* $C2BC waits for the projectile slot to clear. */
+                    if(e->behavior_timer<255)++e->behavior_timer;
                     if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
-                        e->shot_slot=0;e->behavior_phase=2;e->behavior_timer=0;
+                        e->shot_slot=0;e->behavior_phase=3;e->behavior_timer=0;
                     }
                 }else if(++e->behavior_timer>=48){e->behavior_phase=0;e->behavior_timer=0;}
                 y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
@@ -2228,6 +2255,7 @@ static void update_enemies(void)
                     }
                 }else{
                     e->vx=0;
+                    if(e->behavior_timer<255)++e->behavior_timer;
                     if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
                         e->shot_slot=0;e->behavior_phase=0;e->behavior_timer=0;
                         e->vx=e->face_right?FIX_ONE:-FIX_ONE;
@@ -2674,7 +2702,7 @@ static void draw_game_sprites(void)
     }
 
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
-        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0,use_atk=0; unsigned mask; u16 flip,base;
+        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0,use_atk=0,use_atk2=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
@@ -2684,6 +2712,10 @@ static void draw_game_sprites(void)
             if(e->behavior_phase==1)sy-=8;       /* 24px crate -> 32px rise */
             else if(e->behavior_phase==2)sy-=14;/* walking art's visible baseline */
         }
+        /* $C0C6's poses sit five pixels lower than its authored record: the
+           object's Y is the top of its 40px metasprite while the port draws
+           from the cell grid the wider attack cel forces. */
+        else if(e->kind==ENEMY_KIND_THROWER)sy+=5;
         if(sx<-56||sx>255||sy<-56||sy>239)continue;
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
         anim=(int)((g_state_frame/8)&1);
@@ -2703,9 +2735,20 @@ static void draw_game_sprites(void)
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
             /* The throwers write 1 into their animation-state word before the
                projectile leaves, so both stay on the attack cel until it is
-               gone (and $C0C6 through its recovery count as well). */
-            else if(e->kind==ENEMY_KIND_THROWER)anim=e->behavior_phase?3:0;
-            else if(e->kind==ENEMY_KIND_SPEARMAN)anim=e->behavior_phase?3:(int)((g_state_frame/8)&1);
+               gone (and $C0C6 through its recovery count as well).
+
+               Both attack scripts run two cels: $D244 is $E1 (15) / $F9 (7) /
+               $E1, and $D3F8 is $F9 (7) / $F9-selector-4 (7) / $F9.  Anim 4 is
+               that second cel, held for the ROM's seven ticks starting at the
+               frame the projectile leaves. */
+            else if(e->kind==ENEMY_KIND_THROWER)
+                anim=(e->behavior_phase==0)?0:
+                     (e->behavior_phase==2&&e->behavior_timer<THROWER_RELEASE_TICKS)?4:3;
+            else if(e->kind==ENEMY_KIND_SPEARMAN)
+                anim=e->behavior_phase?
+                     ((e->behavior_timer>=THROWER_RELEASE_TICKS&&
+                       e->behavior_timer<THROWER_RELEASE_TICKS*2)?4:3):
+                     (int)((g_state_frame/8)&1);
         }
 #ifdef FORCE_ENEMY_HURT
         if(v->has_hit_frame){use_hit_frame=1;anim=2;}
@@ -2732,15 +2775,18 @@ static void draw_game_sprites(void)
         else{
             /* Live third cels come from the alt bank; anim 2 otherwise means
                the hit pose, which can be a taller metasprite than the walk. */
-            use_alt=(anim==2&&!use_hit_frame&&v->alt_words!=0);
+            use_alt=(anim==2&&!use_hit_frame&&v->alt_words!=0&&g_enemy_alt_vram[li]!=0);
+            use_atk2=(anim==4&&v->atk2_words!=0&&g_enemy_atk2_vram[li]!=0);
+            if(anim==4&&!use_atk2)anim=3;  /* family has one attack cel only */
             use_atk=(anim==3&&v->atk_words!=0&&g_enemy_atk_vram[li]!=0);
             if(anim==3&&!use_atk)anim=0;   /* no captured attack pose: stand */
-            mask=use_atk?v->atk_mask:use_alt?v->alt_mask:(anim==2)?v->mask2:(anim?v->mask1:v->mask0);
+            mask=use_atk2?v->atk2_mask:use_atk?v->atk_mask:use_alt?v->alt_mask:(anim==2)?v->mask2:(anim?v->mask1:v->mask0);
             cols=grid_cols=v->cols;rows=v->rows;
         }
         if(special_snake)base=(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024);
         else if(special_monkey)base=(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
         else if(special_crate)base=(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
+        else if(use_atk2)base=g_enemy_atk2_vram[li];
         else if(use_atk)base=g_enemy_atk_vram[li];
         else if(use_alt)base=g_enemy_alt_vram[li];
         else if(use_hit_frame)base=g_enemy_hit_vram[li];
