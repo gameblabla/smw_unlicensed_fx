@@ -82,13 +82,22 @@ extern void pcfx_tetsu_wait_frame(void);
 /* Level-2 moving platform pattern: 192 words at 0x7300..0x73bf,
  * deliberately between HUD digits (ending 0x72bf) and enemies (0x7400). */
 #define PLATFORM_BASE_WORD 0x7300
-/* Level-8 wedges. The 0xE000 auxiliary bank belongs to the boss rooms, which
-   never run a normal level, so the two grass-topped ledges can share it.
-   32-pixel-wide sprite patterns must stay 128-word aligned: the four 32x16
-   strips come first, the 16-wide remainder columns after them. */
-#define LEVEL8_WEDGE_R_BASE_WORD 0xE000
+/* Level-8 wedges. The 0xE000 auxiliary bank is not free during a normal
+   level: the pot object shared with boss 3 lives at 0xE200 and is uploaded
+   for every stage, so putting the wedges there corrupted the level 3/7/8/9
+   crates. Use the gap between the continue-room player poses (ending
+   0xB900) and the enemy hit bank at 0xC800 instead. 32-pixel-wide sprite
+   patterns must stay 128-word aligned: the four 32x16 strips come first,
+   the 16-wide remainder columns after them. */
+#define LEVEL8_WEDGE_R_BASE_WORD 0xB900
 #define LEVEL8_WEDGE_R_RIGHT_WORD (LEVEL8_WEDGE_R_BASE_WORD+512)
-#define LEVEL8_WEDGE_L_BASE_WORD 0xE300
+#define LEVEL8_WEDGE_L_BASE_WORD (LEVEL8_WEDGE_R_BASE_WORD+768)
+#if (LEVEL8_WEDGE_R_BASE_WORD % 128) != 0 || (LEVEL8_WEDGE_L_BASE_WORD % 128) != 0
+#error "level 8 wedge banks must be aligned for 32-pixel-wide sprites"
+#endif
+#if (LEVEL8_WEDGE_L_BASE_WORD + 384) > ENEMY_HIT_BASE_WORD
+#error "level 8 wedge banks overlap the enemy hit bank"
+#endif
 #define LEVEL8_OBJ_SPR_PAL 12
 #define CONTINUE_TILE_BASE_WORD 0x2000
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
