@@ -25,7 +25,7 @@ ELF := $(OBJDIR)/$(TARGET).elf
 PROGRAM_BIN := $(OBJDIR)/$(TARGET).bin
 MAP := $(OBJDIR)/$(TARGET).map
 
-.PHONY: all disc clean assets editor apply-level-edits
+.PHONY: all disc clean assets editor apply-level-edits vram-map
 CDDA_TOOL := tools/build_cdda.py
 CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/forest.wav \
              NEWMUSIC/graveyard.wav NEWMUSIC/nuclear\ dump.wav NEWMUSIC/staff.wav \
@@ -46,6 +46,8 @@ assets:
 	python3 tools/build_boot_exact.py --frames assets/derived/boot_exact_fixed --project . --first 12 --last 600
 	python3 tools/build_boot_dual.py
 	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) LEVEL_DEFAULTS=$(LEVEL_DEFAULTS) LEVEL_OVERRIDES=$(LEVEL_OVERRIDES) python3 tools/build_full_game.py
+vram-map:
+	python3 tools/vram_map.py --report
 editor:
 	python3 tools/level_editor.py --kit $(if $(KIT),$(KIT),Super_Mario_Bros_MD_reconstruction_kit) --defaults $(LEVEL_DEFAULTS) --overrides $(LEVEL_OVERRIDES)
 apply-level-edits:
@@ -53,6 +55,12 @@ apply-level-edits:
 $(OBJDIR)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
+VRAM_MAP_HEADER := src/vram_map.h
+# Regenerating the header re-runs the overlap check, so every build validates
+# the VRAM layout against the current generated assets.
+$(VRAM_MAP_HEADER): tools/vram_map.py src/game_levels_generated.c src/assets_generated.c
+	python3 tools/vram_map.py
+$(OBJDIR)/main.o: $(VRAM_MAP_HEADER)
 $(OBJDIR)/audio_stub.o: $(SFX_ADPCM_HEADER)
 $(SFX_ADPCM_HEADER): tools/build_sfx_adpcm.py $(SFX_WAVS)
 	python3 tools/build_sfx_adpcm.py

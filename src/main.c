@@ -25,6 +25,9 @@
 #include "audio_stub.h"
 #include "music.h"
 #include "game_levels_generated.h"
+/* Generated VRAM layout: see tools/vram_map.py, which owns every address
+   below and rejects banks that would overlap while both are resident. */
+#include "vram_map.h"
 
 extern void pcfx_tetsu_wait_frame(void);
 
@@ -39,105 +42,34 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BG_BAT_WORDS (BG_BAT_W * BG_BAT_H)
 #define TILE_WORDS 16
 
-#define FG_TILE_BASE_WORD 0x0800
-#define BOSS_BG_TILE_BASE_WORD 0x1000
+#define BOSS_BG_TILE_BASE_WORD BG_TILE_BASE_WORD
 #define BOSS_BG_TILE_BASE_INDEX (BOSS_BG_TILE_BASE_WORD/TILE_WORDS)
 #define FG_TILE_BASE_INDEX (FG_TILE_BASE_WORD / TILE_WORDS)
-#define BG_TILE_BASE_WORD 0x1000
 #define BG_TILE_BASE_INDEX (BG_TILE_BASE_WORD / TILE_WORDS)
-#define BOOT_TILE_BASE_WORD 0x1000
+#define BOOT_TILE_BASE_WORD BG_TILE_BASE_WORD
 #define BOOT_TILE_BASE_INDEX (BOOT_TILE_BASE_WORD / TILE_WORDS)
-#define FRONT_TILE_BASE_WORD 0xD000
 
-#define PLAYER_BASE_WORD 0x4800
-/* Boot-only character banks live below the dual-title CHR area and do not
-   overlap each other.  r12k-r12m incorrectly reused PLAYER_BASE_WORD and
-   LUIGI_BASE_WORD; Luigi's 0x1E00-word upload at 0x4000 overwrote Mario at
-   0x4800, which made early Mario frames fetch Luigi patterns. */
-#define BOOT_MARIO_BASE_WORD 0x1000
-#define BOOT_LUIGI_BASE_WORD 0x3000
-#define THROW_BASE_WORD  0x6600
-#define MENU_MARIO_BASE_WORD 0x8400
-#define MENU_LUIGI_BASE_WORD 0x8A00
-#define PUSH_BASE_WORD   0x5E00
-#define STAR_BASE_WORD   0x5F80
-#define COIN_BASE_WORD   0x6000
-#define HUD_BASE_WORD    0x6A00
 #define HUD_LIFE_BASE_WORD HUD_BASE_WORD
 #define HUD_FIRE_BASE_WORD (HUD_BASE_WORD + 128)
-#define CRATE_BASE_WORD  0x6800
-#define GEM_BASE_WORD    0x6900
-#define ENEMY_BASE_WORD  0x7400
-#define ENEMY_HIT_BASE_WORD 0xC800
-#define ENEMY_BANANA_BASE_WORD 0xDA00
-#define MONKEY_SPECIAL_BASE_WORD 0x9800
-#define CRATE_MIMIC_WALK_BASE_WORD 0x9C80
-/* Level 8 contains both monkeys and the long-strike snake.  Keep the snake's
- * three 0x400-word frames after both shared special banks; placing it at
- * 0x9800 let the monkey upload destroy frame 0 and part of frame 1. */
-#define STRIKE_SNAKE_BASE_WORD 0xA100
-#define FIREBALL_BASE_WORD 0x6E00
-#define HUD_HEART_BASE_WORD 0x7000
-#define HUD_DIGIT_BASE_WORD 0x7040
-/* Level-2 moving platform pattern: 192 words at 0x7300..0x73bf,
- * deliberately between HUD digits (ending 0x72bf) and enemies (0x7400). */
-#define PLATFORM_BASE_WORD 0x7300
-/* Level-8 wedges. The 0xE000 auxiliary bank is not free during a normal
-   level: the pot object shared with boss 3 lives at 0xE200 and is uploaded
-   for every stage, so putting the wedges there corrupted the level 3/7/8/9
-   crates. Use the gap between the continue-room player poses (ending
-   0xB900) and the enemy hit bank at 0xC800 instead. 32-pixel-wide sprite
-   patterns must stay 128-word aligned: the four 32x16 strips come first,
-   the 16-wide remainder columns after them. */
-#define LEVEL8_WEDGE_R_BASE_WORD 0xB900
+/* The four 32x16 strips of the down-right wedge come first; its 16-wide
+   remainder column follows them. */
 #define LEVEL8_WEDGE_R_RIGHT_WORD (LEVEL8_WEDGE_R_BASE_WORD+512)
-#define LEVEL8_WEDGE_L_BASE_WORD (LEVEL8_WEDGE_R_BASE_WORD+768)
-#if (LEVEL8_WEDGE_R_BASE_WORD % 128) != 0 || (LEVEL8_WEDGE_L_BASE_WORD % 128) != 0
-#error "level 8 wedge banks must be aligned for 32-pixel-wide sprites"
-#endif
-#if (LEVEL8_WEDGE_L_BASE_WORD + 384) > ENEMY_HIT_BASE_WORD
-#error "level 8 wedge banks overlap the enemy hit bank"
-#endif
 #define LEVEL8_OBJ_SPR_PAL 12
-#define CONTINUE_TILE_BASE_WORD 0x2000
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
-#define CONTINUE_DIGIT_BASE_WORD 0xA000
-/* Crouch art must survive both the normal enemy stream and boss uploads.
-   Bowser's expanded ten-pose bank occupies 0x7400..0xdcff, while the later
-   bosses' auxiliary objects can reach 0xe940.  Start at the next 0x80-word
-   boundary required by 32-pixel-wide VDC sprite patterns; the gap to the SATB
-   buffers is still large enough for both 0x180-word crouch poses. */
-#define GAMEPLAY_DOWN_MARIO_BASE_WORD 0xE980
-#define GAMEPLAY_DOWN_LUIGI_BASE_WORD (GAMEPLAY_DOWN_MARIO_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL)
-#define CONTINUE_PLAYER_BASE_WORD 0xB300
 #define CONTINUE_LUIGI_BASE_WORD (CONTINUE_PLAYER_BASE_WORD + 2 * PLAYER_FRAME_WORDS_LOCAL)
 #define CONTINUE_PLAYER_SPR_PAL 14
 #define CONTINUE_PLAYER_FRAME_TICKS 8
-#define SATB_BASE0       0xF000
-#define SATB_BASE1       0xF200
 
 #define PLAYER_FRAME_WORDS_LOCAL 384
 #define CONTINUE_PLAYER_FRAME_COUNT 2
 #define PLAYER_STRIP_WORDS 128
 #define BOOT_PLAYER_BANK_WORDS (PLAYER_FRAME_COUNT * PLAYER_FRAME_WORDS_LOCAL)
-#if (BOOT_MARIO_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > BOOT_LUIGI_BASE_WORD
-#error "boot Mario/Luigi VRAM banks overlap"
-#endif
-#if (BOOT_LUIGI_BASE_WORD + BOOT_PLAYER_BANK_WORDS) > PUSH_BASE_WORD
-#error "boot Luigi bank overlaps title sprite assets"
-#endif
-#if (GAMEPLAY_DOWN_LUIGI_BASE_WORD + PLAYER_FRAME_WORDS_LOCAL) > SATB_BASE0
-#error "gameplay crouch banks overlap SATB"
-#endif
-#if (GAMEPLAY_DOWN_MARIO_BASE_WORD % PLAYER_STRIP_WORDS) != 0 || \
-    (GAMEPLAY_DOWN_LUIGI_BASE_WORD % PLAYER_STRIP_WORDS) != 0
-#error "gameplay crouch banks must be aligned for 32-pixel-wide sprites"
-#endif
+/* Bank overlap and 128-word sprite alignment are checked for every scene by
+   tools/vram_map.py before src/vram_map.h is written; the hand-written #if
+   guards this file used to carry only covered four of the banks. */
 #define ENEMY_VARIANT_WORDS ENEMY_VARIANT_VRAM_WORDS
-#define BOSS_BASE_WORD 0x7400
 #define BOWSER_SPECIAL_FRAME_WORDS (7*6*64)
 #define BOWSER_ANIM_BASE_WORD BOSS_BASE_WORD
-#define BOWSER_FLAME_BASE_WORD 0xDD00
 #define BOWSER_SPECIAL_NORMAL 0
 #define BOWSER_SPECIAL_FIRE 2
 #define BOWSER_SPECIAL_TELEPORT 4
@@ -146,15 +78,12 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BOWSER_FIRE_FRAME_TICKS 7
 #define BOWSER_TELEPORT_FRAME_TICKS 3
 #define BOWSER_RUN_FRAME_TICKS 7
-#define BOSS_AUX_BASE_WORD 0xE000
 #define BOSS_RING_BASE_WORD BOSS_AUX_BASE_WORD
 #define BOSS_HAMMER_BASE_WORD (BOSS_AUX_BASE_WORD+256)
-#define BOSS_POT_BASE_WORD (BOSS_AUX_BASE_WORD+512)
 #define BOSS_BELL_BASE_WORD (BOSS_AUX_BASE_WORD+768)
 #define BOSS_BOMB_BASE_WORD (BOSS_AUX_BASE_WORD+1024)
 #define BOSS_CRATE4_BASE_WORD (BOSS_AUX_BASE_WORD+1536)
 #define BOSS13_PLATFORM_BASE_WORD (BOSS_AUX_BASE_WORD+1792)
-#define BOSS_WATER_BASE_WORD (BOSS_AUX_BASE_WORD+2304)
 #define BOSS_AUX_SPR_PAL 12
 #define BOSS_ITEM_SPR_PAL 11
 #define BOSS13_PLATFORM_SPR_PAL 10
