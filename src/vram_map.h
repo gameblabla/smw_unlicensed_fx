@@ -44,7 +44,7 @@
 #define HUD_DIGIT_BASE_WORD 0x7040
 /* 0x7300..0x73C0 [play] level 2/6/8 carrier, 48x16 */
 #define PLATFORM_BASE_WORD 0x7300
-/* 0x7400..0xAE80 [play] per-level enemy variant banks */
+/* 0x7400..0xA100 [play] per-level enemy variant banks */
 #define ENEMY_BASE_WORD 0x7400
 /* 0x7400..0xBD80 [boss] boss body poses (Bowser uses the ten-pose bank) */
 #define BOSS_BASE_WORD 0x7400
@@ -66,7 +66,9 @@
 #define LEVEL8_WEDGE_R_BASE_WORD 0xB900
 /* 0xBC00..0xBD80 [play] level 8 down-left wedge, 32x48 */
 #define LEVEL8_WEDGE_L_BASE_WORD 0xBC00
-/* 0xC800..0xE540 [play] per-variant hit frame */
+/* 0xBD80..0xC680 [play] third live cel for the pterodactyl/floor-attacker variants */
+#define ENEMY_ALT_BASE_WORD 0xBD80
+/* 0xC800..0xDE80 [play] per-variant hit frame */
 #define ENEMY_HIT_BASE_WORD 0xC800
 /* 0xDA00..0xDA40 [play] thrown banana (levels with monkeys) */
 #define ENEMY_BANANA_BASE_WORD 0xDA00

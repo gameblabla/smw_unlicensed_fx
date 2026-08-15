@@ -69,6 +69,7 @@ BANKS = [
     ('CONTINUE_PLAYER_BASE_WORD',   FRONT, 0xB300, 1536,   (PLAY, BOSS, CONT), 'continue/crouch Mario (768) + Luigi (768)'),
     ('LEVEL8_WEDGE_R_BASE_WORD',    FRONT, 0xB900, 768,    (PLAY,), 'level 8 down-right wedge, 48x64', 128),
     ('LEVEL8_WEDGE_L_BASE_WORD',    FRONT, 0xBC00, 384,    (PLAY,), 'level 8 down-left wedge, 32x48', 128),
+    ('ENEMY_ALT_BASE_WORD',         FRONT, 0xBD80, 2304,   (PLAY,), 'third live cel for the pterodactyl/floor-attacker variants'),
     ('ENEMY_HIT_BASE_WORD',         FRONT, 0xC800, 'sized:enemy_hit', (PLAY,), 'per-variant hit frame'),
     ('FRONT_TILE_BASE_WORD',        BACK,  0xD000, 'sized:menu_combo', (TITLE, MENU), 'menu/transition tile set on VDC0'),
     ('ENEMY_BANANA_BASE_WORD',      FRONT, 0xDA00, 64,     (PLAY,), 'thrown banana (levels with monkeys)'),
@@ -98,13 +99,6 @@ KNOWN = {
     ('BOSS_BASE_WORD', 'CONTINUE_PLAYER_BASE_WORD'):
         'the ten-pose Bowser bank runs to 0xBD80 and overwrites the crouch art '
         'that upload_game_sprites() just put at 0xB300',
-    ('ENEMY_HIT_BASE_WORD', 'BOSS_POT_BASE_WORD'):
-        'levels with 11+ enemy variants push the hit frames into the pot at '
-        '0xE200; only levels 7-9 draw the pot, so it is invisible today',
-    ('ENEMY_BASE_WORD', 'CRATE_MIMIC_WALK_BASE_WORD'):
-        'levels 11 and 17 have 12 variants, which reaches past 0x9C80',
-    ('ENEMY_BASE_WORD', 'STRIKE_SNAKE_BASE_WORD'):
-        'level 11 has 12 variants, which reaches past 0xA100',
 }
 
 
@@ -122,11 +116,21 @@ def measure():
     levels_src = (PROJECT / 'src/game_levels_generated.c').read_text()
     assets_src = (PROJECT / 'src/assets_generated.c').read_text()
 
+    # Enemy variants are packed, not strided: each one owns cols x rows cells.
+    vrows = re.search(r'const EnemyVariantData g_enemy_variants\[\] = \{(.*?)\n\};', levels_src, re.S).group(1)
+    variant_words = []
+    for row in re.findall(r'\{(.*?)\}', vrows, re.S):
+        f = [x.strip() for x in row.split(',')]
+        variant_words.append(int(f[-3]) * int(f[-2]) * 64)
+
     rows = re.search(r'const GameLevelData g_game_levels\[19\] = \{(.*?)\n\};', levels_src, re.S).group(1)
     levels = []
     for row in re.findall(r'\{(.*?)\}', rows, re.S):
         f = [x.strip() for x in row.split(',')]
-        levels.append({'set': int(f[0]), 'enemies': f[-3], 'variants': int(f[-2])})
+        ids = re.search(r'\b' + f[-1] + r'\[\d+\] = \{(.*?)\};', levels_src, re.S)
+        words = [variant_words[int(v)] for v in re.findall(r'\d+', ids.group(1))] if ids else []
+        levels.append({'set': int(f[0]), 'enemies': f[-3], 'variants': int(f[-2]),
+                       'enemy_words': sum(words) * 2, 'enemy_hit_words': sum(words)})
 
     sets = re.search(r'const StageSetData g_stage_sets\[12\] = \{(.*?)\n\};', levels_src, re.S).group(1)
     set_tiles = [int(row.split(',')[-2]) for row in re.findall(r'\{(.*?)\}', sets, re.S)]
@@ -157,8 +161,8 @@ def measure():
         'levels': levels,
         'sized': {
             'stage_tiles': max(set_tiles) * TILE_WORDS,
-            'enemy_variants': max(lv['variants'] for lv in levels) * ENEMY_VARIANT_WORDS,
-            'enemy_hit': max(lv['variants'] for lv in levels) * ENEMY_FRAME_WORDS,
+            'enemy_variants': max(lv['enemy_words'] for lv in levels),
+            'enemy_hit': max(lv['enemy_hit_words'] for lv in levels),
             # BOWSER_SPECIAL_FRAME_WORDS (7*6*64) * BOWSER_SPECIAL_FRAME_COUNT,
         # the largest body bank any boss uploads.
         'boss_body': 7 * 6 * 64 * 7,
@@ -238,9 +242,9 @@ def check(data):
             if kind is not None and kind not in lv['kinds']:
                 continue
             if name == 'ENEMY_BASE_WORD':
-                n = lv['variants'] * ENEMY_VARIANT_WORDS
+                n = lv['enemy_words']
             elif name == 'ENEMY_HIT_BASE_WORD':
-                n = lv['variants'] * ENEMY_FRAME_WORDS
+                n = lv['enemy_hit_words']
             group.append((name, base, n, waivers))
         check_group(group, f'front/play level {idx}', problems, warnings)
         fg = lv['tiles'] * TILE_WORDS

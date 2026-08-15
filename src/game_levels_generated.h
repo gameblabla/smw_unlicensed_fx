@@ -2,7 +2,7 @@
 #define SMB_PCFX_GAME_LEVELS_GENERATED_H
 
 typedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;
-typedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1,mask2; unsigned char width,height,has_hit_frame; } EnemyVariantData;
+typedef struct { const unsigned short *words,*palette,*alt_words; unsigned short mask0,mask1,mask2,alt_mask; unsigned char width,height,cols,rows,has_hit_frame; } EnemyVariantData;
 typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;
 typedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;
 typedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;

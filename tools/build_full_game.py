@@ -389,12 +389,42 @@ def make_crate_walk_frames(r):
         masks.append(mask)
     return frames,masks
 
+def anim_scripts(r,gfx):
+    """The object animator's script for one graphics family.
+
+    $CC6E picks a script with ``a3 = [[$CE7E + gfx*4] + state*4]`` and walks it
+    ten bytes at a time; $CCD6/$CCFE read the first two words of each entry as
+    the graphics selector fed to $F3E4 and the metasprite base that $CD02 then
+    offsets by ``sub*2``.  State 0 is the walk cycle, state 1 the attack and
+    **state 2 the hit/death pose** every handler selects through $B6FC.  The
+    port used to guess the hit image as "selector 3 drawn in the walking
+    shape", which is only ever right by accident: for families 7 and 12 (the
+    level 9 cast) selector 3 is an attack cel and its metasprite is a
+    different size, so the pose decoded as debris.
+    """
+    tbl=b32(r,0xCE7E+gfx*4); out=[]
+    for state in range(3):
+        p=b32(r,tbl+state*4); frames=[]
+        if 0<p<len(r)-10:
+            while b16(r,p)!=0x8888 and len(frames)<16:
+                frames.append((b16(r,p),b16(r,p+2))); p+=10
+        out.append(frames)
+    return out
+
+def script_shape(allm,byid,ms,want_tile):
+    """Resolve a script metasprite base against this variant's VRAM bank.
+
+    The six ids of each shape family are three graphics banks times the two
+    alternating DMA buffers, so the bank is identified by the destination tile
+    rather than by arithmetic on the base.
+    """
+    if ms not in byid: return None
+    bw=byid[ms]['bbox'][2]+1; bh=byid[ms]['bbox'][3]+1
+    cands=[m for m in allm if m['parts'] and m['parts'][0]['tile_index']==want_tile
+           and m['bbox'][2]+1==bw and m['bbox'][3]+1==bh]
+    return min(cands,key=lambda m:abs(m['id']-ms)) if cands else byid[ms]
+
 def build_enemy_variants(r,levels):
-    # The Goomba/Koopa graphics families have two walking poses only.
-    # Selector 3 in these tables is not a death/hit image, so never advertise
-    # it to the renderer as one. Family 0 is the later shared variant; 16--20
-    # are the normal early-game colour/species families from the ROM tables.
-    no_hit_frame_gfx={0,16,17,18,19,20}
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text()); byid={m['id']:m for m in allm}
     keys=[]
     for lev in levels:
@@ -403,46 +433,14 @@ def build_enemy_variants(r,levels):
             if k not in keys: keys.append(k)
     variants=[]
     for idx,(gfx,base,sub) in enumerate(keys):
-        frames=[]; masks=[]
-        # Most handlers use selector 3 for their attack/hit pose.  Graphics
-        # family 4 (the green pterodactyl) is different: its table has only
-        # selectors 0, 1 and 2; entry 3 is null.  Selector 0 is the narrow
-        # hanging pose, while 1/2 are the two wide flying poses (the second
-        # also remains available as the impact/defeat image).
-        anim_selectors=(0,1,2) if gfx==4 else (0,1,3)
-        for anim in anim_selectors:
-            tbl=b32(r,0x7246C+gfx*4); ptr=b32(r,tbl+anim*4); next_ptr=b32(r,tbl+(anim+1)*4)
-            addr=ba.vdp_addr(b32(r,0xF454+sub*4));want_tile=addr//32
-            # Resolve the shape first; it also provides a safe exact minimum
-            # length for families whose final animation pointer has no
-            # following frame pointer in the ROM table.
-            # Family 4 changes shape as well as graphics when it takes off.
-            # The encounter stores base 231 (32x40 hanging layout).  Its
-            # 24-tile flying layout is metasprite 273 (48x32), i.e. base+42.
-            # Treating those tiles as the superficially plausible 32x48
-            # layout transposed the final eight tiles and left debris below
-            # the left wing.
-            if gfx==4 and anim!=0:
-                shape_base=base+42       # pterodactyl: 32x40 -> 48x32
-            elif gfx==1 and anim==1:
-                shape_base=base+6        # crate: 24x24 -> 24x32
-            elif gfx==1 and anim==3:
-                shape_base=base+24       # crate legs: 32x40
-            elif gfx==3 and anim==1:
-                shape_base=base-42       # floor attacker rises: 32x32
-            elif gfx==3 and anim==3:
-                shape_base=base-36       # floor attacker strike: 32x40
-            else:
-                shape_base=base
-            bm=byid[shape_base]; bw=bm['bbox'][2]-bm['bbox'][0]+1; bh=bm['bbox'][3]-bm['bbox'][1]+1
-            cand=[]
-            for mid in range(max(0,shape_base-12),min(len(allm),shape_base+18)):
-                mm=byid[mid]
-                if not mm['parts'] or mm['parts'][0]['tile_index']!=want_tile: continue
-                mw=mm['bbox'][2]-mm['bbox'][0]+1; mh=mm['bbox'][3]-mm['bbox'][1]+1
-                score=(0 if (mw,mh)==(bw,bh) else 100)+abs(mid-shape_base)
-                cand.append((score,mid,mm))
-            m=min(cand,key=lambda x:x[0])[2] if cand else bm
+        tbl=b32(r,0x7246C+gfx*4)
+        addr=ba.vdp_addr(b32(r,0xF454+sub*4)); want_tile=addr//32
+
+        def pack(anim,m,cols,rows):
+            ptr=b32(r,tbl+anim*4); next_ptr=b32(r,tbl+(anim+1)*4)
+            # The resolved shape also provides a safe exact minimum length for
+            # families whose final animation pointer has no following frame
+            # pointer in the ROM table.
             shape_len=max((p['tile_index']+p['width_tiles']*p['height_tiles']-want_tile)*32 for p in m['parts'])
             # Each graphics family has its own DMA size. The former fixed
             # 0x180-byte copy happened to fit small enemies but truncated the
@@ -454,30 +452,66 @@ def build_enemy_variants(r,levels):
             if raw_len<shape_len: raw_len=shape_len
             raw=r[ptr:ptr+raw_len]
             vv=bytearray(65536);vv[addr:addr+len(raw)]=raw
-            # The object record's metasprite base is a shape family, while the
-            # graphics DMA table selects one of six VRAM tile banks. Most families
-            # happen to be base+sub*2; gfx #5 does not. Resolve the metasprite by
-            # matching the actual DMA destination tile and the base shape dimensions.
             canvas=[[0]*64 for _ in range(64)]
             for part in m['parts']:
                 ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset'])
             words=[]; mask=0
-            for cy in range(3):
-                for cx in range(3):
+            for cy in range(rows):
+                for cx in range(cols):
                     cell=[[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
-                    if any(any(row) for row in cell): mask|=1<<(cy*3+cx)
+                    if any(any(row) for row in cell): mask|=1<<(cy*cols+cx)
                     words.extend(ba.encode_sprite_cell(cell))
-            frames.extend(words); masks.append(mask)
-        bbox=m.get('bbox',[0,0,23,31]); width=bbox[2]+1; height=bbox[3]+1
-        # Family 4 alternates between a 32x40 vertical pose and a 48x32
-        # horizontal pose.  Its PC-FX cell canvas must cover their union;
-        # using either frame's dimensions alone clips the other pose.
-        if gfx==4: width,height=48,48
-        elif gfx==1: width,height=32,48
-        elif gfx==3: width,height=32,48
+            return words,mask
+
+        scripts=anim_scripts(r,gfx)
+        def entry(state,i,fallback=None):
+            f=scripts[state]
+            if i<len(f): return f[i]
+            return fallback if fallback else (f[0] if f else (0,base))
+
+        # The two poses the renderer animates come straight from the walk
+        # script.  Two families need their second cel from the attack script
+        # instead: the crate mimic's walk state is the single closed-crate
+        # frame, and the pterodactyl only grows wings once it takes off.
+        walk=[entry(0,0)]
+        walk.append(entry(1,0) if gfx in (1,4) else entry(0,1,entry(0,0)))
+        # State 2 is the hit/death pose.  Families whose state 2 repeats the
+        # walk entry -- 15 and the early-game colour families 16..20 -- have no
+        # separate death image.
+        hit=entry(2,0) if scripts[2] else None
+        has_hit_frame=bool(hit and hit!=walk[0])
+        # The third *live* cel used to occupy the hit bank: the pterodactyl's
+        # second flight pose and the floor attacker's second strike pose.  They
+        # get their own bank now that the hit bank carries a real death pose.
+        alt=entry(1,1) if gfx in (3,4) else None
+
+        poses=[(sel,script_shape(allm,byid,ms,want_tile)) for sel,ms in walk]
+        poses.append((hit[0],script_shape(allm,byid,hit[1],want_tile)) if has_hit_frame else poses[0])
+        if alt: poses.append((alt[0],script_shape(allm,byid,alt[1],want_tile)))
+
+        # One cell grid has to cover every pose the variant can strike, so it
+        # is the union of their shapes rather than the walking size.  Family 9
+        # walks as a 64x40 metasprite while its record still claims the 32x40
+        # base, which is what used to shred it into debris.
+        cols=rows=0
+        for _,m in poses:
+            cols=max(cols,min(4,(m['bbox'][2]+16)//16)); rows=max(rows,min(4,(m['bbox'][3]+16)//16))
+        frames=[]; masks=[]
+        for sel,m in poses[:3]:
+            words,mask=pack(sel,m,cols,rows); frames.extend(words); masks.append(mask)
+        alt_words=alt_mask=None
+        if alt: alt_words,alt_mask=pack(*poses[3],cols,rows)
+
+        # Collision keeps the walking silhouette; the taller hit pose must not
+        # widen the box Mario stomps.
+        width=max(poses[0][1]['bbox'][2],poses[1][1]['bbox'][2])+1
+        height=max(poses[0][1]['bbox'][3],poses[1][1]['bbox'][3])+1
+        if gfx==1: width,height=32,48   # mimic hides its legs until it walks
+        elif gfx==3: width,height=32,48 # floor attacker rises out of the floor
         variants.append(dict(key=(gfx,base,sub),words=frames,masks=masks,palette=enemy_palette(r,gfx),width=width,height=height,
-                             has_hit_frame=(gfx not in no_hit_frame_gfx)))
-        print('variant',idx,(gfx,base,sub),'wh',width,height,'mask',masks)
+                             cols=cols,rows=rows,has_hit_frame=has_hit_frame,
+                             alt_words=alt_words,alt_mask=alt_mask or 0))
+        print('variant',idx,(gfx,base,sub),'wh',width,height,'grid',cols,rows,'mask',masks)
     keyidx={v['key']:i for i,v in enumerate(variants)}
     # The 68000 dispatch selects behavior from the authored object family and
     # state, not from the level number. Preserve that identity in each runtime
@@ -1029,9 +1063,10 @@ def main():
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
         '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_FRAME_WORDS 576')
-    hs=hs.replace('unsigned short mask0,mask1;','unsigned short mask0,mask1,mask2;')
+    hs=hs.replace('const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1;',
+                  'const unsigned short *words,*palette,*alt_words; unsigned short mask0,mask1,mask2,alt_mask;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
-                  'unsigned char width,height,has_hit_frame; } EnemyVariantData;')
+                  'unsigned char width,height,cols,rows,has_hit_frame; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
         'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
     hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];\nextern const short g_level8_carriers[][3];\nextern const unsigned short g_level8_carrier_count;\nextern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];')
@@ -1058,14 +1093,17 @@ def main():
         for slot in range(1,20):
             route,modes,quads=routes[slot]; emit_u8(f,f'level{slot:02d}_route',route,static=True);emit_u8(f,f'level{slot:02d}_modes',modes,static=True);emit_u8(f,f'level{slot:02d}_quads',quads,static=True);emit_u16(f,f'level{slot:02d}_pal',palettes[slot],static=True)
             lev=levels[slot-1];emit_s16(f,f'level{slot:02d}_crates',lev['crates'],static=True);emit_s16(f,f'level{slot:02d}_gems',lev['gems'],static=True);emit_s16(f,f'level{slot:02d}_enemies',lev['enemy_records'],static=True);emit_u8(f,f'level{slot:02d}_variants',lev['variant_ids'],static=True)
-        for i,v in enumerate(variants): emit_u16(f,f'enemy_variant_{i:02d}_words',v['words'],static=True);emit_u16(f,f'enemy_variant_{i:02d}_pal',v['palette'],static=True)
+        for i,v in enumerate(variants):
+            emit_u16(f,f'enemy_variant_{i:02d}_words',v['words'],static=True);emit_u16(f,f'enemy_variant_{i:02d}_pal',v['palette'],static=True)
+            if v['alt_words']: emit_u16(f,f'enemy_variant_{i:02d}_alt',v['alt_words'],static=True)
         emit_u16(f,'g_monkey_special_words',monkeyspecial);emit_u16(f,'g_monkey_special_masks',monkeyspecialmasks)
         emit_u16(f,'g_crate_walk_words',cratewalk);emit_u16(f,'g_crate_walk_masks',cratewalkmasks)
         emit_u16(f,'g_level8_snake_words',snakewords);emit_u16(f,'g_level8_snake_masks',snakemasks);emit_u16(f,'g_level8_snake_palette',snakepal)
         f.write(f'const unsigned short g_enemy_variant_count={len(variants)};\n')
         f.write('const EnemyVariantData g_enemy_variants[] = {\n')
         for i,v in enumerate(variants):
-            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},{v["width"]},{v["height"]},{int(v["has_hit_frame"])}}},\n')
+            alt=f'enemy_variant_{i:02d}_alt' if v['alt_words'] else '0'
+            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])}}},\n')
         f.write('};\n\n');emit_u16(f,'g_monkey_banana_words',bananawords)
         f.write('const StageSetData g_stage_sets[12] = {\n')
         for s in sets: q=f'set{s["set_id"]:02d}'; f.write(f'  {{{q}_tiles,{q}_bat,{q}_col,{s["tile_count"]},{s["segment_count"]}}},\n')

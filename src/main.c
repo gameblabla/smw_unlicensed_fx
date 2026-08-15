@@ -323,6 +323,13 @@ static int g_level_width_tiles=416;
 static const GameLevelData *g_level;
 static const StageSetData *g_stage_set;
 static unsigned char g_enemy_palette_line[16];
+/* Enemy variants no longer share one cell grid: each carries the cols x rows
+   its widest pose needs, so the per-level banks are packed rather than
+   strided.  upload_game_sprites() records where each one landed. */
+static u16 g_enemy_vram[16],g_enemy_hit_vram[16],g_enemy_alt_vram[16];
+/* Size of the ENEMY_ALT bank in tools/vram_map.py. */
+#define ENEMY_ALT_WORDS 2304
+#define enemy_frame_words(v) ((int)(v)->cols*(int)(v)->rows*64)
 static int g_in_boss=0;
 static int g_after_boss=0;
 static s32 g_boss_x,g_boss_y,g_boss_vx,g_boss_vy;
@@ -744,7 +751,7 @@ static int palettes_equal(const unsigned short *a, const unsigned short *b)
 
 static void upload_game_sprites(void)
 {
-    int i,j,uniq=0;
+    int i,j,uniq=0,walk_top=0,hit_top=0,alt_top=0;
     const unsigned short *seen[12];
     /* Keep a dedicated copy of the player palette for boss rooms. Normal
        stages use source palette line 0 directly; every generated level carries
@@ -801,16 +808,28 @@ static void upload_game_sprites(void)
        by the current level are copied to VDC1. */
     if (!g_in_boss && g_level) {
         if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
+        walk_top=ENEMY_BASE_WORD; hit_top=ENEMY_HIT_BASE_WORD; alt_top=ENEMY_ALT_BASE_WORD;
         for(i=0;i<g_level->variant_count;++i) {
             int gi=g_level->variant_ids[i]; const EnemyVariantData *v=&g_enemy_variants[gi]; int line=-1;
+            int fw=enemy_frame_words(v);
             for(j=0;j<uniq;++j) if(palettes_equal(seen[j],v->palette)){ line=4+j; break; }
             if(line<0){ seen[uniq]=v->palette; line=4+uniq; for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),v->palette[j]); ++uniq; }
             g_enemy_palette_line[i]=(unsigned char)line;
-            vdc_set_vram_write(FRONT_CHIP,(u16)(ENEMY_BASE_WORD+i*ENEMY_VARIANT_VRAM_WORDS));
-            for(j=0;j<ENEMY_VARIANT_VRAM_WORDS;++j)vdc_vram_write(FRONT_CHIP,v->words[j]);
+            g_enemy_vram[i]=(u16)walk_top;
+            vdc_set_vram_write(FRONT_CHIP,(u16)walk_top);
+            for(j=0;j<fw*2;++j)vdc_vram_write(FRONT_CHIP,v->words[j]);
+            walk_top+=fw*2;
+            g_enemy_hit_vram[i]=(u16)hit_top;
             if(v->has_hit_frame){
-                vdc_set_vram_write(FRONT_CHIP,(u16)(ENEMY_HIT_BASE_WORD+i*ENEMY_FRAME_WORDS));
-                for(j=0;j<ENEMY_FRAME_WORDS;++j)vdc_vram_write(FRONT_CHIP,v->words[ENEMY_VARIANT_VRAM_WORDS+j]);
+                vdc_set_vram_write(FRONT_CHIP,(u16)hit_top);
+                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->words[fw*2+j]);
+                hit_top+=fw;
+            }
+            g_enemy_alt_vram[i]=(u16)alt_top;
+            if(v->alt_words&&alt_top+fw<=ENEMY_ALT_BASE_WORD+ENEMY_ALT_WORDS){
+                vdc_set_vram_write(FRONT_CHIP,(u16)alt_top);
+                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->alt_words[j]);
+                alt_top+=fw;
             }
         }
         /* The snake strike is a genuine 64x40 metasprite and cannot share the
@@ -2361,7 +2380,7 @@ static void draw_game_sprites(void)
     }
 
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
-        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame; unsigned mask; u16 flip,base;
+        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
@@ -2381,15 +2400,17 @@ static void draw_game_sprites(void)
         else if(e->kind!=ENEMY_KIND_GENERIC&&e->kind!=ENEMY_KIND_CHIP){
             if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==2)?((g_state_frame/12)&1):0;
             else if(e->kind==ENEMY_KIND_PTERODACTYL)
-                /* Selector 0 hangs; selectors 1 and 2 are the two wide
-                   flight cels.  Normal enemy storage has room for selectors
-                   0/1 only; selector 2 is deliberately uploaded to the
-                   separate hit bank, where it also serves as the hurt pose. */
+                /* Selector 0 hangs; selectors 1 and 2 are the two wide flight
+                   cels.  Normal enemy storage holds selectors 0/1, so the
+                   second flight cel lives in the alt bank. */
                 anim=e->behavior_phase?(1+((e->behavior_timer/8)&1)):0;
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
         }
+#ifdef FORCE_ENEMY_HURT
+        if(v->has_hit_frame){use_hit_frame=1;anim=2;}
+#endif
 #ifdef FORCE_SNAKE_FRAME
         if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=FORCE_SNAKE_FRAME;
 #endif
@@ -2409,12 +2430,19 @@ static void draw_game_sprites(void)
         }
         else if(special_monkey){mask=g_monkey_special_masks[special_frame];cols=rows=grid_cols=3;}
         else if(special_crate){special_frame=(g_state_frame/10)&1;mask=g_crate_walk_masks[special_frame];cols=rows=grid_cols=3;}
-        else{mask=(anim==2)?v->mask2:(anim?v->mask1:v->mask0);cols=(e->width+15)>>4;rows=(e->height+15)>>4;grid_cols=3;}
+        else{
+            /* Live third cels come from the alt bank; anim 2 otherwise means
+               the hit pose, which can be a taller metasprite than the walk. */
+            use_alt=(anim==2&&!use_hit_frame&&v->alt_words!=0);
+            mask=use_alt?v->alt_mask:(anim==2)?v->mask2:(anim?v->mask1:v->mask0);
+            cols=grid_cols=v->cols;rows=v->rows;
+        }
         if(special_snake)base=(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024);
         else if(special_monkey)base=(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
         else if(special_crate)base=(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
-        else if(use_hit_frame||(e->kind==ENEMY_KIND_PTERODACTYL&&anim==2))base=(u16)(ENEMY_HIT_BASE_WORD+li*ENEMY_FRAME_WORDS);
-        else base=(u16)(ENEMY_BASE_WORD+li*ENEMY_VARIANT_VRAM_WORDS+anim*ENEMY_FRAME_WORDS);
+        else if(use_alt)base=g_enemy_alt_vram[li];
+        else if(use_hit_frame)base=g_enemy_hit_vram[li];
+        else base=(u16)(g_enemy_vram[li]+(anim?enemy_frame_words(v):0));
         flip=((e->kind==ENEMY_KIND_PTERODACTYL)?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
         for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
             int cell=cy*grid_cols+cx,dx;
