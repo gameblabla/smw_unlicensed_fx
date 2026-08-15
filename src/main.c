@@ -122,7 +122,7 @@ extern void pcfx_tetsu_wait_frame(void);
 /* Level 8 streams 37 carrier records across its route; the engine has no
    trigger-driven spawner, so every record is instantiated at level load and
    simulated only while it is near the camera. */
-#define MAX_MOVING_PLATFORMS 40
+#define MAX_MOVING_PLATFORMS 56
 #define MOVING_PLATFORM_W 48
 #define MOVING_PLATFORM_H 16
 
@@ -132,6 +132,24 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_BRICK     1   /* handler 16: 48x16, bobs +/-32 */
 #define PLATFORM_KIND_WEDGE_R   2   /* handler 14: 48x64, slides down-right */
 #define PLATFORM_KIND_WEDGE_L   3   /* handler 15: 32x48, slides down-left */
+/* Records from the generic $10B2A tables, drawn out of the per-level stage
+   object bank.  build_full_game.py's STAGE_OBJECT_KINDS assigns these. */
+#define PLATFORM_KIND_STATIC    4   /* handler 0  */
+#define PLATFORM_KIND_SHUTTLE   5   /* handler 3  */
+#define PLATFORM_KIND_FALLER    6   /* handler 4  */
+#define PLATFORM_KIND_DESCEND   7   /* handler 5  */
+#define PLATFORM_KIND_ASCEND    8   /* handler 6  */
+#define PLATFORM_KIND_PATH      9   /* handler 7  */
+#define PLATFORM_KIND_DIAMOND  10   /* handler 11 */
+#define PLATFORM_KIND_SINKER   11   /* handler 1: the level 2/6 lift elsewhere */
+#define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
+/* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
+   climbing one from 0x64 back to 0x17C, in the object space the records store,
+   which sits 128 lines below the playfield. */
+#define PLATFORM_WRAP_BOTTOM (0x1C2 - 128)
+#define PLATFORM_WRAP_TOP    (0x6E - 128)
+#define PLATFORM_WRAP_CEIL   (0x64 - 128)
+#define PLATFORM_WRAP_REBASE (0x17C - 128)
 #define PLATFORM_STATE_IDLE  0
 #define PLATFORM_STATE_SLIDE 1
 #define PLATFORM_STATE_FALL  2
@@ -244,6 +262,9 @@ typedef struct {
        Mega Drive respawns the object on the next tile trigger. */
     s32 home_x, home_y;
     unsigned char kind, state, timer;
+    /* Index into the level's stage object shape table, and the step counter
+       handler 7 uses to walk its 80-entry path. */
+    unsigned char shape, step;
 } MovingPlatform;
 
 /* Exact Level-2 carrier metasprite 741 ($01D956): tiles 491..496 form a
@@ -404,8 +425,11 @@ static MovingPlatform g_moving_platforms[MAX_MOVING_PLATFORMS];
 static int g_moving_platform_count;
 static int g_on_moving_platform=-1;
 static int g_drop_platform_timer;
+static const StageObjectData *stage_objects(void);
 static int platform_width(const MovingPlatform *p);
 static int platform_height(const MovingPlatform *p);
+static int platform_draw_x(const MovingPlatform *p);
+static int platform_draw_y(const MovingPlatform *p);
 static int g_debug_mode;
 static int g_crate_hide;
 static int g_paused;
@@ -794,6 +818,16 @@ static void upload_game_sprites(void)
         vdc_set_vram_write(FRONT_CHIP,PLATFORM_BASE_WORD);
         for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,platform_words[i]);
     }
+    /* Every other level's stage objects share one bank and one palette line. */
+    if (!g_in_boss) {
+        const StageObjectData *so=stage_objects();
+        if (so->word_count) {
+            vdc_set_vram_write(FRONT_CHIP,STAGE_OBJECT_BASE_WORD);
+            for(i=0;i<so->word_count;++i)vdc_vram_write(FRONT_CHIP,so->words[i]);
+            for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),so->palette[i]);
+        }
+    }
+
     /* Level 8's two sliding wedges (metasprites 168/169). */
     if (!g_in_boss && g_current_level==7) {
         vdc_set_vram_write(FRONT_CHIP,LEVEL8_WEDGE_R_BASE_WORD);
@@ -894,6 +928,8 @@ static void set_game_palette_fade(int level)
     /* Level 8's carriers and wedges are all on source palette line 2. */
     if(!g_in_boss&&g_current_level==7)
         for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),fade_yuv(g_level8_object_palette[i],level));
+    else if(stage_objects()->palette)
+        for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),fade_yuv(stage_objects()->palette[i],level));
     /* Boss bodies own palette line 14, which the continue room normally uses
        for the separately indexed crouch art. Keep an independent boss-room
        copy after every boss/background palette update. */
@@ -1196,7 +1232,7 @@ static void resolve_player_vertical(s32 next_y)
            them, then land when his feet cross the top from above. */
         for (i=0;i<g_moving_platform_count && g_drop_platform_timer==0;++i) {
             MovingPlatform *p=&g_moving_platforms[i];
-            int px=(int)(p->x>>FIX_SHIFT), top=(int)(p->y>>FIX_SHIFT);
+            int px=platform_draw_x(p), top=platform_draw_y(p);
             int platform_w=platform_width(p);
             if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+platform_w) continue;
             if (old_bottom<=top+2 && new_bottom+1>=top && top<best_top) {
@@ -1340,9 +1376,27 @@ static void commit_stage_camera(void)
 }
 
 
+/* The level's stage object table, or a null entry outside gameplay. */
+static const StageObjectData *stage_objects(void)
+{
+    static const StageObjectData none={0,0,0,0,0,0,0};
+    if (g_in_boss || !g_level) return &none;
+    return &g_stage_objects[g_current_level];
+}
+
+/* (word offset, cols, rows, x offset, y offset, width, height) */
+static const unsigned short *platform_shape(const MovingPlatform *p)
+{
+    const StageObjectData *so=stage_objects();
+    if (!PLATFORM_KIND_IS_STAGE_OBJECT(p->kind) || p->shape>=so->shape_count) return 0;
+    return so->shapes+p->shape*STAGE_OBJECT_SHAPE_WORDS;
+}
+
 /* Screen width of each carrier kind; also the width of its standing surface. */
 static int platform_width(const MovingPlatform *p)
 {
+    const unsigned short *sh=platform_shape(p);
+    if (sh) return sh[5];
     if (g_in_boss && g_boss_class==3) return 64;
     if (p->kind==PLATFORM_KIND_WEDGE_L) return 32;
     return MOVING_PLATFORM_W;
@@ -1350,9 +1404,25 @@ static int platform_width(const MovingPlatform *p)
 
 static int platform_height(const MovingPlatform *p)
 {
+    const unsigned short *sh=platform_shape(p);
+    if (sh) return sh[6];
     if (p->kind==PLATFORM_KIND_WEDGE_R) return 64;
     if (p->kind==PLATFORM_KIND_WEDGE_L) return 48;
     return MOVING_PLATFORM_H;
+}
+
+/* Stage object records store the object position; the metasprite hangs off it
+   by the shape's own origin, which is negative for a few of them. */
+static int platform_draw_x(const MovingPlatform *p)
+{
+    const unsigned short *sh=platform_shape(p);
+    return (int)(p->x>>FIX_SHIFT)+(sh?(short)sh[3]:0);
+}
+
+static int platform_draw_y(const MovingPlatform *p)
+{
+    const unsigned short *sh=platform_shape(p);
+    return (int)(p->y>>FIX_SHIFT)+(sh?(short)sh[4]:0);
 }
 
 static void init_moving_platforms(void)
@@ -1408,6 +1478,86 @@ static void init_moving_platforms(void)
             p->min_y=rec[1];p->max_y=(short)(rec[1]+32);
         }
     }
+    /* Every other level's records come straight from the $10B2A table.  Level
+       1 and the boss stages have none; levels 2/6/8 are spawned above. */
+    {
+        const StageObjectData *so=stage_objects();
+        for (i=0;i<so->record_count && g_moving_platform_count<MAX_MOVING_PLATFORMS;++i) {
+            const short *rec=so->records+i*STAGE_OBJECT_RECORD_WORDS;
+            p=&g_moving_platforms[g_moving_platform_count++];
+            p->x=p->home_x=(s32)rec[0]<<FIX_SHIFT;
+            p->y=p->home_y=(s32)rec[1]<<FIX_SHIFT;
+            p->shape=(unsigned char)rec[2];
+            p->kind=(unsigned char)rec[3];
+            p->state=PLATFORM_STATE_IDLE;p->timer=0;p->step=0;
+            /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
+            p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
+            p->min_y=rec[1];p->max_y=(short)(rec[1]+32);
+        }
+    }
+}
+
+/* One $F4FA stage-object handler per kind.  All of them move the record and
+   let the shared rider fix-up below carry whoever is standing on it, which is
+   what $F546 does for the 68000. */
+static void update_stage_object(MovingPlatform *p, int index)
+{
+    int y;
+    switch (p->kind) {
+    case PLATFORM_KIND_STATIC:
+        break;
+    case PLATFORM_KIND_SHUTTLE:      /* $F78E */
+        p->x+=(s32)p->dir*FIX_ONE;
+        if (++p->timer>=70) { p->timer=0; p->dir=(signed char)-p->dir; }
+        break;
+    case PLATFORM_KIND_FALLER:       /* $F8E2 */
+        if (p->state==PLATFORM_STATE_IDLE) {
+            if (g_on_moving_platform==index) p->state=PLATFORM_STATE_FALL;
+            break;
+        }
+        p->y+=4*FIX_ONE;
+        if ((int)(p->y>>FIX_SHIFT)>=PLATFORM_WRAP_BOTTOM) {
+            /* $1312A despawns it; the record is restored once it is off camera
+               so a second pass over the same trigger finds it again. */
+            if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
+            p->x=p->home_x; p->y=p->home_y; p->state=PLATFORM_STATE_IDLE;
+        }
+        break;
+    case PLATFORM_KIND_DESCEND:      /* $F934 */
+        p->y+=FIX_ONE;
+        y=(int)(p->y>>FIX_SHIFT);
+        if (y>=PLATFORM_WRAP_BOTTOM) {
+            if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
+            p->y=(s32)PLATFORM_WRAP_TOP<<FIX_SHIFT;
+        }
+        break;
+    case PLATFORM_KIND_ASCEND:       /* $F980 */
+        p->y-=FIX_ONE;
+        y=(int)(p->y>>FIX_SHIFT);
+        if (y<=PLATFORM_WRAP_CEIL) {
+            if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
+            p->y=(s32)PLATFORM_WRAP_REBASE<<FIX_SHIFT;
+        }
+        break;
+    case PLATFORM_KIND_PATH:         /* $F9C6 */
+        /* $F9CA gates the step on bit 0 of the frame counter. */
+        if (g_state_frame&1) break;
+        p->x+=(s32)g_stage_object_path[p->step*2]<<FIX_SHIFT;
+        p->y+=(s32)g_stage_object_path[p->step*2+1]<<FIX_SHIFT;
+        if (++p->step>=80) p->step=0;
+        break;
+    case PLATFORM_KIND_SINKER:       /* $F5B0, as the level 2/6 lifts */
+        p->y+=(s32)p->dir*FIX_ONE;
+        if (++p->timer>=100) { p->timer=0; p->dir=(signed char)-p->dir; }
+        break;
+    case PLATFORM_KIND_DIAMOND:      /* $FF3A */
+        p->x+=(p->state==0||p->state==1)?FIX_ONE:-FIX_ONE;
+        p->y+=(p->state==0||p->state==3)?FIX_ONE:-FIX_ONE;
+        if (++p->timer>=48) { p->timer=0; p->state=(unsigned char)((p->state+1)&3); }
+        break;
+    default:
+        break;
+    }
 }
 
 static void update_moving_platforms(void)
@@ -1419,7 +1569,9 @@ static void update_moving_platforms(void)
     for (i=0;i<g_moving_platform_count;++i) {
         MovingPlatform *p=&g_moving_platforms[i];
         s32 old_y=p->y,old_x=p->x;
-        if (p->kind==PLATFORM_KIND_LIFT) {
+        if (PLATFORM_KIND_IS_STAGE_OBJECT(p->kind)) {
+            update_stage_object(p,i);
+        } else if (p->kind==PLATFORM_KIND_LIFT) {
             p->y+=(s32)p->dir*(s32)p->speed*FIX_ONE;
             if ((int)(p->y>>FIX_SHIFT)<=p->min_y) {
                 p->y=(s32)p->min_y<<FIX_SHIFT; p->dir=1;
@@ -2348,10 +2500,21 @@ static void draw_game_sprites(void)
        enemies so a busy screen cannot make the floor disappear. */
     for (i=0;i<g_moving_platform_count && n<58;++i) {
         MovingPlatform *mp=&g_moving_platforms[i];
-        int sx=(int)(mp->x>>FIX_SHIFT)-g_camera_x;
-        int sy=(int)(mp->y>>FIX_SHIFT);
+        int sx=platform_draw_x(mp)-g_camera_x;
+        int sy=platform_draw_y(mp);
         if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
-        if(mp->kind==PLATFORM_KIND_BRICK){
+        if(PLATFORM_KIND_IS_STAGE_OBJECT(mp->kind)){
+            /* Cells are stored row-major with an even pitch, so each pair is
+               128-word aligned and can go out as one 32-pixel-wide sprite. */
+            const unsigned short *sh=platform_shape(mp);
+            u16 base=(u16)(STAGE_OBJECT_BASE_WORD+sh[0]);
+            int cols=sh[1],rows=sh[2],cy2,cx2;
+            for(cy2=0;cy2<rows&&n<58;++cy2)for(cx2=0;cx2<cols&&n<58;cx2+=2){
+                u16 addr=(u16)(base+(cy2*cols+cx2)*64);
+                set_sprite_entry(satb,n++,sx+cx2*16,sy+cy2*16,addr,
+                    (u16)(VDC_SPR_PRIO_SP|((cols-cx2>=2)?VDC_SPR_X_WIDTH_2:0)|LEVEL8_OBJ_SPR_PAL));
+            }
+        }else if(mp->kind==PLATFORM_KIND_BRICK){
             set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,
                 (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
             if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),

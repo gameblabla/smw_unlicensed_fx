@@ -88,6 +88,8 @@
 #define SATB_BASE0 0xF000
 /* 0xF200..0xF300 [boot,title,menu,play,boss,continue] sprite attribute table, page 1 */
 #define SATB_BASE1 0xF200
+/* 0xF300..0xFA40 [play] per-level stage object shapes */
+#define STAGE_OBJECT_BASE_WORD 0xF300
 
 /* VDC 0 (back/background) */
 /* 0x0000..0x1000 [boot,title,menu,play,boss,continue] background BAT, 64x64 cells */

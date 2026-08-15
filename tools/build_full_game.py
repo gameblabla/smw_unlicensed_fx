@@ -901,6 +901,112 @@ def make_boss13_platform_words():
     palette += [ba.rgb_to_yuv(0,0,0)]*(16-len(palette))
     return words,palette
 
+# $F4FA dispatches one routine per stage-object record.  These are the ones
+# that carry the player and are reproduced on PC-FX; the rest of the table is
+# per-level set dressing (traps, switches, story triggers) the port does not
+# spawn yet, and records selecting them are dropped rather than drawn as
+# immovable blocks.
+STAGE_OBJECT_KINDS={
+    0: 4,   # no handler: a static platform
+    1:11,   # $F5B0: sinks 1px/frame for 100 frames, then rises for 100
+    3: 5,   # $F78E: shuttles +/-1px horizontally, 70 frames each way
+    4: 6,   # $F8E2: falls at 4px/frame once it is stood on
+    5: 7,   # $F934: descends 1px/frame, wrapping 0x1C2 -> 0x6E
+    6: 8,   # $F980: climbs 1px/frame, wrapping 0x64 -> 0x17C
+    7: 9,   # $F9C6: walks the 80-step path table at $FA58, every other frame
+    11:10,  # $FF3A: 48-frame diamond orbit, +1/+1 +1/-1 -1/-1 -1/+1
+}
+# Levels 2, 6 and 8 already spawn their records through make_level8_carriers()
+# and the hand-built level-2/6 lifts.
+STAGE_OBJECT_SKIP_SLOTS={2,6,8}
+
+def stage_object_path(r):
+    """The 80 (dx,dy) steps handler 7 walks, from the byte table at $FA58."""
+    out=[]
+    for i in range(80):
+        dx,dy=r[0xFA58+i*2],r[0xFA58+i*2+1]
+        out.append((dx-256 if dx>=128 else dx, dy-256 if dy>=128 else dy))
+    return out
+
+def make_stage_objects(r):
+    """Per-level stage objects from the record tables at $10B2A.
+
+    Same 12-byte records make_level8_carriers() reads for level 8, but for
+    every other level as well: (route segment, tile trigger, spawn x, spawn y,
+    metasprite, handler).  Only levels 2, 6 and 8 had ever been reproduced, so
+    every carrier, lift and falling block in levels 9 onward was missing.
+
+    Each level gets one sprite bank holding the metasprites its records name,
+    packed as 16x16 cells with an even cell pitch so the renderer can cover a
+    row with 32-pixel-wide sprites, which the SATB budget needs when a dozen
+    carriers share the screen.
+    """
+    levels=[]
+    for slot in range(1,20):
+        recs=[]
+        if slot not in STAGE_OBJECT_SKIP_SLOTS:
+            off=b32(r,0x10B2A+(slot-1)*4)
+            while b16(r,off)!=0x8888:
+                seg,tile,x,y,ms,handler=[b16(r,off+i*2) for i in range(6)]
+                off+=12
+                if handler in STAGE_OBJECT_KINDS and ms:
+                    recs.append((seg,tile,x,y,ms,handler))
+        if not recs:
+            levels.append(dict(shapes=[],words=[],records=[],palette=None)); continue
+
+        ld=KIT/('graphics/levels/level_%02d'%slot)
+        vram=ld.joinpath('assembled_vram.bin').read_bytes()
+        rgb,_=ba.read_stage_palette(ld)
+
+        def metasprite(mid):
+            ptr=b32(r,0x197F0+(mid-1)*4); p=ptr+1; parts=[]
+            while r[p]!=0xFF:
+                parts.append((r[p]-256 if r[p]>=128 else r[p],
+                              r[p+1]-256 if r[p+1]>=128 else r[p+1],
+                              (r[p+2]>>4)&15, r[p+2]&15, b16(r,p+3)))
+                p+=5
+            return parts
+
+        ids=[]
+        for rec in recs:
+            if rec[4] not in ids: ids.append(rec[4])
+        # Every stage object draws from line 2 of the extracted stage palette,
+        # the same line make_level8_platform_words() uses for the level-8
+        # carriers.  The metasprite attribute names CRAM line 3, so the kit's
+        # palette.csv does not store the sprite lines in hardware order.
+        line=2
+        shapes=[]; words=[]
+        for mid in ids:
+            parts=metasprite(mid)
+            ox=min(p[0] for p in parts); oy=min(p[1] for p in parts)
+            w=max(p[0]+p[2]*8 for p in parts)-ox; h=max(p[1]+p[3]*8 for p in parts)-oy
+            cols=(w+15)//16; rows=(h+15)//16
+            if cols>1 and (cols&1): cols+=1     # keep 32-wide sprite pairs aligned
+            canvas=[[0]*(cols*16) for _ in range(rows*16)]
+            for x0,y0,tw,th,attr in parts:
+                tile=attr&0x7FF
+                # Mega Drive sprite patterns run column-major inside the piece.
+                for cx in range(tw):
+                    for cy in range(th):
+                        pix=ba.tilepix(vram,tile+cx*th+cy)
+                        for yy in range(8):
+                            for xx in range(8):
+                                v=pix[yy*8+xx]
+                                if v: canvas[y0-oy+cy*8+yy][x0-ox+cx*8+xx]=v
+            shapes.append((len(words),cols,rows,ox,oy,w,h))
+            for cy in range(rows):
+                for cx in range(cols):
+                    words.extend(ba.encode_sprite_cell(
+                        [[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]))
+        out=[]
+        for seg,tile,x,y,ms,handler in recs:
+            out.append((ba.world_x_for_trigger(seg,tile)+(x-0x180), y-128,
+                        ids.index(ms), STAGE_OBJECT_KINDS[handler]))
+        levels.append(dict(shapes=shapes,words=words,records=out,
+                           palette=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*rgb[line*16+i]) for i in range(1,16)]))
+        print('stage objects slot',slot,'shapes',len(shapes),'records',len(out),'words',len(words))
+    return levels
+
 def make_level8_carriers(r):
     """Object records for level 8, table $11120 (pointer $10B2A + 7*4).
 
@@ -1053,7 +1159,7 @@ def main():
     routes=parse_routes(r,sm); sets=build_sets(sm); levels=parse_level_objects(r,routes,init); variants=build_enemy_variants(r,levels)
     set_index={slot:s['set_id']-1 for s in sets for slot in s['slots']}
     palettes={slot:palette_for_level(slot) for slot in range(1,20)}
-    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
+    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);stageobjs=make_stage_objects(r);objpath=stage_object_path(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
     bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
     h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')
@@ -1069,7 +1175,7 @@ def main():
                   'unsigned char width,height,cols,rows,has_hit_frame; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
         'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
-    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];\nextern const short g_level8_carriers[][3];\nextern const unsigned short g_level8_carrier_count;\nextern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];')
+    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];\nextern const short g_level8_carriers[][3];\nextern const unsigned short g_level8_carrier_count;\nextern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];\ntypedef struct { const unsigned short *words,*shapes,*palette; const short *records; unsigned short word_count; unsigned char shape_count, record_count; } StageObjectData;\nextern const StageObjectData g_stage_objects[19];\nextern const signed char g_stage_object_path[160];\n#define STAGE_OBJECT_SHAPE_WORDS 7\n#define STAGE_OBJECT_RECORD_WORDS 4')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned long long g_bowser_special_masks[10];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_banana_words[64];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_special_words[1152],g_monkey_special_masks[2];\nextern const unsigned short g_boss_hp_1p')
@@ -1105,6 +1211,21 @@ def main():
             alt=f'enemy_variant_{i:02d}_alt' if v['alt_words'] else '0'
             f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])}}},\n')
         f.write('};\n\n');emit_u16(f,'g_monkey_banana_words',bananawords)
+        for i,so in enumerate(stageobjs):
+            if not so['records']: continue
+            emit_u16(f,f'stageobj{i+1:02d}_words',so['words'],static=True)
+            emit_u16(f,f'stageobj{i+1:02d}_shapes',[v for sh in so['shapes'] for v in sh],static=True)
+            emit_s16(f,f'stageobj{i+1:02d}_records',so['records'],static=True)
+            emit_u16(f,f'stageobj{i+1:02d}_pal',so['palette'],static=True)
+        f.write('const signed char g_stage_object_path[160] = {'+','.join(str(v) for s2 in objpath for v in s2)+'};\n')
+        f.write('const StageObjectData g_stage_objects[19] = {\n')
+        for i,so in enumerate(stageobjs):
+            if so['records']:
+                q=f'stageobj{i+1:02d}'
+                f.write(f'  {{{q}_words,{q}_shapes,{q}_pal,{q}_records,{len(so["words"])},{len(so["shapes"])},{len(so["records"])}}},\n')
+            else:
+                f.write('  {0,0,0,0,0,0,0},\n')
+        f.write('};\n\n')
         f.write('const StageSetData g_stage_sets[12] = {\n')
         for s in sets: q=f'set{s["set_id"]:02d}'; f.write(f'  {{{q}_tiles,{q}_bat,{q}_col,{s["tile_count"]},{s["segment_count"]}}},\n')
         f.write('};\n\n')

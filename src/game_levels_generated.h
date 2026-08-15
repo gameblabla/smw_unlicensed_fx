@@ -18,6 +18,11 @@ extern const unsigned short g_level6_platform_words[192];
 extern const short g_level8_carriers[][3];
 extern const unsigned short g_level8_carrier_count;
 extern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];
+typedef struct { const unsigned short *words,*shapes,*palette; const short *records; unsigned short word_count; unsigned char shape_count, record_count; } StageObjectData;
+extern const StageObjectData g_stage_objects[19];
+extern const signed char g_stage_object_path[160];
+#define STAGE_OBJECT_SHAPE_WORDS 7
+#define STAGE_OBJECT_RECORD_WORDS 4
 extern const BossRoomData g_bowser_rooms[2];
 extern const unsigned short g_final_ring_words[256],g_final_hammer_words[256],g_final_aux_palette[16],g_boss_pot_words[256],g_boss_pot_palette[16],g_boss_bomb_words[512],g_boss_bomb_palette[16],g_boss_crate4_words[256],g_boss_crate4_palette[16],g_boss_bell_words[256],g_boss_bell_palette[16],g_boss_water_words[64],g_boss_water_palette[16],g_boss13_platform_words[512],g_boss13_platform_palette[16];
 extern const unsigned char g_bowser_flame_mask;

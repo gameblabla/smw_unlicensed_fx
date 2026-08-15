@@ -82,6 +82,7 @@ BANKS = [
     ('GAMEPLAY_DOWN_LUIGI_BASE_WORD', FRONT, 0xEB00, PLAYER_FRAME_WORDS, (PLAY, BOSS), 'crouch Luigi', 128),
     ('SATB_BASE0',                  FRONT, 0xF000, 256,    SCENES, 'sprite attribute table, page 0'),
     ('SATB_BASE1',                  FRONT, 0xF200, 256,    SCENES, 'sprite attribute table, page 1'),
+    ('STAGE_OBJECT_BASE_WORD',      FRONT, 0xF300, 'sized:stage_objects', (PLAY,), 'per-level stage object shapes', 128),
 
     # ---- VDC0 (BACK): background plane ----
     ('BG_BAT_BASE_WORD',            BACK,  0x0000, 64*64,  SCENES, 'background BAT, 64x64 cells'),
@@ -149,6 +150,9 @@ def measure():
         lv['kinds'] = enemy_kinds(lv['enemies'])
         lv['tiles'] = set_tiles[lv['set']]
 
+    stage_object_words = max([0] + [int(m.group(1)) for m in
+                                    re.finditer(r'static const unsigned short stageobj\d+_words\[(\d+)\]', levels_src)])
+
     boot_dual = 0
     m = re.search(r'#define BOOT_DUAL_BACK_WORDS\s+(\w+)', (PROJECT / 'src/boot_dual.h').read_text())
     if m:
@@ -169,6 +173,7 @@ def measure():
             'bg_tiles': max(bg_assets.get('g_level_bg_asset', 0), 1000) * TILE_WORDS,
             'continue_tiles': bg_assets.get('g_continue_base_asset', 0) * TILE_WORDS,
             'menu_combo': bg_assets.get('g_menu_combo_asset', 0) * TILE_WORDS,
+            'stage_objects': stage_object_words,
             'boot_dual': boot_dual,
         },
     }
