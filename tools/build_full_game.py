@@ -445,20 +445,10 @@ def script_shape(allm,byid,ms,want_tile):
     rather than by arithmetic on the base.
     """
     if ms not in byid: return None
-    want=byid[ms]
-    bw=want['bbox'][2]+1; bh=want['bbox'][3]+1
+    bw=byid[ms]['bbox'][2]+1; bh=byid[ms]['bbox'][3]+1
     cands=[m for m in allm if m['parts'] and m['parts'][0]['tile_index']==want_tile
            and m['bbox'][2]+1==bw and m['bbox'][3]+1==bh]
-    if not cands: return want
-    # Nearest id alone is not enough to identify the sibling.  Family 15's
-    # rock has three shapes six ids apart (441/447/453) that differ only in
-    # where each quadrant is placed, and for the third DMA bank the nearest
-    # id to 447 is 445 -- a *different* shape, which drew the rotation as two
-    # torn halves.  Match the placement pattern first; it is what makes two
-    # ids the same shape in the first place.
-    shape=[(p['x_offset'],p['y_offset']) for p in want['parts']]
-    same=[m for m in cands if [(p['x_offset'],p['y_offset']) for p in m['parts']]==shape]
-    return min(same or cands,key=lambda m:abs(m['id']-ms))
+    return min(cands,key=lambda m:abs(m['id']-ms)) if cands else byid[ms]
 
 def build_enemy_variants(r,levels):
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text()); byid={m['id']:m for m in allm}
@@ -525,18 +515,12 @@ def build_enemy_variants(r,levels):
         # The third *live* cel used to occupy the hit bank: the pterodactyl's
         # second flight pose and the floor attacker's second strike pose.  They
         # get their own bank now that the hit bank carries a real death pose.
-        # Family 15's walk script is four *distinct* cels -- selectors 0 and 1
-        # of metasprite 441 followed by 447 and 453 -- which is the rock's
-        # rotation.  Only the first two were ever captured, so it read as a
-        # still image.  The last two go in the alt and atk banks, which this
-        # family has no other use for.
-        alt=entry(0,2) if gfx==15 else (entry(1,1) if gfx in (3,4) else None)
+        alt=entry(1,1) if gfx in (3,4) else None
         # Frame 0 of the attack script is the pose $C0C6/$BAD6 and friends
         # select by writing 1 to the object's animation-state word before they
         # throw.  Families whose second walk cel already *is* that pose (1 and
         # 4 above) do not need a second copy of it.
         atk=scripts[1][0] if scripts[1] and gfx not in (1,4) and (gfx,base,sub) in atk_keys else None
-        if gfx==15: atk=entry(0,3)      # the rock's fourth rotation cel
         if atk and (atk==walk[0] or atk==walk[1]): atk=None
         # The attack scripts are not one still pose.  Family 7 runs
         # $E1 (15f) -> $F9 (7f) -> $E1 (31f) and family 12 runs

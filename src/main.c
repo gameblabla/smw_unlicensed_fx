@@ -2840,11 +2840,13 @@ static void draw_game_sprites(void)
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
-            /* The rock's walk script is four cels of one rotation.  Cels 2
-               and 3 ride in the alt and atk banks, which anim 2 and anim 3
-               already select below; this family has no death pose, so the
-               hit-frame path cannot claim anim 2 from it. */
-            else if(e->kind==ENEMY_KIND_BOULDER)anim=(int)((g_state_frame/4)&3);
+            /* The rock's cycle is the three poses the family stores, and the
+               third repeats the first: only two of the ball's images are
+               distinct, which is the pair the port keeps in VRAM.  (The walk
+               script also names metasprites 447 and 453, but those re-place
+               the same four quadrant tiles and resolve to torn halves
+               against this art rather than to a further rotation.) */
+            else if(e->kind==ENEMY_KIND_BOULDER)anim=(((int)(g_state_frame/6)%3)==1)?1:0;
             /* The throwers write 1 into their animation-state word before the
                projectile leaves, so both stay on the attack cel until it is
                gone (and $C0C6 through its recovery count as well).
