@@ -66,6 +66,9 @@ extern const unsigned short g_continue_luigi_words[768];
 extern const unsigned short g_crate_sprite_words[256];
 extern const unsigned short g_gem_sprite_words[192];
 extern const unsigned short g_fireball_sprite_words[256];
+extern const unsigned short g_item_sprite_words[448];
+#define ITEM_KIND_COUNT 7
+#define ITEM_CELL_WORDS 64
 extern const unsigned short g_enemy_palette[16];
 extern const unsigned short g_enemy_sprite_words[15360];
 extern const short g_crate_spawns[];

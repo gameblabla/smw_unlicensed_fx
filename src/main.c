@@ -115,6 +115,10 @@ extern void pcfx_tetsu_wait_frame(void);
 #define MAX_GEMS 72
 #define MAX_ENEMIES 32
 #define MAX_FIREBALLS 3
+/* Items freed from crates go into the source's four-slot $600..$660 pool. */
+#define MAX_ITEMS 4
+#define ITEM_W 16
+#define ITEM_H 16
 /* Level 8 streams 37 carrier records across its route; the engine has no
    trigger-driven spawner, so every record is instantiated at level load and
    simulated only while it is near the camera. */
@@ -133,6 +137,13 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_STATE_FALL  2
 #define PLAYER_MAX_HEARTS 5
 #define HURT_FRAMES 60
+/* $167B8 flickers the player every fourth frame and counts to 15 for an
+   ordinary hit but to 127 for the shield item, so the shield lasts 508
+   frames against the hurt state's 60. */
+#define SHIELD_FRAMES 508
+/* The stopwatch writes $150 to FF00A6, which $B706 tests to skip the whole
+   enemy behavior dispatch until it counts back down. */
+#define STOPWATCH_FRAMES 0x150
 #define HURT_FLICKER_HALF_PERIOD 6
 
 /* MODE1 toggles this at runtime.  It deliberately lives in the release build:
@@ -201,6 +212,24 @@ typedef struct {
     unsigned char active;
     unsigned char life;
 } Fireball;
+
+/* The hidden crate contents.  A crate record's tenth byte carries one of these
+   ids; throwing the crate frees the item, which then sits where the crate was
+   until the player walks into it.  Numbered as the source's collect handler
+   indexes its jump table at $15B96. */
+#define ITEM_FULL_HEAL   1
+#define ITEM_FIRST_AID   2
+#define ITEM_POISON      3
+#define ITEM_EXTRA_LIFE  4
+#define ITEM_STOPWATCH   5
+#define ITEM_SHIELD      6
+#define ITEM_FIREBALL    7
+
+typedef struct {
+    short x, y;
+    unsigned char active;
+    unsigned char kind;   /* ITEM_*, 1..ITEM_KIND_COUNT */
+} Item;
 
 typedef struct { s32 x,y,vx,vy; unsigned char active,palette; } EnemyShot;
 
@@ -360,6 +389,9 @@ static int level_has_enemy_kind(unsigned char kind)
     return 0;
 }
 static Fireball g_fireballs[MAX_FIREBALLS];
+static Item g_items[MAX_ITEMS];
+/* Frames left on the stopwatch item, mirroring FF00A6. */
+static int g_enemy_freeze;
 static MovingPlatform g_moving_platforms[MAX_MOVING_PLATFORMS];
 static int g_moving_platform_count;
 static int g_on_moving_platform=-1;
@@ -744,6 +776,7 @@ static void upload_game_sprites(void)
     vdc_set_vram_write(FRONT_CHIP,BOSS_POT_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);
     vdc_set_vram_write(FRONT_CHIP,GEM_BASE_WORD); for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,g_gem_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,FIREBALL_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_fireball_sprite_words[i]);
+    if(!g_in_boss){vdc_set_vram_write(FRONT_CHIP,ITEM_BASE_WORD); for(i=0;i<ITEM_KIND_COUNT*ITEM_CELL_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_item_sprite_words[i]);}
     vdc_set_vram_write(FRONT_CHIP,HUD_HEART_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_heart_words[i]);
     vdc_set_vram_write(FRONT_CHIP,HUD_DIGIT_BASE_WORD); for(i=0;i<640;++i)vdc_vram_write(FRONT_CHIP,g_hud_digit_words[i]);
     if (!g_in_boss && (g_current_level==1 || g_current_level==5 || g_current_level==7)) {
@@ -1277,7 +1310,13 @@ static void commit_stage_camera(void)
     stage_chip=level_stage_chip();
     backdrop_chip=level_backdrop_chip();
     vdc_set_scroll(stage_chip,(u16)(g_camera_x&0x01FF),0);
-    vdc_set_scroll(backdrop_chip,(u16)((g_camera_x>>1)&0x01FF),0);
+    /* Level 6/7's "backdrop" map is really the stage's foreground scenery and
+       is dithered against the stage plane behind it.  Half-rate parallax slides
+       that dither over a plane moving at a different speed, so the checkerboard
+       cells keep re-mixing with whatever is underneath and appear to change
+       colour as the level scrolls.  Lock it to the stage rate. */
+    vdc_set_scroll(backdrop_chip,
+                   (u16)((level_uses_front_backdrop()?g_camera_x:(g_camera_x>>1))&0x01FF),0);
 }
 
 
@@ -1441,6 +1480,8 @@ static void init_objects(void)
     g_carry_index=-1;g_lift_timer=0;g_gem_count=0;g_invuln=0;
     g_crate_hide=0;
     for(i=0;i<MAX_FIREBALLS;++i)g_fireballs[i].active=0;
+    for(i=0;i<MAX_ITEMS;++i)g_items[i].active=0;
+    g_enemy_freeze=0;
 }
 
 static void update_crates(void)
@@ -1532,10 +1573,37 @@ static int find_pickup_crate(void)
     return best;
 }
 
+/* $1756E: throwing a carried crate frees whatever the crate record's tenth
+   byte named into the four-slot item pool, at the crate's own position nudged
+   right 4 and down 8.  The source then destroys the carried crate object and
+   rebuilds it as the player's thrown projectile, so a crate can only ever give
+   up its contents once; here the crate survives the throw, and clearing extra
+   is what keeps a single box from being farmed for ammo.
+
+   Boss rooms are excluded because their crate slots reuse extra to carry the
+   boss class for the pot/bomb/bell variants rather than an item id. */
+static void spawn_crate_item(Crate *c)
+{
+    int i;
+    if (g_in_boss || !c->extra || c->extra > ITEM_KIND_COUNT) return;
+    for (i = 0; i < MAX_ITEMS; ++i) {
+        if (g_items[i].active) continue;
+        g_items[i].x = (short)((int)(c->x >> FIX_SHIFT) + 4);
+        g_items[i].y = (short)((int)(c->y >> FIX_SHIFT) + 8);
+        g_items[i].kind = c->extra;
+        g_items[i].active = 1;
+        c->extra = 0;
+        return;
+    }
+    /* Pool full: the source leaves the contents in place, so the crate keeps
+       them for a later throw. */
+}
+
 static void do_crate_action(void)
 {
     if (g_carry_index >= 0) {
         Crate *c = &g_crates[g_carry_index];
+        spawn_crate_item(c);
         c->carried = 0;
         if (read_buttons()&JOY_UP) {
             c->x=g_player_x+(s32)4*FIX_ONE;c->y=g_player_y-(s32)8*FIX_ONE;
@@ -1677,6 +1745,66 @@ static void hurt_player(void)
     Play_Sound_Sample(SFX_PLAYER_HURT,0,0);
 }
 
+/* $15AB0 dispatches on the item id through the jump table at $15B96.  Sound
+   $9C -- the port's SFX_MENU_CONFIRM -- is the shared collect chime played by
+   the caller; the $B0 jingle the life and ammo entries add on top of it has no
+   capture in the ADPCM bank, so those two are left with the chime alone. */
+static void apply_item(unsigned char kind)
+{
+    switch (kind) {
+    case ITEM_FULL_HEAL:
+        g_player_hearts = PLAYER_MAX_HEARTS;
+        break;
+    case ITEM_FIRST_AID:
+        if (g_player_hearts < PLAYER_MAX_HEARTS) ++g_player_hearts;
+        break;
+    case ITEM_POISON:
+        /* The one harmful box.  $15AF4 spends a heart with the ordinary hurt
+           sound and kills outright at zero, granting no mercy invulnerability
+           the way an enemy hit does. */
+        if (g_player_hearts > 0) --g_player_hearts;
+        Play_Sound_Sample(SFX_PLAYER_HURT,0,0);
+        if (g_player_hearts <= 0) g_hurt_pending_death = 1;
+        break;
+    case ITEM_EXTRA_LIFE:
+        if (g_lives < 9) ++g_lives;
+        break;
+    case ITEM_STOPWATCH:
+        g_enemy_freeze = STOPWATCH_FRAMES;
+        break;
+    case ITEM_SHIELD:
+        g_invuln = SHIELD_FRAMES;
+        break;
+    case ITEM_FIREBALL:
+        if (g_fireball_ammo < 9) ++g_fireball_ammo;
+        break;
+    default:
+        break;
+    }
+}
+
+/* $15984 tests the item pool against the player's whole 28x44 object box, not
+   the narrower body rectangle the port uses for terrain and enemies.  It has to
+   stay that tall: an item is freed level with the crate the player is holding,
+   which sits above the body box, so a body-sized test would leave the pickup
+   hanging out of reach over Mario's head. */
+static void update_items(void)
+{
+    int i;
+    int px = (int)(g_player_x >> FIX_SHIFT) + 4;
+    int py = (int)(g_player_y >> FIX_SHIFT);
+    if (g_enemy_freeze > 0) --g_enemy_freeze;
+    if (g_player_mode != PMODE_NORMAL) return;
+    for (i = 0; i < MAX_ITEMS; ++i) {
+        if (!g_items[i].active) continue;
+        if (!aabb(px, py, 28, 44,
+                  g_items[i].x + 4, g_items[i].y, ITEM_W - 4, ITEM_H - 4)) continue;
+        g_items[i].active = 0;
+        Play_Sound_Sample(SFX_MENU_CONFIRM,0,0);
+        apply_item(g_items[i].kind);
+    }
+}
+
 /* A resting crate is terrain for ordinary level enemies.  Carried crates have
    no world body, and a thrown crate keeps its projectile behavior below. */
 static int enemy_crate_blocked(const Enemy *e, s32 next_x, int y)
@@ -1747,6 +1875,12 @@ static void update_enemies(void)
             e->spawned=1;
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
+
+        /* The stopwatch item skips $B6E0's behavior dispatch and nothing else,
+           so a frozen enemy still collides: it can be stomped, hit by a thrown
+           crate, and it still hurts on contact.  The defeated-drop above sits
+           ahead of the source's FF00A6 test as well and keeps running. */
+        if (g_enemy_freeze) goto enemy_attack_checks;
 
         if(e->kind!=ENEMY_KIND_GENERIC&&e->kind!=ENEMY_KIND_CHIP){
             int near=iabs_i(px-x);
@@ -2125,6 +2259,18 @@ static void draw_game_sprites(void)
             if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
             set_sprite_entry(satb,n++,sx,sy,(u16)(GEM_BASE_WORD + gf*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
         }
+    }
+
+    /* Freed crate contents.  Metasprites 191..197 are single 16x16 parts on
+       the same sprite palette line the crate and gem use. */
+    for (i = 0; i < MAX_ITEMS && n < 54; ++i) {
+        int sx, sy;
+        if (!g_items[i].active) continue;
+        sx = g_items[i].x - g_camera_x; sy = g_items[i].y;
+        if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
+        set_sprite_entry(satb,n++,sx,sy,
+            (u16)(ITEM_BASE_WORD + (g_items[i].kind-1)*ITEM_CELL_WORDS),
+            (u16)(VDC_SPR_PRIO_SP|player_pal));
     }
 
     for (i = 0; i < MAX_CRATES && n < 54; ++i) {
@@ -3128,7 +3274,7 @@ static void update_play(u16 btn, u16 pressed)
     update_crates();
     update_fireballs();
     if(g_in_boss) update_boss_actor();
-    else { update_gems(); update_enemies(); }
+    else { update_gems(); update_items(); update_enemies(); }
     if(!g_in_boss)update_enemy_shots();
     if (g_state==STATE_LEVEL_FADE) { draw_game_sprites(); return; }
     if (g_player_mode!=PMODE_NORMAL) { draw_game_sprites(); return; }

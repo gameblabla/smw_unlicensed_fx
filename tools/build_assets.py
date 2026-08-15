@@ -430,6 +430,13 @@ def build_object_sprite(vram, base, w, h, outw=32, outh=32):
     return encode_sprite_32x32(c) if outh==32 else encode_sprite_32x48(c)
 
 
+# Hidden crate contents, in the order the collect handler's jump table at
+# $15B96 indexes them: 1 full heal, 2 first-aid, 3 poison, 4 extra life,
+# 5 stopwatch, 6 shield, 7 the green fist that refills fireball ammo.
+ITEM_TILE_INDICES = (165, 169, 173, 177, 181, 185, 189)
+ITEM_COUNT = len(ITEM_TILE_INDICES)
+
+
 def build_gem_sprite(vram, base):
     c=[[0]*16 for _ in range(16)]
     blit_gen_tiles_to_canvas(vram,base,2,2,c,0,0)
@@ -572,9 +579,14 @@ def build_stage_assets(kit,rom):
     gem_words=[]
     for b in (1885,1889,1893): gem_words.extend(build_gem_sprite(level_vram,b))
     fireball_words=build_object_sprite(level_vram,1860,3,3)
+    # Crate contents 1..7 spawn object types $BF..$C5 when the crate is thrown.
+    # Metasprites 191..197 are each one 2x2 part on sprite palette 0 -- the same
+    # line the crate and gem use -- at these tile indices.
+    item_words=[]
+    for b in ITEM_TILE_INDICES: item_words.extend(build_gem_sprite(level_vram,b))
     enemy_pal,enemy_words=build_enemy_assets(rom,kit)
     crates,gems,enemies=extract_stage_object_tables(rom)
-    return fg,bg,bytes(collision),palette[:16],player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies
+    return fg,bg,bytes(collision),palette[:16],player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,item_words,enemy_pal,enemy_words,crates,gems,enemies
 
 
 
@@ -693,7 +705,7 @@ def main():
     star_pal,star_words=build_simple_sprite_image(frontdir/'menu_star_sprite.png')
     menu_m_pal,menu_m_words,menu_l_pal,menu_l_words=build_menu_character_assets(frontdir,kit)
     reference_player_pal,player_down_words,luigi_down_words,continue_mario_words,continue_luigi_words=build_reference_player_assets(p)
-    fg,bg,collision,player_pal,player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,enemy_pal,enemy_words,crates,gems,enemies=build_stage_assets(kit,rom)
+    fg,bg,collision,player_pal,player_words,luigi_words,death_words,hud_life_words,hud_fire_words,hud_heart_words,hud_digit_words,crate_words,gem_words,fireball_words,item_words,enemy_pal,enemy_words,crates,gems,enemies=build_stage_assets(kit,rom)
     continue_bg,continue_digit_pal,continue_digit_words=build_continue_assets(kit,p)
     fronts.append(('continue_base',continue_bg))
 
@@ -718,7 +730,7 @@ extern const unsigned short g_player_down_words[384];
 extern const unsigned short g_luigi_down_words[384];
 extern const unsigned short g_continue_mario_words[768];
 extern const unsigned short g_continue_luigi_words[768];
-extern const unsigned short g_crate_sprite_words[256];\nextern const unsigned short g_gem_sprite_words[192];\nextern const unsigned short g_fireball_sprite_words[256];\nextern const unsigned short g_enemy_palette[16];\nextern const unsigned short g_enemy_sprite_words[15360];\nextern const short g_crate_spawns[];\nextern const short g_gem_spawns[];\nextern const short g_enemy_spawns[];\n#define PLAYER_FRAME_COUNT 20\n#define PLAYER_FRAME_WORDS 384\n#define CRATE_SPAWN_COUNT %d\n#define GEM_SPAWN_COUNT %d\n#define ENEMY_SPAWN_COUNT %d\n#define LEVEL_WIDTH_TILES 416\n#define LEVEL_HEIGHT_TILES 32\n#define LEVEL_COLLISION_HEIGHT 32\n#define LEVEL_BG_WIDTH_TILES 64\n#define LEVEL_BG_HEIGHT_TILES 64\n#endif\n'''%(len(crates),len(gems),len(enemies)))
+extern const unsigned short g_crate_sprite_words[256];\nextern const unsigned short g_gem_sprite_words[192];\nextern const unsigned short g_fireball_sprite_words[256];\nextern const unsigned short g_item_sprite_words[%d];\n#define ITEM_KIND_COUNT %d\n#define ITEM_CELL_WORDS 64\nextern const unsigned short g_enemy_palette[16];\nextern const unsigned short g_enemy_sprite_words[15360];\nextern const short g_crate_spawns[];\nextern const short g_gem_spawns[];\nextern const short g_enemy_spawns[];\n#define PLAYER_FRAME_COUNT 20\n#define PLAYER_FRAME_WORDS 384\n#define CRATE_SPAWN_COUNT %d\n#define GEM_SPAWN_COUNT %d\n#define ENEMY_SPAWN_COUNT %d\n#define LEVEL_WIDTH_TILES 416\n#define LEVEL_HEIGHT_TILES 32\n#define LEVEL_COLLISION_HEIGHT 32\n#define LEVEL_BG_WIDTH_TILES 64\n#define LEVEL_BG_HEIGHT_TILES 64\n#endif\n'''%(len(item_words),ITEM_COUNT,len(crates),len(gems),len(enemies)))
     with c.open('w') as f:
         f.write('#include "assets_generated.h"\n\n')
         for nm,a0 in fronts+[('level_fg',fg),('level_bg',bg)]:
@@ -730,7 +742,7 @@ extern const unsigned short g_crate_sprite_words[256];\nextern const unsigned sh
         emit_u16(f,'g_hud_heart_words',hud_heart_words); emit_u16(f,'g_hud_digit_words',hud_digit_words)
         emit_u16(f,'g_continue_digit_palette',continue_digit_pal); emit_u16(f,'g_continue_digit_words',continue_digit_words)
         emit_u16(f,'g_continue_player_palette',reference_player_pal); emit_u16(f,'g_player_down_words',player_down_words); emit_u16(f,'g_luigi_down_words',luigi_down_words); emit_u16(f,'g_continue_mario_words',continue_mario_words); emit_u16(f,'g_continue_luigi_words',continue_luigi_words)
-        emit_u16(f,'g_crate_sprite_words',crate_words); emit_u16(f,'g_gem_sprite_words',gem_words); emit_u16(f,'g_fireball_sprite_words',fireball_words)
+        emit_u16(f,'g_crate_sprite_words',crate_words); emit_u16(f,'g_gem_sprite_words',gem_words); emit_u16(f,'g_fireball_sprite_words',fireball_words); emit_u16(f,'g_item_sprite_words',item_words)
         emit_u16(f,'g_enemy_palette',enemy_pal); emit_u16(f,'g_enemy_sprite_words',enemy_words)
         emit_s16_records(f,'g_crate_spawns',crates); emit_s16_records(f,'g_gem_spawns',gems); emit_s16_records(f,'g_enemy_spawns',enemies)
     print('front assets',[(n,a['tile_count']) for n,a in fronts])

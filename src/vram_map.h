@@ -34,6 +34,8 @@
 #define GEM_BASE_WORD 0x6900
 /* 0x6A00..0x6AC0 [play,boss] life icon (128) + fire icon (64) */
 #define HUD_BASE_WORD 0x6A00
+/* 0x6B00..0x6CC0 [play] seven hidden crate items, 16x16 each */
+#define ITEM_BASE_WORD 0x6B00
 /* 0x6E00..0x6F00 [play,boss] fireball */
 #define FIREBALL_BASE_WORD 0x6E00
 /* 0x7000..0x7040 [play,boss] heart */

@@ -53,6 +53,7 @@ BANKS = [
     ('CRATE_BASE_WORD',             FRONT, 0x6800, 256,    (PLAY, BOSS), 'crate object'),
     ('GEM_BASE_WORD',               FRONT, 0x6900, 192,    (PLAY, BOSS), 'gem, three frames'),
     ('HUD_BASE_WORD',               FRONT, 0x6A00, 192,    (PLAY, BOSS), 'life icon (128) + fire icon (64)'),
+    ('ITEM_BASE_WORD',              FRONT, 0x6B00, 448,    (PLAY,), 'seven hidden crate items, 16x16 each'),
     ('FIREBALL_BASE_WORD',          FRONT, 0x6E00, 256,    (PLAY, BOSS), 'fireball'),
     ('HUD_HEART_BASE_WORD',         FRONT, 0x7000, 64,     (PLAY, BOSS), 'heart'),
     ('HUD_DIGIT_BASE_WORD',         FRONT, 0x7040, 640,    (PLAY, BOSS), 'HUD digits'),
