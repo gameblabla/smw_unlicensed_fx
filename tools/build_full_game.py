@@ -462,7 +462,14 @@ def build_enemy_variants(r,levels):
     # variant overflowed the ENEMY_ALT arena many times over, and the runtime's
     # bounds check then silently dropped whichever banks came last -- including
     # the two the level 9 throwers actually draw.
-    atk_keys={(e[2],e[3],e[4]) for lev in levels for e in lev['enemies'] if e[5] in (8,13)}
+    #
+    # $C62C is the other handler that writes 1 into the animation-state word:
+    # the leaping fish of the forest stages spends its whole jump in state 1,
+    # whose script alternates selectors 2 and 3 every seven frames.  Selector 3
+    # already rides in the alt bank for this family, so capturing state 1's
+    # first cel here is what completes the pair.
+    atk_keys={(e[2],e[3],e[4]) for lev in levels for e in lev['enemies']
+              if e[5] in (8,13) or (e[2]==3 and e[5]==4)}
     variants=[]
     for idx,(gfx,base,sub) in enumerate(keys):
         tbl=b32(r,0x7246C+gfx*4)
@@ -529,7 +536,7 @@ def build_enemy_variants(r,levels):
         # spear actually leaves the hand.  Only the first was captured before,
         # which is why the attack read as a single frame in game.
         atk2=scripts[1][1] if atk and len(scripts[1])>1 else None
-        if atk2 and atk2 in (atk,walk[0],walk[1]): atk2=None
+        if atk2 and atk2 in (atk,walk[0],walk[1],alt): atk2=None
 
         poses=[(sel,script_shape(allm,byid,ms,want_tile)) for sel,ms in walk]
         poses.append((hit[0],script_shape(allm,byid,hit[1],want_tile)) if has_hit_frame else poses[0])

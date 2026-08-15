@@ -477,6 +477,18 @@ static const signed char g_boulder_bounce3[19]={
     -3,-3,-2,-2,-2,-1,-1,-1,0,0,0,1,1,1,2,2,2,3,3
 };
 
+/* $C6E0: the leap of the water fish, one signed word a frame for the fifty-one
+   steps $C62C counts off.  It is symmetric, so the fish returns to the exact
+   surface line it left. */
+static const signed char g_fish_leap_dy[51]={
+    -8,-8,-8,-7,-7,-7,-6,-6,-6,-5,-5,-5,-4,-4,-3,-3,-3,
+    -3,-2,-2,-2,-1,-1,-1,0,0,0,1,1,1,2,2,2,3,3,3,3,
+    4,4,5,5,5,6,6,6,7,7,7,8,8,8
+};
+#define FISH_LEAP_STEPS 51
+/* $C630 gates the handler on a sixteen-tick counter before the first step. */
+#define FISH_LEAP_DELAY 16
+
 /* $8764's object coordinates, in room space.  The ostrich metasprite (IDs
    588-591) is anchored bottom-centre with bbox x0 = -40, and the supplied
    strip puts its art at canvas x 8 and bottom-aligns every pose on canvas
@@ -2332,10 +2344,30 @@ static void update_enemies(void)
                     }
                     y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
                 }
-            }else if(e->kind==ENEMY_KIND_FLOOR_SNAKE){ /* fixed until its near-range strike */
+            }else if(e->kind==ENEMY_KIND_FLOOR_SNAKE){
+                /* $C62C.  The fish waits sixteen ticks in the water, then
+                   walks the fifty-one-entry arc at $C6E0 one step a frame --
+                   switching to animation state 1 on the second step and to the
+                   splash state on the last -- and $1312A finally clears its
+                   object slot.  The port used to hold it perfectly still at
+                   its authored spot and only swap cels when Mario came within
+                   64 pixels, which is why it never jumped.
+
+                   The countdown starts when the fish reaches the screen rather
+                   than at the source's spawn point: the pre-roll here reaches
+                   64 pixels past the right edge, and starting there would spend
+                   most of the leap out of sight. */
                 e->vx=e->vy=0;
-                if(e->behavior_phase==0&&near<=64){e->behavior_phase=1;e->behavior_timer=0;}
-                else if(e->behavior_phase&&++e->behavior_timer>=64){e->behavior_phase=0;e->behavior_timer=0;}
+                if(e->behavior_phase==0){
+                    if(x-g_camera_x<=252&&++e->behavior_timer>=FISH_LEAP_DELAY){
+                        e->behavior_phase=1;e->behavior_timer=0;
+                    }
+                }else if(e->behavior_phase==1){
+                    e->y+=(s32)g_fish_leap_dy[e->behavior_timer]*FIX_ONE;
+                    if(++e->behavior_timer>=FISH_LEAP_STEPS){e->behavior_phase=2;e->behavior_timer=0;}
+                }else if(++e->behavior_timer>=FISH_LEAP_DELAY){
+                    e->active=0;continue;
+                }
                 y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
             }else if(e->kind==ENEMY_KIND_BOULDER){
                 /* $B844.  The rock is authored above the ceiling and drops at
@@ -2375,14 +2407,6 @@ static void update_enemies(void)
                 if(x-g_camera_x>320||y>256)e->active=0;
                 goto enemy_attack_checks;
             }
-        }
-
-        if (e->kind==ENEMY_KIND_FLOOR_SNAKE) {
-            /* $C62C never applies horizontal movement or gravity. The snake
-               remains at its authored floor opening. */
-            e->vx=e->vy=0;
-            y=(int)(e->y>>FIX_SHIFT);
-            goto enemy_attack_checks;
         }
 
         if (e->flying) {
@@ -2839,7 +2863,13 @@ static void draw_game_sprites(void)
                 anim=e->behavior_phase?(1+((e->behavior_timer/8)&1)):0;
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
-            else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
+            /* The fish rests on its submerged cel, flaps between the two cels
+               of animation state 1 -- selector 2 in the attack bank and
+               selector 3 in the alt bank, seven ticks each -- for the whole
+               leap, and re-enters the water on the spray cel of state 3. */
+            else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)
+                anim=(e->behavior_phase==0)?0:(e->behavior_phase==2)?1:
+                     ((e->behavior_timer/7)&1)?2:3;
             /* The rock's cycle is the three poses the family stores, and the
                third repeats the first: only two of the ball's images are
                distinct, which is the pair the port keeps in VRAM.  (The walk
