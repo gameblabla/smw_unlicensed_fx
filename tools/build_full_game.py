@@ -484,6 +484,7 @@ def build_enemy_variants(r,levels):
     # record so shared behavior never has to infer a species from its stage.
     def enemy_kind(gfx,state):
         if state==18: return 6            # red flying-Koopa handler $B794
+        if gfx==0 and state==1: return 7  # CHIP: airborne patrol (not pterodactyl)
         if gfx==6 and state==7: return 1  # monkey handler $C166 ($C31A throws)
         if gfx==4 and state==5: return 2  # hanging pterodactyl
         if gfx==5 and state==6: return 3  # long-strike snake
@@ -866,6 +867,83 @@ def make_boss13_platform_words():
     palette += [ba.rgb_to_yuv(0,0,0)]*(16-len(palette))
     return words,palette
 
+def make_level8_carriers(r):
+    """Object records for level 8, table $11120 (pointer $10B2A + 7*4).
+
+    Each 12-byte record is (route segment, tile trigger, spawn x, spawn y,
+    metasprite, handler).  The spawn x is always the off-screen 384 used by
+    the streaming spawner, so the world position is reconstructed from the
+    trigger exactly as the level-2/6 carriers are: x = segment*256 + tile*8.
+    Y is the object coordinate less the 128-line playfield offset.
+    """
+    out=[]; off=b32(r,0x10B2A+7*4)
+    while b16(r,off)!=0x8888:
+        seg,tile,_x,y,ms,handler=[b16(r,off+i*2) for i in range(6)]
+        kind={16:1,14:2,15:3}.get(handler)
+        if kind is None: raise RuntimeError(f'level 8 handler {handler} unhandled')
+        out.append([seg*256+tile*8,y-128,kind])
+        off+=12
+    return out
+
+def make_level8_platform_words(r):
+    """Level-8 carrier objects from the $11120 record table.
+
+    Metasprite 167 is the 48x16 gold brick carrier driven by handler 16;
+    168 (48x64) and 169 (32x48) are the grass-topped wedges that handlers 14
+    and 15 slide away under the player.  All three live on source palette
+    line 2 of the level-8 stage palette and use the same stage VRAM as the
+    background tiles.
+    """
+    ld=KIT/'graphics/levels/level_08'
+    vram=ld.joinpath('assembled_vram.bin').read_bytes()
+    rgb,_=ba.read_stage_palette(ld)
+
+    def metasprite(mid):
+        ptr=b32(r,0x197F0+(mid-1)*4); p=ptr+1; parts=[]
+        while r[p]!=0xFF:
+            parts.append((r[p]-256 if r[p]>=128 else r[p],
+                          r[p+1]-256 if r[p+1]>=128 else r[p+1],
+                          (r[p+2]>>4)&15, r[p+2]&15, b16(r,p+3)))
+            p+=5
+        return parts
+
+    def canvas_for(mid,w,h):
+        canvas=[[0]*w for _ in range(h)]
+        for x0,y0,tw,th,attr in metasprite(mid):
+            tile=attr&0x7FF
+            # Mega Drive sprite patterns run column-major inside the piece.
+            for cx in range(tw):
+                for cy in range(th):
+                    pix=ba.tilepix(vram,tile+cx*th+cy)
+                    for y in range(8):
+                        for x in range(8):
+                            v=pix[y*8+x]
+                            if v: canvas[y0+cy*8+y][x0+cx*8+x]=v
+        return canvas
+
+    def cell(canvas,px,py):
+        return ba.encode_sprite_cell([[canvas[py+y][px+x] for x in range(16)] for y in range(16)])
+
+    # 48x16: one 32-wide strip followed by the 16-wide remainder, the layout
+    # the renderer already uses for the level-2/6 carriers.
+    brick=canvas_for(167,48,16)
+    brick_words=cell(brick,0,0)+cell(brick,16,0)+cell(brick,32,0)
+
+    # The wedges are drawn as stacked 32x16 strips plus 16x16 right cells;
+    # 32-pixel-wide VDC sprite patterns must stay 128-word aligned, so the
+    # right-hand column is stored after all of the strips.
+    wr=canvas_for(168,48,64)
+    right_words=[]
+    for sy in range(4): right_words+=cell(wr,0,sy*16)+cell(wr,16,sy*16)
+    for sy in range(4): right_words+=cell(wr,32,sy*16)
+
+    wl=canvas_for(169,32,48)
+    left_words=[]
+    for sy in range(3): left_words+=cell(wl,0,sy*16)+cell(wl,16,sy*16)
+
+    palette=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*rgb[32+i]) for i in range(1,16)]
+    return brick_words,right_words,left_words,palette
+
 def make_final_boss_aux_words():
     """Exact 24x24 ring/hammer objects from the final-room live VDP bank."""
     vram=(BOSSREF/'layers/boss19/md19_vram.bin').read_bytes();out=[]
@@ -941,7 +1019,7 @@ def main():
     routes=parse_routes(r,sm); sets=build_sets(sm); levels=parse_level_objects(r,routes,init); variants=build_enemy_variants(r,levels)
     set_index={slot:s['set_id']-1 for s in sets for slot in s['slots']}
     palettes={slot:palette_for_level(slot) for slot in range(1,20)}
-    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
+    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
     bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
     h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')
@@ -950,13 +1028,13 @@ def main():
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
-        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_FRAME_WORDS 576')
+        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('unsigned short mask0,mask1;','unsigned short mask0,mask1,mask2;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
                   'unsigned char width,height,has_hit_frame; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
         'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
-    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];')
+    hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];\nextern const short g_level8_carriers[][3];\nextern const unsigned short g_level8_carrier_count;\nextern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned long long g_bowser_special_masks[10];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_banana_words[64];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_special_words[1152],g_monkey_special_masks[2];\nextern const unsigned short g_boss_hp_1p')
@@ -1004,7 +1082,7 @@ def main():
         for ri,(room,fg) in enumerate(bowserrooms):
             q=f'bowser_room{ri}';f.write(f'  {{{q}_palette,{q}_tiles,{q}_bg_bat,{q}_fg_bat,{room["tile_count"]}}},\n')
         f.write('};\n\n')
-        emit_u16(f,'g_bowser_flame_words',bossflamewords);emit_u16(f,'g_bowser_special_words',bowserspecialwords);emit_u16(f,'g_bowser_palette',bosspal);f.write('const unsigned long long g_bowser_special_masks[10]={'+','.join(f'0x{x:09X}ULL' for x in bowserspecialmasks)+'};\n');f.write(f'const unsigned char g_bowser_flame_mask=0x{bossflamemask:02X};\n');emit_u16(f,'g_level6_platform_words',level6platform);emit_u16(f,'g_boss13_platform_words',boss13platform);emit_u16(f,'g_boss13_platform_palette',boss13platformpal);emit_u16(f,'g_final_ring_words',finalring);emit_u16(f,'g_final_hammer_words',finalhammer);emit_u16(f,'g_final_aux_palette',finalauxpal);emit_u16(f,'g_boss_pot_words',potwords);emit_u16(f,'g_boss_pot_palette',potpal);emit_u16(f,'g_boss_bomb_words',bombwords);emit_u16(f,'g_boss_bomb_palette',bombpal);emit_u16(f,'g_boss_crate4_words',crate4words);emit_u16(f,'g_boss_crate4_palette',crate4pal);emit_u16(f,'g_boss_bell_words',bellwords);emit_u16(f,'g_boss_bell_palette',bellpal);emit_u16(f,'g_boss_water_words',waterwords);emit_u16(f,'g_boss_water_palette',waterpal)
+        emit_u16(f,'g_bowser_flame_words',bossflamewords);emit_u16(f,'g_bowser_special_words',bowserspecialwords);emit_u16(f,'g_bowser_palette',bosspal);f.write('const unsigned long long g_bowser_special_masks[10]={'+','.join(f'0x{x:09X}ULL' for x in bowserspecialmasks)+'};\n');f.write(f'const unsigned char g_bowser_flame_mask=0x{bossflamemask:02X};\n');emit_u16(f,'g_level6_platform_words',level6platform);f.write('const short g_level8_carriers['+str(len(l8carriers))+'][3] = {'+','.join('{%d,%d,%d}'%tuple(c) for c in l8carriers)+'};\n');f.write('const unsigned short g_level8_carrier_count = '+str(len(l8carriers))+';\n');emit_u16(f,'g_level8_platform_words',l8brick);emit_u16(f,'g_level8_wedge_right_words',l8wedger);emit_u16(f,'g_level8_wedge_left_words',l8wedgel);emit_u16(f,'g_level8_object_palette',l8objpal);emit_u16(f,'g_boss13_platform_words',boss13platform);emit_u16(f,'g_boss13_platform_palette',boss13platformpal);emit_u16(f,'g_final_ring_words',finalring);emit_u16(f,'g_final_hammer_words',finalhammer);emit_u16(f,'g_final_aux_palette',finalauxpal);emit_u16(f,'g_boss_pot_words',potwords);emit_u16(f,'g_boss_pot_palette',potpal);emit_u16(f,'g_boss_bomb_words',bombwords);emit_u16(f,'g_boss_bomb_palette',bombpal);emit_u16(f,'g_boss_crate4_words',crate4words);emit_u16(f,'g_boss_crate4_palette',crate4pal);emit_u16(f,'g_boss_bell_words',bellwords);emit_u16(f,'g_boss_bell_palette',bellpal);emit_u16(f,'g_boss_water_words',waterwords);emit_u16(f,'g_boss_water_palette',waterpal)
         for b in laterboss:
             q=f'boss{b["slot"]}'
             emit_u16(f,q+'_bg_palette',b['bg']['palette'],static=True);emit_u16(f,q+'_bg_tiles',b['bg']['tile_words'],static=True);emit_u16(f,q+'_bg_bat',b['bg']['bat'],static=True)

@@ -15,6 +15,9 @@ extern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_bos
 extern const unsigned short g_boss_bg_tile_count;
 extern const unsigned short g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];
 extern const unsigned short g_level6_platform_words[192];
+extern const short g_level8_carriers[][3];
+extern const unsigned short g_level8_carrier_count;
+extern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];
 extern const BossRoomData g_bowser_rooms[2];
 extern const unsigned short g_final_ring_words[256],g_final_hammer_words[256],g_final_aux_palette[16],g_boss_pot_words[256],g_boss_pot_palette[16],g_boss_bomb_words[512],g_boss_bomb_palette[16],g_boss_crate4_words[256],g_boss_crate4_palette[16],g_boss_bell_words[256],g_boss_bell_palette[16],g_boss_water_words[64],g_boss_water_palette[16],g_boss13_platform_words[512],g_boss13_platform_palette[16];
 extern const unsigned char g_bowser_flame_mask;
@@ -37,6 +40,7 @@ extern const unsigned char g_boss_collision[6144];
 #define ENEMY_KIND_CRATE_MIMIC 4
 #define ENEMY_KIND_FLOOR_SNAKE 5
 #define ENEMY_KIND_FLYING_KOOPA 6
+#define ENEMY_KIND_CHIP 7
 #define ENEMY_FRAME_WORDS 576
 #define ENEMY_VARIANT_VRAM_WORDS 1152
 #define BOWSER_SPECIAL_FRAME_COUNT 10
