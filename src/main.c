@@ -847,10 +847,30 @@ static void set_game_palette_fade(int level)
     g_game_fade_level=level;
 }
 
+/* Level 6 draws its jungle scenery on the front VDC (level_uses_front_backdrop),
+   the same chip the sprites live on, so the canopy only hangs in front of the
+   cast if the sprites give up their in-front-of-background priority bit. */
+static int level_front_scenery_over_sprites(void)
+{
+    return !g_in_boss && g_current_level==6;
+}
+
+/* Tile rows 28 and 29 sit below the Mega Drive's 224-line V28 picture.  The
+   source has no art there, so the generator continues the row-27 texture into
+   them; behind the HUD that reads as a band of repeated scenery.  Blank both
+   planes instead, which leaves palette entry 0 -- black in every level palette
+   -- showing under the HUD sprites. */
+#define HUD_BAND_FIRST_ROW 28
+static int level_blank_hud_band(void)
+{
+    return !g_in_boss && g_current_level==6;
+}
+
 static u16 level_fg_bat_entry(int world_col,int row)
 {
     int screen,seg,lx;
     if(!g_level||!g_stage_set||world_col<0||world_col>=g_level_width_tiles||row<0||row>=30)return FG_TILE_BASE_INDEX;
+    if(row>=HUD_BAND_FIRST_ROW&&level_blank_hud_band())return FG_TILE_BASE_INDEX;
     screen=world_col>>5; lx=world_col&31; if(screen>=g_level->route_len)return FG_TILE_BASE_INDEX;
     seg=g_level->route[screen]; if(seg==255||seg>=g_stage_set->segment_count)return FG_TILE_BASE_INDEX;
     return relocate_bat(g_stage_set->segment_bat[(seg*30+row)*32+lx],FG_TILE_BASE_INDEX);
@@ -901,7 +921,11 @@ static void upload_level_backdrop(void)
         vdc_set_vram_write(chip,(u16)(y*BG_BAT_W));
         /* The background plane is the Mega Drive's full 64-cell width; it
            wraps every 512 pixels, not every 256. */
-        for(x=0;x<64;++x){u16 e=g_level->bg_bat[y*BG_BAT_W+x];vdc_vram_write(chip,relocate_bat(e,FG_TILE_BASE_INDEX));}
+        for(x=0;x<64;++x){
+            u16 e=g_level->bg_bat[y*BG_BAT_W+x];
+            if(y>=HUD_BAND_FIRST_ROW&&level_blank_hud_band())e=0;
+            vdc_vram_write(chip,relocate_bat(e,FG_TILE_BASE_INDEX));
+        }
     }
 }
 
@@ -1979,6 +2003,9 @@ static void draw_game_sprites(void)
         if (digit<0) digit=0; if (digit>9) digit=9;
         set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
+    /* Everything emitted from here on is world content and may be occluded by
+       a front-plane scenery layer; the HUD above never is. */
+    int hud_entries=n;
 
     /* SATB entries with lower indices win sprite/sprite overlap.  A carried
        crate is the one exception to the normal object ordering: it must cover
@@ -2265,6 +2292,9 @@ static void draw_game_sprites(void)
         if (g_fireballs[i].vx<0) ctrl|=VDC_SPR_X_INVERT;
         set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,ctrl);
     }
+
+    if (level_front_scenery_over_sprites())
+        for (i=hud_entries;i<64;++i) satb[i*4+3]&=(u16)~VDC_SPR_PRIO_SP;
 
     vdc_set_vram_write(FRONT_CHIP, base);
     for (i = 0; i < 64 * 4; ++i) vdc_vram_write(FRONT_CHIP, satb[i]);
