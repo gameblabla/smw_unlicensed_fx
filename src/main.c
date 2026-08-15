@@ -2712,10 +2712,6 @@ static void draw_game_sprites(void)
             if(e->behavior_phase==1)sy-=8;       /* 24px crate -> 32px rise */
             else if(e->behavior_phase==2)sy-=14;/* walking art's visible baseline */
         }
-        /* $C0C6's poses sit five pixels lower than its authored record: the
-           object's Y is the top of its 40px metasprite while the port draws
-           from the cell grid the wider attack cel forces. */
-        else if(e->kind==ENEMY_KIND_THROWER)sy+=5;
         if(sx<-56||sx>255||sy<-56||sy>239)continue;
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
         anim=(int)((g_state_frame/8)&1);
@@ -2773,6 +2769,13 @@ static void draw_game_sprites(void)
         else if(special_monkey){mask=g_monkey_special_masks[special_frame];cols=rows=grid_cols=3;}
         else if(special_crate){special_frame=(g_state_frame/10)&1;mask=g_crate_walk_masks[special_frame];cols=rows=grid_cols=3;}
         else{
+            /* Every pose of a variant is packed bottom-aligned in its cell grid
+               so the short ones stop floating, which shifts the whole grid down
+               by the walk cel's share of that alignment.  Lift it back so walk
+               cel 0 -- the pose that was always placed correctly -- does not
+               move.  The special banks above carry their own art and their own
+               alignment, so they must not be shifted. */
+            sy-=(int)v->baseline;
             /* Live third cels come from the alt bank; anim 2 otherwise means
                the hit pose, which can be a taller metasprite than the walk. */
             use_alt=(anim==2&&!use_hit_frame&&v->alt_words!=0&&g_enemy_alt_vram[li]!=0);

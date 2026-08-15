@@ -468,7 +468,7 @@ def build_enemy_variants(r,levels):
         tbl=b32(r,0x7246C+gfx*4)
         addr=ba.vdp_addr(b32(r,0xF454+sub*4)); want_tile=addr//32
 
-        def pack(anim,m,cols,rows):
+        def pack(anim,m,cols,rows,top=0):
             ptr=b32(r,tbl+anim*4); next_ptr=b32(r,tbl+(anim+1)*4)
             # The resolved shape also provides a safe exact minimum length for
             # families whose final animation pointer has no following frame
@@ -486,7 +486,7 @@ def build_enemy_variants(r,levels):
             vv=bytearray(65536);vv[addr:addr+len(raw)]=raw
             canvas=[[0]*64 for _ in range(64)]
             for part in m['parts']:
-                ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset'])
+                ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],part['height_tiles'],canvas,part['x_offset'],part['y_offset']+top)
             words=[]; mask=0
             for cy in range(rows):
                 for cx in range(cols):
@@ -545,15 +545,33 @@ def build_enemy_variants(r,levels):
         cols=rows=0
         for _,m in poses:
             cols=max(cols,min(4,(m['bbox'][2]+16)//16)); rows=max(rows,min(4,(m['bbox'][3]+16)//16))
+        # The poses of one family are not all the same height -- the spearman
+        # stands 40 tall but crouches to 32, and family 7's first walk cel is
+        # 24 against 32 for the rest -- and every metasprite is authored from a
+        # common *top* origin.  Blitting them all at canvas y=0 therefore left
+        # the shorter ones hanging in the air: the level 9 spearman's whole
+        # attack floated eight pixels off the ground.  The ROM compensates with
+        # the per-frame dy in its animation scripts (family 7's second walk cel
+        # carries exactly the -8 this predicts).  Rather than thread those
+        # offsets through the renderer, bottom-align the poses here so a single
+        # baseline shift puts every cel's feet on the same line.
+        pose_h=[m['bbox'][3]+1 for _,m in poses]
+        floor=max(pose_h)
+        tops=[floor-h for h in pose_h]
+        # Walk cel 0 is the pose whose placement is already correct in game, so
+        # the runtime lifts the sprite by its share of the shift and nothing
+        # else moves.
+        baseline=floor-pose_h[0]
+
         frames=[]; masks=[]
-        for sel,m in poses[:3]:
-            words,mask=pack(sel,m,cols,rows); frames.extend(words); masks.append(mask)
+        for i,(sel,m) in enumerate(poses[:3]):
+            words,mask=pack(sel,m,cols,rows,tops[i]); frames.extend(words); masks.append(mask)
         alt_words=alt_mask=None
         atk_words=atk_mask=None
         atk2_words=atk2_mask=None
-        if alt: alt_words,alt_mask=pack(*poses[alt_i],cols,rows)
-        if atk: atk_words,atk_mask=pack(*poses[atk_i],cols,rows)
-        if atk2: atk2_words,atk2_mask=pack(*poses[atk2_i],cols,rows)
+        if alt: alt_words,alt_mask=pack(*poses[alt_i],cols,rows,tops[alt_i])
+        if atk: atk_words,atk_mask=pack(*poses[atk_i],cols,rows,tops[atk_i])
+        if atk2: atk2_words,atk2_mask=pack(*poses[atk2_i],cols,rows,tops[atk2_i])
 
         # Collision keeps the walking silhouette; the taller hit pose must not
         # widen the box Mario stomps.
@@ -566,7 +584,7 @@ def build_enemy_variants(r,levels):
                              cols=cols,rows=rows,has_hit_frame=has_hit_frame,
                              alt_words=alt_words,alt_mask=alt_mask or 0,
                              atk_words=atk_words,atk_mask=atk_mask or 0,
-                             atk2_words=atk2_words,atk2_mask=atk2_mask or 0,
+                             atk2_words=atk2_words,atk2_mask=atk2_mask or 0,baseline=baseline,
                              shot_words=make_enemy_shot(r,gfx,*shot) if shot else None,
                              shot_cols=shot[1] if shot else 0))
         print('variant',idx,(gfx,base,sub),'wh',width,height,'grid',cols,rows,'mask',masks)
@@ -1236,7 +1254,7 @@ def main():
     hs=hs.replace('const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1;',
                   'const unsigned short *words,*palette,*alt_words,*atk_words,*atk2_words,*shot_words; unsigned short mask0,mask1,mask2,alt_mask,atk_mask,atk2_mask;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
-                  'unsigned char width,height,cols,rows,has_hit_frame,shot_cols; } EnemyVariantData;')
+                  'unsigned char width,height,cols,rows,has_hit_frame,shot_cols,baseline; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
         'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
     hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];\nextern const short g_level8_carriers[][3];\nextern const unsigned short g_level8_carrier_count;\nextern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];\ntypedef struct { const unsigned short *words,*shapes,*palette; const short *records; unsigned short word_count; unsigned char shape_count, record_count; } StageObjectData;\nextern const StageObjectData g_stage_objects[19];\nextern const signed char g_stage_object_path[160];\n#define STAGE_OBJECT_SHAPE_WORDS 7\n#define STAGE_OBJECT_RECORD_WORDS 4')
@@ -1294,7 +1312,7 @@ def main():
             atk=extra_syms.get((i,'atk'),'0')
             atk2=extra_syms.get((i,'atk2'),'0')
             shot=shot_syms.get(v['key'][0],'0') if v['shot_words'] else '0'
-            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},{atk},{atk2},{shot},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},0x{v["atk_mask"]:04X},0x{v["atk2_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])},{v["shot_cols"]}}},\n')
+            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},{atk},{atk2},{shot},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},0x{v["atk_mask"]:04X},0x{v["atk2_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])},{v["shot_cols"]},{v["baseline"]}}},\n')
         f.write('};\n\n');emit_u16(f,'g_monkey_banana_words',bananawords)
         for i,so in enumerate(stageobjs):
             if not so['records']: continue
