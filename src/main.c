@@ -302,6 +302,7 @@ static int g_boss_action,g_boss_action_timer,g_boss_action_dir;
 static const unsigned char g_bowser_action_script[12]={1,5,2,6,3,4,1,5,2,5,3,4};
 static const unsigned char g_bowser_direction_script[12]={0,1,1,1,0,1,0,1,1,0,0,1};
 static int g_boss_script_index;
+static int g_boss8_slow_count,g_boss8_spin_toggle;
 static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx,g_boss_shot_vy;
 static int g_boss_shot_active;
 static unsigned g_boss_drop_rng;
@@ -312,6 +313,13 @@ static int g_boss_random_drop_timer;
    Keep the recovered data here instead of approximating it with a velocity
    pattern; the direction flag is also the value used by the original sprite
    selector. */
+/* The pig's mask is 4 cells wide by 5 tall, so a 64x80 body.  These bounds
+   keep every cell inside the 256x240 room while it spins. */
+#define BOSS8_MIN_X 8
+#define BOSS8_MAX_X 184
+#define BOSS8_MIN_Y 8
+#define BOSS8_MAX_Y 152
+
 static const unsigned char g_boss8_arc[45]={
     1,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3,
     3,4,4,4,4,4,4,4,4,4,4,3,3,3,3,3,
@@ -356,6 +364,14 @@ static int g_paused;
 static void enter_menu(void);
 static void enter_boot(void);
 static void start_boss(int fade_in);
+
+/* Boss 3 (level 8 slot) alternates between a slow patrol and a fast spin.
+   Actions 6 and 7 are the two spin paths. */
+static int boss8_spinning(void)
+{
+    return g_boss_class==1 && (g_boss_action==6 || g_boss_action==7);
+}
+
 static void submit_front_satb(u16 *satb);
 static void clear_front_sprites(void);
 static void set_front_sprites_enabled(int enabled);
@@ -1896,8 +1912,7 @@ static int later_boss_frame(const BossVisualData *v)
     case 1: /* Pig strip: walk 0/1, spin 2/3/4, hurt 5, death 6. */
         if(g_boss_defeated)frame=6;
         else if(g_boss_invuln>0)frame=5;
-        else if(g_boss_action==8)frame=-1; /* MD attack has no pig sprite. */
-        else if(g_boss_action==6||g_boss_action==7)
+        else if(boss8_spinning())
             frame=2+(t/5)%3;
         else frame=(g_boss_action==2||g_boss_action==4)?1:0;
         break; /* Pig */
@@ -2386,6 +2401,7 @@ static void start_boss(int fade_in)
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
+    g_boss8_slow_count=0;g_boss8_spin_toggle=0;
 
     /* Exact 1P HP table $6D6E: 8,8,10,10,12,12,12 for the seven bosses.
        $6D94 is also exported for the later two-player implementation. */
@@ -2523,14 +2539,29 @@ static void update_boss_motion(void)
            Keeping the previous state through the transition preserves its
            final pose for the frame in which the source resets that bit. */
         if(g_boss_action_timer<0){
-            p=&g_boss8_script[g_boss_script_index*2];
-            if(p[0]==0x88){g_boss_script_index=0;p=g_boss8_script;}
-            g_boss_action=p[0];g_boss_action_dir=p[1];++g_boss_script_index;
+            /* The source script only spins about once every twenty-five
+               actions.  Alternate instead: four slow patrol actions, then one
+               of the two fast spin paths. */
+            if(g_boss8_slow_count>=4){
+                g_boss_action=g_boss8_spin_toggle?7:6;
+                g_boss8_spin_toggle^=1;
+                g_boss_action_dir=0;
+                g_boss8_slow_count=0;
+            }else{
+                for(;;){
+                    p=&g_boss8_script[g_boss_script_index*2];
+                    if(p[0]==0x88){g_boss_script_index=0;continue;}
+                    ++g_boss_script_index;
+                    if(p[0]==6||p[0]==7)continue; /* spins are scheduled above */
+                    break;
+                }
+                g_boss_action=p[0];g_boss_action_dir=p[1];
+                ++g_boss8_slow_count;
+            }
             g_boss_action_timer=0;g_boss_phase=0;
             /* The cleaned strip is stored in the opposite base orientation
                from the MD direction bit: dir 0 moves left and is unflipped. */
             g_boss_face=g_boss_action_dir?-1:1;
-            if(g_boss_action==8)boss_drop_water();
         }
         state=g_boss_action;dir=g_boss_action_dir;
         if(state==1){
@@ -2597,6 +2628,13 @@ static void update_boss_motion(void)
             }
             g_boss_vx=(s32)vx*FIX_ONE;g_boss_vy=(s32)vy*FIX_ONE;
             g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;
+            /* The raw source phase lengths carry the 80x80 body far past the
+               right edge, which read as the spin having no graphics at all.
+               Keep the whole sprite inside the room instead. */
+            if(g_boss_x<(s32)BOSS8_MIN_X*FIX_ONE)g_boss_x=(s32)BOSS8_MIN_X*FIX_ONE;
+            if(g_boss_x>(s32)BOSS8_MAX_X*FIX_ONE)g_boss_x=(s32)BOSS8_MAX_X*FIX_ONE;
+            if(g_boss_y<(s32)BOSS8_MIN_Y*FIX_ONE)g_boss_y=(s32)BOSS8_MIN_Y*FIX_ONE;
+            if(g_boss_y>(s32)BOSS8_MAX_Y*FIX_ONE)g_boss_y=(s32)BOSS8_MAX_Y*FIX_ONE;
             ++g_boss_action_timer;
             if(g_boss_action_timer>=duration){
                 g_boss_action_timer=0;++g_boss_phase;
@@ -2697,9 +2735,18 @@ static void update_boss_actor(void)
             g_boss_random_drop_timer=72+(int)(boss_random()&95);
         }
     }
+    /* Boss 3 splits its two attacks by movement mode: water drops while it
+       patrols slowly, crates only while it spins. */
+    if(g_boss_class==1&&g_boss_invuln==0&&!boss8_spinning()){
+        if(g_boss_random_drop_timer>0)--g_boss_random_drop_timer;
+        if(g_boss_random_drop_timer<=0&&!g_boss_shot_active){
+            boss_drop_water();g_boss_random_drop_timer=56;
+        }
+    }
     /* The source dispenser ($7958) waits while its previous crate object is
        live.  Do the same so unused ammunition cannot carpet the catwalk. */
-    if(g_boss_class!=3&&g_boss_invuln==0&&(g_boss_timer%120)==1){
+    if(g_boss_class!=3&&g_boss_invuln==0&&
+       (g_boss_class==1?(boss8_spinning()&&(g_boss_timer%48)==1):((g_boss_timer%120)==1))){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
         if(!any_crate)for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
@@ -2707,8 +2754,15 @@ static void update_boss_actor(void)
                 /* Later bosses always dispense their own throwable.  Zero is
                    reserved for Bowser's ordinary wooden crate. */
                 g_crates[i].extra=(unsigned char)g_boss_class;
+                if(g_boss_class==1){
+                    /* Spin drops fall from wherever the pig currently is. */
+                    int cx=(int)(g_boss_x>>FIX_SHIFT)+24;
+                    if(cx<16)cx=16;if(cx>224)cx=224;
+                    g_crates[i].x=(s32)cx<<FIX_SHIFT;
+                }else
                 g_crates[i].x=(s32)(32+((g_boss_timer/120)%6)*32)<<FIX_SHIFT;
-                g_crates[i].y=(s32)-16*FIX_ONE;g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
+                g_crates[i].y=(g_boss_class==1)?(g_boss_y+(s32)64*FIX_ONE):((s32)-16*FIX_ONE);
+                g_crates[i].vx=0;g_crates[i].vy=FIX_ONE;break;
         }
     }
     if(g_boss_shot_active){
