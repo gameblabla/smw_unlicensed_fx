@@ -1007,6 +1007,15 @@ STAGE_OBJECT_SKIP_SLOTS={2,6,8}
 # girder is gold, not green).  The port used to force line 2 everywhere.
 STAGE_OBJECT_PAL_LINE={9:3, 10:3, 11:2, 12:2, 13:2, 15:3, 17:2, 18:2, 19:2}
 
+# Metasprites whose art is supplied as a PNG instead of being assembled from
+# the Mega Drive pattern block.  Level 9's pillar (metasprite 121) is authored
+# against the 224-line picture and stops 16 pixels short of the PC-FX floor;
+# the supplied replacement is the same 32-wide column carried down to 96, so
+# the record's y=144 puts its foot exactly on raster 240.  The image's colours
+# are matched to the level's own stage-object palette line, so the shape stays
+# on the one line the whole bank shares.
+STAGE_OBJECT_ART={(9,121):'pillar.png'}
+
 def stage_object_path(r):
     """The 80 (dx,dy) steps handler 7 walks, from the byte table at $FA58."""
     out=[]
@@ -1058,15 +1067,39 @@ def make_stage_objects(r):
         for rec in recs:
             if rec[4] not in ids: ids.append(rec[4])
         line=STAGE_OBJECT_PAL_LINE.get(slot,2)
+        def art_canvas(path,cols,rows):
+            """Quantise a supplied RGBA image onto this level's palette line."""
+            im=Image.open(PROJECT/path).convert('RGBA')
+            canvas=[[0]*(cols*16) for _ in range(rows*16)]
+            for y in range(min(im.height,rows*16)):
+                for x in range(min(im.width,cols*16)):
+                    px=im.getpixel((x,y))
+                    if px[3]<128: continue
+                    canvas[y][x]=min(range(1,16),
+                        key=lambda i:sum((a-b)**2 for a,b in zip(px[:3],rgb[line*16+i])))
+            return canvas
+
         shapes=[]; words=[]
         for mid in ids:
             parts=metasprite(mid)
             ox=min(p[0] for p in parts); oy=min(p[1] for p in parts)
             w=max(p[0]+p[2]*8 for p in parts)-ox; h=max(p[1]+p[3]*8 for p in parts)-oy
+            art=STAGE_OBJECT_ART.get((slot,mid))
+            if art:
+                im=Image.open(PROJECT/art)
+                w,h=im.size
             cols=(w+15)//16; rows=(h+15)//16
             if cols>1 and (cols&1): cols+=1     # keep 32-wide sprite pairs aligned
-            canvas=[[0]*(cols*16) for _ in range(rows*16)]
-            for x0,y0,tw,th,attr in parts:
+            # A 32-pixel-wide sprite ignores the low bit of its pattern index,
+            # so the renderer's cell pairs only land on the intended art when
+            # each such shape starts on a 128-word (two-cell) boundary.  A
+            # shape with an odd cell count -- level 9's single 16x16 ledge --
+            # otherwise pushes every later shape half a cell out, which drew
+            # the pillar as its own neighbouring columns side by side.
+            if cols>1 and len(words)%128: words.extend([0]*(128-len(words)%128))
+            canvas=(art_canvas(art,cols,rows) if art
+                    else [[0]*(cols*16) for _ in range(rows*16)])
+            for x0,y0,tw,th,attr in (() if art else parts):
                 tile=attr&0x7FF
                 # Mega Drive sprite patterns run column-major inside the piece.
                 for cx in range(tw):
