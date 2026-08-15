@@ -460,6 +460,23 @@ static const unsigned char g_boss10_pot[31]={
     0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x88
 };
 
+/* $B844's three bounce arcs, read one signed word a frame while the rock
+   rolls two pixels right.  The first is the same 45-step table $17948 gives
+   the player's jump; the port's copy of that one carries a deliberate change
+   for Mario's clearance, so the rock keeps its own. */
+static const signed char g_boulder_bounce1[45]={
+    -6,-6,-5,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,
+    -2,-2,-2,-2,-2,-2,-2,0,0,0,2,2,2,2,2,2,2,
+    4,4,4,4,4,4,4,4,4,4,4,5,6,6
+};
+static const signed char g_boulder_bounce2[32]={
+    -4,-4,-3,-2,-2,-2,-2,-2,-2,-1,-1,-1,-1,-1,0,0,
+    1,1,1,1,1,2,2,2,2,2,2,2,3,4,4,4
+};
+static const signed char g_boulder_bounce3[19]={
+    -3,-3,-2,-2,-2,-1,-1,-1,0,0,0,1,1,1,2,2,2,3,3
+};
+
 /* $8764's object coordinates, in room space.  The ostrich metasprite (IDs
    588-591) is anchored bottom-centre with bbox x0 = -40, and the supplied
    strip puts its art at canvas x 8 and bottom-aligns every pose on canvas
@@ -2320,6 +2337,43 @@ static void update_enemies(void)
                 if(e->behavior_phase==0&&near<=64){e->behavior_phase=1;e->behavior_timer=0;}
                 else if(e->behavior_phase&&++e->behavior_timer>=64){e->behavior_phase=0;e->behavior_timer=0;}
                 y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->kind==ENEMY_KIND_BOULDER){
+                /* $B844.  The rock is authored above the ceiling and drops at
+                   eight pixels a frame until $17D50 reports ground under it.
+                   It then runs three shrinking bounce arcs -- $BA7A, $B918,
+                   $B95A -- rolling two pixels right on every step of them,
+                   and afterwards just keeps rolling, falling four pixels a
+                   frame whenever nothing is beneath it.  The port used to
+                   hand it to the Goomba solver, which left it hanging in the
+                   air on one frame of its four-cel rotation. */
+                int bottom;
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0){
+                    e->y+=(s32)8*FIX_ONE;
+                    y=(int)(e->y>>FIX_SHIFT);bottom=y+h-1;
+                    if(solid_v(x+3,bottom)||solid_v(x+e->width-4,bottom)){
+                        e->y=(s32)(((bottom>>3)<<3)-h)<<FIX_SHIFT;
+                        e->behavior_phase=1;e->behavior_timer=0;
+                    }
+                }else if(e->behavior_phase<4){
+                    const signed char *arc=(e->behavior_phase==1)?g_boulder_bounce1:
+                                           (e->behavior_phase==2)?g_boulder_bounce2:g_boulder_bounce3;
+                    int len=(e->behavior_phase==1)?45:(e->behavior_phase==2)?32:19;
+                    if(e->behavior_timer>=len){++e->behavior_phase;e->behavior_timer=0;}
+                    else{
+                        e->y+=(s32)arc[e->behavior_timer]*FIX_ONE;
+                        e->x+=(s32)2*FIX_ONE;++e->behavior_timer;
+                    }
+                }else{
+                    e->x+=(s32)2*FIX_ONE;
+                    x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);bottom=y+h-1;
+                    if(!solid_v(x+3,bottom+4)&&!solid_v(x+e->width-4,bottom+4))
+                        e->y+=(s32)4*FIX_ONE;
+                }
+                x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
+                /* $130C6 retires it once it has rolled past the view. */
+                if(x-g_camera_x>320||y>256)e->active=0;
+                goto enemy_attack_checks;
             }
         }
 
@@ -2786,6 +2840,11 @@ static void draw_game_sprites(void)
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
+            /* The rock's walk script is four cels of one rotation.  Cels 2
+               and 3 ride in the alt and atk banks, which anim 2 and anim 3
+               already select below; this family has no death pose, so the
+               hit-frame path cannot claim anim 2 from it. */
+            else if(e->kind==ENEMY_KIND_BOULDER)anim=(int)((g_state_frame/4)&3);
             /* The throwers write 1 into their animation-state word before the
                projectile leaves, so both stay on the attack cel until it is
                gone (and $C0C6 through its recovery count as well).

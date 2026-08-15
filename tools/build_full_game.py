@@ -445,10 +445,20 @@ def script_shape(allm,byid,ms,want_tile):
     rather than by arithmetic on the base.
     """
     if ms not in byid: return None
-    bw=byid[ms]['bbox'][2]+1; bh=byid[ms]['bbox'][3]+1
+    want=byid[ms]
+    bw=want['bbox'][2]+1; bh=want['bbox'][3]+1
     cands=[m for m in allm if m['parts'] and m['parts'][0]['tile_index']==want_tile
            and m['bbox'][2]+1==bw and m['bbox'][3]+1==bh]
-    return min(cands,key=lambda m:abs(m['id']-ms)) if cands else byid[ms]
+    if not cands: return want
+    # Nearest id alone is not enough to identify the sibling.  Family 15's
+    # rock has three shapes six ids apart (441/447/453) that differ only in
+    # where each quadrant is placed, and for the third DMA bank the nearest
+    # id to 447 is 445 -- a *different* shape, which drew the rotation as two
+    # torn halves.  Match the placement pattern first; it is what makes two
+    # ids the same shape in the first place.
+    shape=[(p['x_offset'],p['y_offset']) for p in want['parts']]
+    same=[m for m in cands if [(p['x_offset'],p['y_offset']) for p in m['parts']]==shape]
+    return min(same or cands,key=lambda m:abs(m['id']-ms))
 
 def build_enemy_variants(r,levels):
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text()); byid={m['id']:m for m in allm}
@@ -515,12 +525,18 @@ def build_enemy_variants(r,levels):
         # The third *live* cel used to occupy the hit bank: the pterodactyl's
         # second flight pose and the floor attacker's second strike pose.  They
         # get their own bank now that the hit bank carries a real death pose.
-        alt=entry(1,1) if gfx in (3,4) else None
+        # Family 15's walk script is four *distinct* cels -- selectors 0 and 1
+        # of metasprite 441 followed by 447 and 453 -- which is the rock's
+        # rotation.  Only the first two were ever captured, so it read as a
+        # still image.  The last two go in the alt and atk banks, which this
+        # family has no other use for.
+        alt=entry(0,2) if gfx==15 else (entry(1,1) if gfx in (3,4) else None)
         # Frame 0 of the attack script is the pose $C0C6/$BAD6 and friends
         # select by writing 1 to the object's animation-state word before they
         # throw.  Families whose second walk cel already *is* that pose (1 and
         # 4 above) do not need a second copy of it.
         atk=scripts[1][0] if scripts[1] and gfx not in (1,4) and (gfx,base,sub) in atk_keys else None
+        if gfx==15: atk=entry(0,3)      # the rock's fourth rotation cel
         if atk and (atk==walk[0] or atk==walk[1]): atk=None
         # The attack scripts are not one still pose.  Family 7 runs
         # $E1 (15f) -> $F9 (7f) -> $E1 (31f) and family 12 runs
@@ -602,6 +618,7 @@ def build_enemy_variants(r,levels):
         if gfx==3 and state==4: return 5  # floor-opening snake $C62C
         if state==8: return 8   # $C0C6: stationary thrower, never walks
         if state==13: return 9  # $BAD6: walks, then stops to throw its spear
+        if state==16: return 10 # $B844: ceiling rock that drops and bounces
         return 0
 
     # Localize variants per level and rewrite enemy records as
@@ -1250,7 +1267,7 @@ def main():
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
-        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_KIND_THROWER 8\n#define ENEMY_KIND_SPEARMAN 9\n#define ENEMY_FRAME_WORDS 576')
+        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_KIND_THROWER 8\n#define ENEMY_KIND_SPEARMAN 9\n#define ENEMY_KIND_BOULDER 10\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1;',
                   'const unsigned short *words,*palette,*alt_words,*atk_words,*atk2_words,*shot_words; unsigned short mask0,mask1,mask2,alt_mask,atk_mask,atk2_mask;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',

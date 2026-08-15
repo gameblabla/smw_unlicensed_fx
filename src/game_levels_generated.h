@@ -48,6 +48,7 @@ extern const unsigned char g_boss_collision[6144];
 #define ENEMY_KIND_CHIP 7
 #define ENEMY_KIND_THROWER 8
 #define ENEMY_KIND_SPEARMAN 9
+#define ENEMY_KIND_BOULDER 10
 #define ENEMY_FRAME_WORDS 576
 #define ENEMY_VARIANT_VRAM_WORDS 1152
 #define BOWSER_SPECIAL_FRAME_COUNT 10
