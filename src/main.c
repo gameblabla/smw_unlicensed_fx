@@ -423,6 +423,59 @@ static const unsigned char g_boss8_script[]={
     8,1, 2,1, 0x88
 };
 
+/* Boss 4's handler at MD $8764 is the same shape: the byte-pair script at
+   $8C61 names one of the eleven move handlers in the $8CC0 jump table and
+   supplies the source direction flag.  Move 9 is the death state and 10 the
+   victory state; neither appears in the script, they are forced by the HP
+   check at $87D2, which the port's own defeat path already covers. */
+static const unsigned char g_boss10_script[]={
+     1,0, 11,1,  1,1,  3,0,  6,1, 11,1,  8,0,  3,0,
+     7,0,  8,1,  2,1, 11,1,  2,0,  4,1,  4,1,  1,1,
+    11,1,  5,1, 11,0,  1,1, 11,1,  2,0,  4,1,  7,0,
+     3,0,  6,1, 11,1,  4,1,  7,0,  1,1, 11,1,  8,1,
+     1,1, 11,1,  8,0,  2,0, 11,0,  4,1,  7,0,  3,0,
+     6,1, 11,1,  3,0,  3,0,  5,0,  1,1, 11,1, 0x88
+};
+/* $8BC8: the acceleration ramp every charge indexes with its own frame
+   counter.  The source runs off the end of the table into the hop arc below
+   for a charge that lasts more than 64 frames; none can, because both ends
+   of the room are reached first, so the port clamps on the saturated 10. */
+static const unsigned char g_boss10_ramp[64]={
+    0x01,0x01,0x02,0x02,0x02,0x02,0x03,0x03,0x03,0x03,0x03,0x04,0x04,0x04,0x04,0x04,
+    0x05,0x05,0x05,0x05,0x06,0x06,0x06,0x06,0x06,0x07,0x07,0x07,0x07,0x07,0x08,0x08,
+    0x08,0x08,0x08,0x08,0x08,0x09,0x09,0x09,0x09,0x09,0x09,0x0A,0x0A,0x0A,0x0A,0x0A,
+    0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A,0x0A
+};
+/* $8C1B: the hop arc, applied to Y one entry a frame. */
+static const unsigned char g_boss10_hop[39]={
+    0xFA,0xFA,0xFB,0xFB,0xFB,0xFC,0xFC,0xFC,0xFC,0xFD,0xFD,0xFD,0xFD,
+    0xFE,0xFE,0xFE,0xFE,0xFF,0xFF,0x01,0x01,0x02,0x02,0x02,0x02,0x03,
+    0x03,0x03,0x03,0x04,0x04,0x04,0x04,0x05,0x05,0x05,0x06,0x06,0x88
+};
+/* $8C42: the arc the spat pot follows before $8B58 hands it to the room's
+   object slot and it becomes an ordinary throwable. */
+static const unsigned char g_boss10_pot[31]={
+    0xFE,0xFE,0xFE,0xFE,0xFF,0xFF,0xFF,0xFF,0x00,0x00,0x01,
+    0x01,0x01,0x01,0x02,0x02,0x02,0x02,0x03,0x03,0x03,0x03,
+    0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x88
+};
+
+/* $8764's object coordinates, in room space.  The ostrich metasprite (IDs
+   588-591) is anchored bottom-centre with bbox x0 = -40, and the supplied
+   strip puts its art at canvas x 8 and bottom-aligns every pose on canvas
+   row 107, so room_x = md_x - $B0 and room_y = md_y - $EC.  The check on
+   that pair is the handler's own centre: $100 lands the 80-pixel body on the
+   middle of the 256-pixel room, and $B0/$150 come out symmetric about it. */
+#define BOSS10_X(md) ((md)-176)
+#define BOSS10_Y(md) ((md)-236)
+#define BOSS10_MIN_X      BOSS10_X(0x28)    /* charge target, fully off left  */
+#define BOSS10_MAX_X      BOSS10_X(0x1CC)   /* charge target, fully off right */
+#define BOSS10_MID_X      BOSS10_X(0x100)   /* where the walk-on stops        */
+#define BOSS10_RIGHT_STOP BOSS10_X(0x150)
+#define BOSS10_LEFT_STOP  BOSS10_X(0xB0)
+#define BOSS10_AIR_Y      BOSS10_Y(0xC8)
+#define BOSS10_GROUND_Y   BOSS10_Y(0x110)
+
 static Crate g_crates[MAX_CRATES];
 static Gem g_gems[MAX_GEMS];
 static Enemy g_enemies[MAX_ENEMIES];
@@ -2474,7 +2527,11 @@ static int later_boss_frame(const BossVisualData *v)
         else if(boss8_spinning())frame=2+(t/4)%3;
         else frame=(t/4)&1;
         break; /* Pig */
-    case 2: frame=(t/8)%3;break;                              /* ostrich */
+    /* Ostrich strip: 0 and 1 are the two 96-pixel running poses and 2 is the
+       taller pose the rider throws from, so it belongs to move 11 alone.
+       Every pose is bottom-aligned in the shared canvas, so the extra height
+       grows upward and the feet stay put. */
+    case 2: frame=(g_boss_action==11)?2:((t/6)&1);break;      /* ostrich */
     case 3: frame=g_boss_shot_active?3+(t/8)%7:(t/8)%3;break; /* tank */
     case 4: frame=g_boss_shot_active?3+(t/8)%2:(t/8)%3;break; /* mage */
     default:frame=g_boss_shot_active?2+(t/8)%3:(t/8)%2;break; /* elephant */
@@ -3026,10 +3083,11 @@ static void start_boss(int fade_in)
     x=bv?bv->spawn_x:(int)bp[0]-128; y=bv?bv->spawn_y:(int)bp[1]-128;
     if(x<-96||x>256)x=172;
     if(y<-64||y>192)y=104;
-    /* Boss 4's supplied ostrich strip is authored 17 pixels below the old
-       capture origin. Move the actor itself so the visual, hitbox and sweep
-       all share the corrected Y axis. */
-    if(g_boss_class==2)y+=17;
+    /* Boss 4's own loader record is (336,272), which the ostrich mapping
+       turns into the right-hand rest position its script charges back to.
+       The hand-picked spawn the placeholder sweep used is not on the axis
+       the transcribed handler moves along. */
+    if(g_boss_class==2){x=BOSS10_X((int)bp[0]);y=BOSS10_Y((int)bp[1]);}
     /* Boss 3's object X is drawn through a bottom-centre metasprite anchor
        (bbox x0 = -32).  Fold that into the actor so motion, art and hitbox
        all share one coordinate. */
@@ -3037,7 +3095,7 @@ static void start_boss(int fade_in)
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
-    g_boss_action=0;g_boss_action_timer=(g_boss_class==1)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
+    g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
     g_boss8_crate=-1;
 
     /* Exact 1P HP table $6D6E: 8,8,10,10,12,12,12 for the seven bosses.
@@ -3134,6 +3192,31 @@ static int boss8_drop_crate(void)
         c->x=g_boss_x+(s32)20*FIX_ONE;
         c->y=g_boss_y+(s32)48*FIX_ONE;
         c->vx=0;c->vy=(s32)2*FIX_ONE-80;
+        g_boss8_crate=i;
+        return 1;
+    }
+    return 0;
+}
+
+/* $8ACE, move 11.  The ostrich spits a pot out behind itself: the object
+   starts $32 ahead of its origin on the side it came from, walks one pixel a
+   frame the way it is looking away from, and follows the $8C42 arc.  Only
+   when the arc runs out does $8B58 copy it into the room's own object slot,
+   which is the moment it becomes a box Mario can pick up.  $8ADA skips the
+   whole move while that slot is still occupied. */
+static int boss10_drop_pot(void)
+{
+    int i;
+    for(i=0;i<MAX_CRATES;++i)
+        if(g_crates[i].active&&!g_crates[i].carried&&!g_crates[i].thrown)return 0;
+    for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
+        Crate *c=&g_crates[i];
+        c->active=1;c->carried=0;c->thrown=0;c->extra=1;c->flight_timer=0;
+        /* Pot metasprite $B2's bbox starts at (0,8) from the object origin,
+           so the two source offsets land these two room positions. */
+        c->x=g_boss_x+(s32)(g_boss_action_dir?-2:82)*FIX_ONE;
+        c->y=g_boss_y+(s32)56*FIX_ONE;
+        c->vx=0;c->vy=-80;
         g_boss8_crate=i;
         return 1;
     }
@@ -3330,12 +3413,94 @@ static void update_boss_motion(void)
         if(state!=6&&state!=7)boss8_common_tail();
         break;
     }
-    case 2: /* level 10: whole-screen sweeps visible in $886E/$88A2 */
-        if((t%160)==0){g_boss_phase^=1;g_boss_vx=g_boss_phase?2*FIX_ONE:-2*FIX_ONE;}
-        g_boss_x+=g_boss_vx;bx=(int)(g_boss_x>>FIX_SHIFT);
-        if(bx<-88){g_boss_x=(s32)-88*FIX_ONE;g_boss_vx=2*FIX_ONE;}if(bx>332){g_boss_x=(s32)332*FIX_ONE;g_boss_vx=-2*FIX_ONE;}
-        g_boss_face=(g_boss_vx<0)?-1:1;if((t%80)==0)boss_fire_at_player(4);
+    case 2: { /* level 10/$8764, transcribed from the 68000 handler */
+        int state,dir,step;
+        const unsigned char *p;
+        /* $8764's init byte is represented by a negative timer, as for the
+           pig above: the previous move keeps its pose for the frame in which
+           the source clears it. */
+        if(g_boss_action_timer<0){
+            p=&g_boss10_script[g_boss_script_index*2];
+            if(p[0]==0x88){g_boss_script_index=0;p=g_boss10_script;}
+            g_boss_action=p[0];g_boss_action_dir=p[1];++g_boss_script_index;
+            g_boss_action_timer=0;g_boss_phase=0;
+            /* The supplied ostrich strip is drawn facing left, which is the
+               source's direction 0, so only rightward moves are flipped. */
+            g_boss_face=g_boss_action_dir?-1:1;
+        }
+        state=g_boss_action;dir=g_boss_action_dir;
+        bx=(int)(g_boss_x>>FIX_SHIFT);
+        g_boss_vx=0;g_boss_vy=0;
+        if(state==1||state==2){ /* $8806 / $883A: 80 frames of flat walking */
+            step=(state==1)?1:2;
+            g_boss_vx=(s32)(dir?step:-step)*FIX_ONE;
+            g_boss_x+=g_boss_vx;
+            if(++g_boss_action_timer>=0x50)g_boss_action_timer=-1;
+        }else if(state==3||state==4){ /* $886E / $88A2: accelerating charge */
+            step=g_boss10_ramp[(g_boss_action_timer<64)?g_boss_action_timer:63];
+            g_boss_vx=(s32)(state==3?-step:step)*FIX_ONE;
+            g_boss_x+=g_boss_vx;++g_boss_action_timer;
+            bx=(int)(g_boss_x>>FIX_SHIFT);
+            if(state==3?(bx<=BOSS10_MIN_X):(bx>=BOSS10_MAX_X))g_boss_action_timer=-1;
+        }else if(state==5){ /* $88D6: re-enter from a corner and walk to centre */
+            if(!g_boss_phase){
+                g_boss_phase=1;
+                g_boss_x=(s32)(dir?BOSS10_MIN_X:BOSS10_MAX_X)<<FIX_SHIFT;
+                g_boss_y=(s32)(dir?BOSS10_AIR_Y:BOSS10_GROUND_Y)<<FIX_SHIFT;
+            }else{
+                g_boss_vx=(s32)(dir?1:-1)*FIX_ONE;
+                g_boss_x+=g_boss_vx;
+                if((int)(g_boss_x>>FIX_SHIFT)==BOSS10_MID_X)g_boss_action_timer=-1;
+            }
+        }else if(state==6||state==7){ /* $8946 / $89A0: corner charge, clamped */
+            if(!g_boss_phase){
+                /* Both handlers place themselves regardless of the script's
+                   direction byte: 6 always comes in from the left. */
+                g_boss_phase=1;
+                g_boss_x=(s32)((state==6)?BOSS10_MIN_X:BOSS10_MAX_X)<<FIX_SHIFT;
+                g_boss_y=(s32)((state==6)?BOSS10_AIR_Y:BOSS10_GROUND_Y)<<FIX_SHIFT;
+            }else{
+                step=g_boss10_ramp[(g_boss_action_timer<64)?g_boss_action_timer:63];
+                g_boss_vx=(s32)((state==6)?step:-step)*FIX_ONE;
+                g_boss_x+=g_boss_vx;++g_boss_action_timer;
+                bx=(int)(g_boss_x>>FIX_SHIFT);
+                if(state==6?(bx>=BOSS10_RIGHT_STOP):(bx<=BOSS10_LEFT_STOP)){
+                    g_boss_x=(s32)((state==6)?BOSS10_RIGHT_STOP:BOSS10_LEFT_STOP)<<FIX_SHIFT;
+                    g_boss_action_timer=-1;
+                }
+            }
+        }else if(state==8){ /* $89F8: the 38-step hop */
+            step=g_boss10_hop[g_boss_action_timer];
+            if(step==0x88)g_boss_action_timer=-1;
+            else{
+                g_boss_vy=(s32)(signed char)step*FIX_ONE;
+                g_boss_y+=g_boss_vy;++g_boss_action_timer;
+            }
+        }else if(state==11){ /* $8ACE: spit a pot out behind */
+            Crate *c=(g_boss8_crate>=0)?&g_crates[g_boss8_crate]:0;
+            if(!g_boss_phase){
+                g_boss_phase=1;
+                if(!boss10_drop_pot())g_boss_action_timer=-1;
+            }else if(!c||!c->active||c->carried||c->thrown)g_boss_action_timer=-1;
+            else{
+                step=g_boss10_pot[g_boss_action_timer];
+                if(step==0x88){
+                    /* $8B58 releases it into the room, and $8B80 throws it
+                       away again if the arc carried it off the playfield. */
+                    bx=(int)(c->x>>FIX_SHIFT);
+                    if(bx+CRATE_W<0||bx>256)c->active=0;
+                    g_boss8_crate=-1;g_boss_action_timer=-1;
+                }else{
+                    /* update_crates() adds one gravity step before it moves,
+                       so cancel it and carry the table's own displacement. */
+                    c->x+=(s32)(dir?-1:1)*FIX_ONE;
+                    c->vy=(s32)(signed char)step*FIX_ONE-80;
+                    ++g_boss_action_timer;
+                }
+            }
+        }else g_boss_action_timer=-1;   /* 9/10 are the death and win states */
         break;
+    }
     case 3: { /* level 13/$8CEC: wait on either carrier, then cross by arc */
         int q=t%160,from=(t/160)&1,to=from^1,step;
         int fx=(int)(g_moving_platforms[from].x>>FIX_SHIFT),fy=(int)(g_moving_platforms[from].y>>FIX_SHIFT)-64;
@@ -3410,8 +3575,13 @@ static void update_boss_actor(void)
         }
     }
     /* The source dispenser ($7958) waits while its previous crate object is
-       live.  Do the same so unused ammunition cannot carpet the catwalk. */
-    if(g_boss_class!=3&&g_boss_class!=1&&g_boss_invuln==0&&(g_boss_timer%120)==1){
+       live.  Do the same so unused ammunition cannot carpet the catwalk.
+       Bosses whose own handler supplies the throwable are excluded: the pig
+       lowers crates from $8564, boss 5 drops bombs, and the ostrich spits a
+       pot out of move 11.  Leaving the generic dispenser on for those parks
+       a box in the room permanently, and their handlers then skip their own
+       drop for ever because the source's occupancy check sees it. */
+    if(g_boss_class!=3&&g_boss_class!=1&&g_boss_class!=2&&g_boss_invuln==0&&(g_boss_timer%120)==1){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
         if(!any_crate)for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
