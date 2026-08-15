@@ -44,7 +44,7 @@
 #define HUD_DIGIT_BASE_WORD 0x7040
 /* 0x7300..0x73C0 [play] level 2/6/8 carrier, 48x16 */
 #define PLATFORM_BASE_WORD 0x7300
-/* 0x7400..0xA100 [play] per-level enemy variant banks */
+/* 0x7400..0x8600 [play] per-level enemy variant banks */
 #define ENEMY_BASE_WORD 0x7400
 /* 0x7400..0xBD80 [boss] boss body poses (Bowser uses the ten-pose bank) */
 #define BOSS_BASE_WORD 0x7400
@@ -66,12 +66,14 @@
 #define LEVEL8_WEDGE_R_BASE_WORD 0xB900
 /* 0xBC00..0xBD80 [play] level 8 down-left wedge, 32x48 */
 #define LEVEL8_WEDGE_L_BASE_WORD 0xBC00
-/* 0xBD80..0xC680 [play] third live cel for the pterodactyl/floor-attacker variants */
+/* 0xBD80..0xC680 [play] extra live cels: pterodactyl/floor-attacker third pose plus every variant attack pose */
 #define ENEMY_ALT_BASE_WORD 0xBD80
-/* 0xC800..0xDE80 [play] per-variant hit frame */
+/* 0xC800..0xD100 [play] per-variant hit frame */
 #define ENEMY_HIT_BASE_WORD 0xC800
 /* 0xDA00..0xDA40 [play] thrown banana (levels with monkeys) */
 #define ENEMY_BANANA_BASE_WORD 0xDA00
+/* 0xDA40..0xDB40 [play] thrown rock/spear for the $C0C6 and $BAD6 throwers */
+#define ENEMY_SHOT_BASE_WORD 0xDA40
 /* 0xDD00..0xDE80 [boss] Bowser flame */
 #define BOWSER_FLAME_BASE_WORD 0xDD00
 /* 0xE000..0xE900 [boss] ring/hammer/pot/bell/bomb/crate4/platform */

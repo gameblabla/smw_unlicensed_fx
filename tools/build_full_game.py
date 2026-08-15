@@ -330,6 +330,32 @@ def enemy_palette(r,gfx):
     pi=b16(r,0xF426+gfx*2); ptr=b32(r,0x72338+pi*4)
     return [ba.rgb_to_yuv(*ba.genesis_cram_rgb(b16(r,ptr+i*2))) for i in range(16)]
 
+# Metasprite each throwing handler creates for its projectile, and the cell
+# grid it needs.  $C31A (states 7 and 8) throws metasprite $1E3, $BC02 (state
+# 13) throws the $207 spear.  The tiles are not shared: each family loads its
+# own copy at the tail of graphics selector 3, so the monkey throws a banana,
+# the level 9 thrower a rock and the spearman a spear from the same records.
+ENEMY_SHOT_ART={7:(0x1E3,1,1), 12:(0x207,2,1)}
+
+def make_enemy_shot(r,gfx,mid,cols,rows,yoff=4):
+    """Pack one family's projectile out of its own graphics selector 3."""
+    allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text())
+    m={x['id']:x for x in allm}[mid]
+    tbl=b32(r,0x7246C+gfx*4); ptr=b32(r,tbl+3*4); next_ptr=b32(r,tbl+4*4)
+    addr=ba.vdp_addr(b32(r,0xF454)); vv=bytearray(65536)
+    vv[addr:addr+next_ptr-ptr]=r[ptr:next_ptr]
+    canvas=[[0]*(cols*16) for _ in range(rows*16)]
+    for part in m['parts']:
+        ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],
+                                    part['height_tiles'],canvas,part['x_offset'],
+                                    part['y_offset']+yoff)
+    words=[]
+    for cy in range(rows):
+        for cx in range(cols):
+            words.extend(ba.encode_sprite_cell(
+                [[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]))
+    return words
+
 def make_monkey_banana(r):
     """Pack metasprite $1E3 created by monkey handler $C31A."""
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());m={x['id']:x for x in allm}[0x1E3]
@@ -484,10 +510,17 @@ def build_enemy_variants(r,levels):
         # second flight pose and the floor attacker's second strike pose.  They
         # get their own bank now that the hit bank carries a real death pose.
         alt=entry(1,1) if gfx in (3,4) else None
+        # Frame 0 of the attack script is the pose $C0C6/$BAD6 and friends
+        # select by writing 1 to the object's animation-state word before they
+        # throw.  Families whose second walk cel already *is* that pose (1 and
+        # 4 above) do not need a second copy of it.
+        atk=scripts[1][0] if scripts[1] and gfx not in (1,4) else None
+        if atk and (atk==walk[0] or atk==walk[1]): atk=None
 
         poses=[(sel,script_shape(allm,byid,ms,want_tile)) for sel,ms in walk]
         poses.append((hit[0],script_shape(allm,byid,hit[1],want_tile)) if has_hit_frame else poses[0])
         if alt: poses.append((alt[0],script_shape(allm,byid,alt[1],want_tile)))
+        if atk: poses.append((atk[0],script_shape(allm,byid,atk[1],want_tile)))
 
         # One cell grid has to cover every pose the variant can strike, so it
         # is the union of their shapes rather than the walking size.  Family 9
@@ -500,7 +533,9 @@ def build_enemy_variants(r,levels):
         for sel,m in poses[:3]:
             words,mask=pack(sel,m,cols,rows); frames.extend(words); masks.append(mask)
         alt_words=alt_mask=None
+        atk_words=atk_mask=None
         if alt: alt_words,alt_mask=pack(*poses[3],cols,rows)
+        if atk: atk_words,atk_mask=pack(*poses[-1],cols,rows)
 
         # Collision keeps the walking silhouette; the taller hit pose must not
         # widen the box Mario stomps.
@@ -508,9 +543,13 @@ def build_enemy_variants(r,levels):
         height=max(poses[0][1]['bbox'][3],poses[1][1]['bbox'][3])+1
         if gfx==1: width,height=32,48   # mimic hides its legs until it walks
         elif gfx==3: width,height=32,48 # floor attacker rises out of the floor
+        shot=ENEMY_SHOT_ART.get(gfx)
         variants.append(dict(key=(gfx,base,sub),words=frames,masks=masks,palette=enemy_palette(r,gfx),width=width,height=height,
                              cols=cols,rows=rows,has_hit_frame=has_hit_frame,
-                             alt_words=alt_words,alt_mask=alt_mask or 0))
+                             alt_words=alt_words,alt_mask=alt_mask or 0,
+                             atk_words=atk_words,atk_mask=atk_mask or 0,
+                             shot_words=make_enemy_shot(r,gfx,*shot) if shot else None,
+                             shot_cols=shot[1] if shot else 0))
         print('variant',idx,(gfx,base,sub),'wh',width,height,'grid',cols,rows,'mask',masks)
     keyidx={v['key']:i for i,v in enumerate(variants)}
     # The 68000 dispatch selects behavior from the authored object family and
@@ -524,6 +563,8 @@ def build_enemy_variants(r,levels):
         if gfx==5 and state==6: return 3  # long-strike snake
         if gfx==1 and state==2: return 4  # crate mimic
         if gfx==3 and state==4: return 5  # floor-opening snake $C62C
+        if state==8: return 8   # $C0C6: stationary thrower, never walks
+        if state==13: return 9  # $BAD6: walks, then stops to throw its spear
         return 0
 
     # Localize variants per level and rewrite enemy records as
@@ -920,6 +961,14 @@ STAGE_OBJECT_KINDS={
 # and the hand-built level-2/6 lifts.
 STAGE_OBJECT_SKIP_SLOTS={2,6,8}
 
+# Sprite CRAM line each level's stage objects draw from, in the kit's
+# palette.csv ordering.  The metasprite attribute is not usable here: the kit
+# dumps the four lines in its own order, so the attribute's line number only
+# happens to agree for some levels.  These are the lines that reproduce the
+# Mega Drive's own colours (level 9's ledges are brown, not green; level 19's
+# girder is gold, not green).  The port used to force line 2 everywhere.
+STAGE_OBJECT_PAL_LINE={9:3, 10:3, 11:2, 12:2, 13:2, 15:3, 17:2, 18:2, 19:2}
+
 def stage_object_path(r):
     """The 80 (dx,dy) steps handler 7 walks, from the byte table at $FA58."""
     out=[]
@@ -970,11 +1019,7 @@ def make_stage_objects(r):
         ids=[]
         for rec in recs:
             if rec[4] not in ids: ids.append(rec[4])
-        # Every stage object draws from line 2 of the extracted stage palette,
-        # the same line make_level8_platform_words() uses for the level-8
-        # carriers.  The metasprite attribute names CRAM line 3, so the kit's
-        # palette.csv does not store the sprite lines in hardware order.
-        line=2
+        line=STAGE_OBJECT_PAL_LINE.get(slot,2)
         shapes=[]; words=[]
         for mid in ids:
             parts=metasprite(mid)
@@ -1168,11 +1213,11 @@ def main():
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
-        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_FRAME_WORDS 576')
+        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_KIND_THROWER 8\n#define ENEMY_KIND_SPEARMAN 9\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1;',
-                  'const unsigned short *words,*palette,*alt_words; unsigned short mask0,mask1,mask2,alt_mask;')
+                  'const unsigned short *words,*palette,*alt_words,*atk_words,*shot_words; unsigned short mask0,mask1,mask2,alt_mask,atk_mask;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',
-                  'unsigned char width,height,cols,rows,has_hit_frame; } EnemyVariantData;')
+                  'unsigned char width,height,cols,rows,has_hit_frame,shot_cols; } EnemyVariantData;')
     hs=hs.replace('typedef struct { unsigned char set_index, route_len;',
         'typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;\ntypedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;\ntypedef struct { unsigned char set_index, route_len;')
     hs=hs.replace('g_bowser_words[],g_bowser_palette[16];','g_bowser_words[],g_bowser_flame_words[],g_bowser_special_words[],g_bowser_palette[16];\nextern const unsigned short g_level6_platform_words[192];\nextern const short g_level8_carriers[][3];\nextern const unsigned short g_level8_carrier_count;\nextern const unsigned short g_level8_platform_words[192],g_level8_wedge_right_words[768],g_level8_wedge_left_words[384],g_level8_object_palette[16];\ntypedef struct { const unsigned short *words,*shapes,*palette; const short *records; unsigned short word_count; unsigned char shape_count, record_count; } StageObjectData;\nextern const StageObjectData g_stage_objects[19];\nextern const signed char g_stage_object_path[160];\n#define STAGE_OBJECT_SHAPE_WORDS 7\n#define STAGE_OBJECT_RECORD_WORDS 4')
@@ -1199,9 +1244,17 @@ def main():
         for slot in range(1,20):
             route,modes,quads=routes[slot]; emit_u8(f,f'level{slot:02d}_route',route,static=True);emit_u8(f,f'level{slot:02d}_modes',modes,static=True);emit_u8(f,f'level{slot:02d}_quads',quads,static=True);emit_u16(f,f'level{slot:02d}_pal',palettes[slot],static=True)
             lev=levels[slot-1];emit_s16(f,f'level{slot:02d}_crates',lev['crates'],static=True);emit_s16(f,f'level{slot:02d}_gems',lev['gems'],static=True);emit_s16(f,f'level{slot:02d}_enemies',lev['enemy_records'],static=True);emit_u8(f,f'level{slot:02d}_variants',lev['variant_ids'],static=True)
+        shot_syms={}
         for i,v in enumerate(variants):
             emit_u16(f,f'enemy_variant_{i:02d}_words',v['words'],static=True);emit_u16(f,f'enemy_variant_{i:02d}_pal',v['palette'],static=True)
             if v['alt_words']: emit_u16(f,f'enemy_variant_{i:02d}_alt',v['alt_words'],static=True)
+            if v['atk_words']: emit_u16(f,f'enemy_variant_{i:02d}_atk',v['atk_words'],static=True)
+            # Every variant of a throwing family carries the same projectile,
+            # so emit one array per family and let them share it: the runtime
+            # dedupes the VRAM upload on the pointer.
+            if v['shot_words'] and v['key'][0] not in shot_syms:
+                shot_syms[v['key'][0]]=f'enemy_shot_gfx{v["key"][0]:02d}'
+                emit_u16(f,shot_syms[v['key'][0]],v['shot_words'],static=True)
         emit_u16(f,'g_monkey_special_words',monkeyspecial);emit_u16(f,'g_monkey_special_masks',monkeyspecialmasks)
         emit_u16(f,'g_crate_walk_words',cratewalk);emit_u16(f,'g_crate_walk_masks',cratewalkmasks)
         emit_u16(f,'g_level8_snake_words',snakewords);emit_u16(f,'g_level8_snake_masks',snakemasks);emit_u16(f,'g_level8_snake_palette',snakepal)
@@ -1209,7 +1262,9 @@ def main():
         f.write('const EnemyVariantData g_enemy_variants[] = {\n')
         for i,v in enumerate(variants):
             alt=f'enemy_variant_{i:02d}_alt' if v['alt_words'] else '0'
-            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])}}},\n')
+            atk=f'enemy_variant_{i:02d}_atk' if v['atk_words'] else '0'
+            shot=shot_syms.get(v['key'][0],'0') if v['shot_words'] else '0'
+            f.write(f'  {{enemy_variant_{i:02d}_words,enemy_variant_{i:02d}_pal,{alt},{atk},{shot},0x{v["masks"][0]:04X},0x{v["masks"][1]:04X},0x{v["masks"][2]:04X},0x{v["alt_mask"]:04X},0x{v["atk_mask"]:04X},{v["width"]},{v["height"]},{v["cols"]},{v["rows"]},{int(v["has_hit_frame"])},{v["shot_cols"]}}},\n')
         f.write('};\n\n');emit_u16(f,'g_monkey_banana_words',bananawords)
         for i,so in enumerate(stageobjs):
             if not so['records']: continue

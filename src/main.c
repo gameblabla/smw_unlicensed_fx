@@ -223,6 +223,10 @@ typedef struct {
     unsigned char behavior_phase;
     unsigned char behavior_timer;
     unsigned char face_right;
+    /* Slot+1 of the projectile this enemy currently owns, 0 when it has none.
+       $C25C/$BB98 both drive their throw phase off "is my next object slot
+       still occupied", which is what this reproduces. */
+    unsigned char shot_slot;
 } Enemy;
 
 typedef struct {
@@ -250,7 +254,14 @@ typedef struct {
     unsigned char grounded;  /* cleared while the item is still dropping */
 } Item;
 
-typedef struct { s32 x,y,vx,vy; unsigned char active,palette; } EnemyShot;
+/* mode 0 is the monkey's thrown banana, which arcs under the normal object
+   gravity.  Mode 1 is $C25C's rock: its horizontal speed walks the $C360
+   deceleration table while $C2A8 adds a flat two pixels of drop.  Mode 2 is
+   $BB98's spear, which only ever changes X. */
+#define SHOT_MODE_ARC   0
+#define SHOT_MODE_ROCK  1
+#define SHOT_MODE_SPEAR 2
+typedef struct { s32 x,y,vx,vy; u16 base; unsigned char active,palette,cols,mode,step; } EnemyShot;
 
 typedef struct {
     s32 x, y;
@@ -348,8 +359,13 @@ static unsigned char g_enemy_palette_line[16];
    its widest pose needs, so the per-level banks are packed rather than
    strided.  upload_game_sprites() records where each one landed. */
 static u16 g_enemy_vram[16],g_enemy_hit_vram[16],g_enemy_alt_vram[16];
-/* Size of the ENEMY_ALT bank in tools/vram_map.py. */
+/* Attack poses share the ENEMY_ALT arena: only two variants ever own a third
+   live cel, so the rest of that bank is free for the state-1 script pose the
+   throwing handlers select. */
+static u16 g_enemy_atk_vram[16],g_enemy_shot_vram[16];
+/* Size of the ENEMY_ALT and ENEMY_SHOT banks in tools/vram_map.py. */
 #define ENEMY_ALT_WORDS 2304
+#define ENEMY_SHOT_WORDS 256
 #define enemy_frame_words(v) ((int)(v)->cols*(int)(v)->rows*64)
 static int g_in_boss=0;
 static int g_after_boss=0;
@@ -426,6 +442,7 @@ static int g_moving_platform_count;
 static int g_on_moving_platform=-1;
 static int g_drop_platform_timer;
 static const StageObjectData *stage_objects(void);
+static int throw_enemy_shot(Enemy *e, int yoff, int xoff, int speed, int mode);
 static int platform_width(const MovingPlatform *p);
 static int platform_height(const MovingPlatform *p);
 static int platform_draw_x(const MovingPlatform *p);
@@ -775,7 +792,7 @@ static int palettes_equal(const unsigned short *a, const unsigned short *b)
 
 static void upload_game_sprites(void)
 {
-    int i,j,uniq=0,walk_top=0,hit_top=0,alt_top=0;
+    int i,j,uniq=0,walk_top=0,hit_top=0,alt_top=0,shot_top=0;
     const unsigned short *seen[12];
     /* Keep a dedicated copy of the player palette for boss rooms. Normal
        stages use source palette line 0 directly; every generated level carries
@@ -843,6 +860,7 @@ static void upload_game_sprites(void)
     if (!g_in_boss && g_level) {
         if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
         walk_top=ENEMY_BASE_WORD; hit_top=ENEMY_HIT_BASE_WORD; alt_top=ENEMY_ALT_BASE_WORD;
+        shot_top=ENEMY_SHOT_BASE_WORD;
         for(i=0;i<g_level->variant_count;++i) {
             int gi=g_level->variant_ids[i]; const EnemyVariantData *v=&g_enemy_variants[gi]; int line=-1;
             int fw=enemy_frame_words(v);
@@ -864,6 +882,30 @@ static void upload_game_sprites(void)
                 vdc_set_vram_write(FRONT_CHIP,(u16)alt_top);
                 for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->alt_words[j]);
                 alt_top+=fw;
+            }
+            g_enemy_atk_vram[i]=(u16)alt_top;
+            if(v->atk_words&&alt_top+fw<=ENEMY_ALT_BASE_WORD+ENEMY_ALT_WORDS){
+                vdc_set_vram_write(FRONT_CHIP,(u16)alt_top);
+                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->atk_words[j]);
+                alt_top+=fw;
+            }else g_enemy_atk_vram[i]=0;
+            /* Each throwing family carries its own copy of the projectile at
+               the tail of graphics selector 3, so the rock and the spear are
+               uploaded per variant rather than once per level. */
+            /* Every variant of a throwing family shares one projectile array,
+               so upload it once and point the rest of the family at it. */
+            g_enemy_shot_vram[i]=0;
+            if(v->shot_words){
+                for(j=0;j<i;++j)
+                    if(g_enemy_variants[g_level->variant_ids[j]].shot_words==v->shot_words){
+                        g_enemy_shot_vram[i]=g_enemy_shot_vram[j];break;
+                    }
+                if(!g_enemy_shot_vram[i]&&shot_top+v->shot_cols*64<=ENEMY_SHOT_BASE_WORD+ENEMY_SHOT_WORDS){
+                    g_enemy_shot_vram[i]=(u16)shot_top;
+                    vdc_set_vram_write(FRONT_CHIP,(u16)shot_top);
+                    for(j=0;j<v->shot_cols*64;++j)vdc_vram_write(FRONT_CHIP,v->shot_words[j]);
+                    shot_top+=v->shot_cols*64;
+                }
             }
         }
         /* The snake strike is a genuine 64x40 metasprite and cannot share the
@@ -1640,7 +1682,7 @@ static void init_objects(void)
             g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA||e[7]==ENEMY_KIND_CHIP);
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
-            g_enemies[i].face_right=0;
+            g_enemies[i].face_right=0;g_enemies[i].shot_slot=0;
 #ifdef FORCE_ENEMY_ACTION
             if(g_enemies[i].state==2||g_enemies[i].state==4||g_enemies[i].state==5||g_enemies[i].state==6||g_enemies[i].state==7){
                 g_enemies[i].behavior_phase=1;g_enemies[i].behavior_timer=40;
@@ -2108,7 +2150,8 @@ static void update_enemies(void)
                         int k;e->behavior_phase=2;e->behavior_timer=0;
                         for(k=0;k<4;++k)if(!g_enemy_shots[k].active){
                             EnemyShot *s=&g_enemy_shots[k];s->active=1;s->x=e->x+16*FIX_ONE;s->y=e->y+24*FIX_ONE;
-                            s->vx=(px<x)?-2*FIX_ONE:2*FIX_ONE;s->vy=-2*FIX_ONE;s->palette=g_enemy_palette_line[e->variant];break;
+                            s->vx=(px<x)?-2*FIX_ONE:2*FIX_ONE;s->vy=-2*FIX_ONE;s->palette=g_enemy_palette_line[e->variant];
+                            s->base=ENEMY_BANANA_BASE_WORD;s->cols=1;s->mode=SHOT_MODE_ARC;s->step=0;break;
                         }
                         e->behavior_phase=3;
                     }
@@ -2152,6 +2195,45 @@ static void update_enemies(void)
                    solver, so it walks left/right, lands on terrain and turns
                    at walls/crates just like a Goomba instead of hovering at
                    its authored Y coordinate. */
+            }else if(e->kind==ENEMY_KIND_THROWER){
+                /* State 8, ROM $C0C6.  This one never walks: it stands for 96
+                   frames, turns to face the player, plays the attack pose
+                   while $C25C carries its rock, then recovers for 48 more.
+                   The port used to run it through the generic Goomba solver,
+                   which is why it wandered off its authored spot. */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0){
+                    if(++e->behavior_timer>=96){
+                        e->behavior_timer=0;e->behavior_phase=1;
+                        e->face_right=(unsigned char)(px>=x);
+                        e->shot_slot=(unsigned char)(throw_enemy_shot(e,18,0,6,SHOT_MODE_ROCK)+1);
+                    }
+                }else if(e->behavior_phase==1){
+                    /* $C2BC waits for the projectile slot to clear. */
+                    if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
+                        e->shot_slot=0;e->behavior_phase=2;e->behavior_timer=0;
+                    }
+                }else if(++e->behavior_timer>=48){e->behavior_phase=0;e->behavior_timer=0;}
+                y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->kind==ENEMY_KIND_SPEARMAN){
+                /* State 13, ROM $BAD6.  Unlike the thrower this one really
+                   does patrol, so it keeps the generic terrain solver below
+                   and only stops while $BB98 has a spear in flight. */
+                if(e->behavior_phase==0){
+                    if(e->behavior_timer==0)e->behavior_timer=(unsigned char)(30+(g_state_frame&127));
+                    if(--e->behavior_timer==0){
+                        e->behavior_phase=1;e->vx=0;
+                        e->face_right=(unsigned char)(px>=x);
+                        e->shot_slot=(unsigned char)(throw_enemy_shot(e,8,0,2,SHOT_MODE_SPEAR)+1);
+                    }
+                }else{
+                    e->vx=0;
+                    if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
+                        e->shot_slot=0;e->behavior_phase=0;e->behavior_timer=0;
+                        e->vx=e->face_right?FIX_ONE:-FIX_ONE;
+                    }
+                    y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+                }
             }else if(e->kind==ENEMY_KIND_FLOOR_SNAKE){ /* fixed until its near-range strike */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0&&near<=64){e->behavior_phase=1;e->behavior_timer=0;}
@@ -2275,14 +2357,52 @@ enemy_attack_checks:
     }
 }
 
+/* $C31A and $BC02 both create the projectile in the object slot after the
+   thrower, at its own X and a fixed Y offset, then hand it a horizontal speed
+   in the facing direction.  Returns the slot used, or -1 when the four-shot
+   pool ($600..$660 in the source) is full. */
+static int throw_enemy_shot(Enemy *e, int yoff, int xoff, int speed, int mode)
+{
+    int k;
+    for(k=0;k<4;++k){
+        EnemyShot *s=&g_enemy_shots[k];
+        if(s->active)continue;
+        s->active=1;
+        s->x=e->x+(s32)(e->face_right?xoff:-xoff)*FIX_ONE;
+        s->y=e->y+(s32)yoff*FIX_ONE;
+        s->vx=(s32)(e->face_right?speed:-speed)*FIX_ONE;
+        s->vy=0;
+        s->mode=(unsigned char)mode;
+        s->step=0;
+        s->palette=g_enemy_palette_line[e->variant];
+        s->base=g_enemy_shot_vram[e->variant];
+        s->cols=g_enemy_variants[g_level->variant_ids[e->variant]].shot_cols;
+        if(!s->base||!s->cols){s->base=ENEMY_BANANA_BASE_WORD;s->cols=1;}
+        return k;
+    }
+    return -1;
+}
+
 static void update_enemy_shots(void)
 {
     int i,px=player_body_x(),py=player_body_y();
-    for(i=0;i<4;++i){EnemyShot *s=&g_enemy_shots[i];int x,y;if(!s->active)continue;
-        s->x+=s->vx;s->vy+=48;if(s->vy>4*FIX_ONE)s->vy=4*FIX_ONE;s->y+=s->vy;
+    /* $C360: the rock loses speed over its first 25 frames and then crawls. */
+    static const unsigned char rock_speed[25]={6,6,5,5,5,4,4,4,4,3,3,3,3,3,3,3,3,2,2,2,2,1,1,1,1};
+    for(i=0;i<4;++i){EnemyShot *s=&g_enemy_shots[i];int x,y,w;if(!s->active)continue;
+        if(s->mode==SHOT_MODE_ROCK){
+            int sp=rock_speed[s->step<25?s->step:24];
+            if(s->step<255)++s->step;
+            s->x+=(s32)((s->vx<0)?-sp:sp)*FIX_ONE;
+            s->y+=2*FIX_ONE;
+        }else if(s->mode==SHOT_MODE_SPEAR){
+            s->x+=s->vx;
+        }else{
+            s->x+=s->vx;s->vy+=48;if(s->vy>4*FIX_ONE)s->vy=4*FIX_ONE;s->y+=s->vy;
+        }
         x=(int)(s->x>>FIX_SHIFT);y=(int)(s->y>>FIX_SHIFT);
-        if(x<g_camera_x-24||x>g_camera_x+280||y>240){s->active=0;continue;}
-        if(g_invuln==0&&aabb(px,py,PLAYER_BODY_W,PLAYER_BODY_H,x,y,16,16)){hurt_player();s->active=0;}
+        if(x<g_camera_x-40||x>g_camera_x+280||y>240){s->active=0;continue;}
+        w=s->cols?s->cols*16:16;
+        if(g_invuln==0&&aabb(px,py,PLAYER_BODY_W,PLAYER_BODY_H,x,y,w,16)){hurt_player();s->active=0;}
     }
 }
 
@@ -2542,8 +2662,19 @@ static void draw_game_sprites(void)
         }
     }
 
+    /* Projectiles are emitted ahead of the enemies: a screen full of stage
+       objects can exhaust the 64-entry SATB, and dropping the thing that
+       hurts the player is worse than dropping one enemy cell. */
+    for(i=0;i<4&&n<62;++i)if(g_enemy_shots[i].active){
+        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-g_camera_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT);
+        int c;
+        for(c=0;c<g_enemy_shots[i].cols&&n<62;++c)
+            set_sprite_entry(satb,n++,sx+c*16,sy,(u16)(g_enemy_shots[i].base+c*64),
+                (u16)(VDC_SPR_PRIO_SP|g_enemy_shots[i].palette));
+    }
+
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
-        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0; unsigned mask; u16 flip,base;
+        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0,use_atk=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
@@ -2570,6 +2701,11 @@ static void draw_game_sprites(void)
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)anim=e->behavior_phase?((e->behavior_timer>32)?2:1):0;
+            /* The throwers write 1 into their animation-state word before the
+               projectile leaves, so both stay on the attack cel until it is
+               gone (and $C0C6 through its recovery count as well). */
+            else if(e->kind==ENEMY_KIND_THROWER)anim=e->behavior_phase?3:0;
+            else if(e->kind==ENEMY_KIND_SPEARMAN)anim=e->behavior_phase?3:(int)((g_state_frame/8)&1);
         }
 #ifdef FORCE_ENEMY_HURT
         if(v->has_hit_frame){use_hit_frame=1;anim=2;}
@@ -2597,26 +2733,25 @@ static void draw_game_sprites(void)
             /* Live third cels come from the alt bank; anim 2 otherwise means
                the hit pose, which can be a taller metasprite than the walk. */
             use_alt=(anim==2&&!use_hit_frame&&v->alt_words!=0);
-            mask=use_alt?v->alt_mask:(anim==2)?v->mask2:(anim?v->mask1:v->mask0);
+            use_atk=(anim==3&&v->atk_words!=0&&g_enemy_atk_vram[li]!=0);
+            if(anim==3&&!use_atk)anim=0;   /* no captured attack pose: stand */
+            mask=use_atk?v->atk_mask:use_alt?v->alt_mask:(anim==2)?v->mask2:(anim?v->mask1:v->mask0);
             cols=grid_cols=v->cols;rows=v->rows;
         }
         if(special_snake)base=(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024);
         else if(special_monkey)base=(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
         else if(special_crate)base=(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
+        else if(use_atk)base=g_enemy_atk_vram[li];
         else if(use_alt)base=g_enemy_alt_vram[li];
         else if(use_hit_frame)base=g_enemy_hit_vram[li];
         else base=(u16)(g_enemy_vram[li]+(anim?enemy_frame_words(v):0));
-        flip=((e->kind==ENEMY_KIND_PTERODACTYL)?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
+        flip=((e->kind==ENEMY_KIND_PTERODACTYL||e->kind==ENEMY_KIND_THROWER||
+               (e->kind==ENEMY_KIND_SPEARMAN&&e->behavior_phase))?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
         for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
             int cell=cy*grid_cols+cx,dx;
             if(!(mask&(1u<<cell)))continue;dx=flip?(cols-1-cx)*16:cx*16;
             set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
         }
-    }
-
-    for(i=0;i<4&&n<62;++i)if(g_enemy_shots[i].active){
-        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-g_camera_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT);
-        set_sprite_entry(satb,n++,sx,sy,ENEMY_BANANA_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|g_enemy_shots[i].palette));
     }
 
     if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<58){
