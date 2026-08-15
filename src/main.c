@@ -226,9 +226,10 @@ typedef struct {
 #define ITEM_FIREBALL    7
 
 typedef struct {
-    short x, y;
+    s32 x, y, vy;
     unsigned char active;
-    unsigned char kind;   /* ITEM_*, 1..ITEM_KIND_COUNT */
+    unsigned char kind;      /* ITEM_*, 1..ITEM_KIND_COUNT */
+    unsigned char grounded;  /* cleared while the item is still dropping */
 } Item;
 
 typedef struct { s32 x,y,vx,vy; unsigned char active,palette; } EnemyShot;
@@ -1580,6 +1581,12 @@ static int find_pickup_crate(void)
    up its contents once; here the crate survives the throw, and clearing extra
    is what keeps a single box from being farmed for ammo.
 
+   A crate is carried at chest height, so that spawn point lands inside the
+   player's own 28x44 pickup box: collected on the very frame it appears, the
+   item was never drawn once.  The item is therefore released a little above
+   the crate and dropped (see update_items), which is what puts it on screen
+   and lets it be walked into where it lands.
+
    Boss rooms are excluded because their crate slots reuse extra to carry the
    boss class for the pot/bomb/bell variants rather than an item id. */
 static void spawn_crate_item(Crate *c)
@@ -1588,8 +1595,10 @@ static void spawn_crate_item(Crate *c)
     if (g_in_boss || !c->extra || c->extra > ITEM_KIND_COUNT) return;
     for (i = 0; i < MAX_ITEMS; ++i) {
         if (g_items[i].active) continue;
-        g_items[i].x = (short)((int)(c->x >> FIX_SHIFT) + 4);
-        g_items[i].y = (short)((int)(c->y >> FIX_SHIFT) + 8);
+        g_items[i].x = c->x + (s32)4*FIX_ONE;
+        g_items[i].y = c->y - (s32)12*FIX_ONE;
+        g_items[i].vy = -(s32)3*FIX_ONE;
+        g_items[i].grounded = 0;
         g_items[i].kind = c->extra;
         g_items[i].active = 1;
         c->extra = 0;
@@ -1784,24 +1793,44 @@ static void apply_item(unsigned char kind)
 }
 
 /* $15984 tests the item pool against the player's whole 28x44 object box, not
-   the narrower body rectangle the port uses for terrain and enemies.  It has to
-   stay that tall: an item is freed level with the crate the player is holding,
-   which sits above the body box, so a body-sized test would leave the pickup
-   hanging out of reach over Mario's head. */
+   the narrower body rectangle the port uses for terrain and enemies.
+
+   The drop is the port's own: a freed item pops out of the crate and falls
+   under the same gravity a loose crate uses until it rests on the floor.  It
+   is only collectable once it has landed, so the pickup always plays out on
+   screen instead of being swallowed on its first frame, and an item that
+   lands away from the player waits there to be walked into. */
 static void update_items(void)
 {
     int i;
     int px = (int)(g_player_x >> FIX_SHIFT) + 4;
     int py = (int)(g_player_y >> FIX_SHIFT);
     if (g_enemy_freeze > 0) --g_enemy_freeze;
-    if (g_player_mode != PMODE_NORMAL) return;
     for (i = 0; i < MAX_ITEMS; ++i) {
-        if (!g_items[i].active) continue;
+        Item *it = &g_items[i];
+        int x, y, bottom;
+        if (!it->active) continue;
+        if (!it->grounded) {
+            it->vy += 48;
+            if (it->vy > 5*FIX_ONE) it->vy = 5*FIX_ONE;
+            it->y += it->vy;
+            x = (int)(it->x >> FIX_SHIFT); y = (int)(it->y >> FIX_SHIFT);
+            bottom = y + ITEM_H - 1;
+            if (y > 240) { it->active = 0; continue; }
+            if (it->vy >= 0 && (solid_v(x+3,bottom) || solid_v(x+ITEM_W-4,bottom))) {
+                it->y = (s32)(((bottom>>3)<<3) - ITEM_H) << FIX_SHIFT;
+                it->vy = 0;
+                it->grounded = 1;
+            }
+            continue;
+        }
+        if (g_player_mode != PMODE_NORMAL) continue;
         if (!aabb(px, py, 28, 44,
-                  g_items[i].x + 4, g_items[i].y, ITEM_W - 4, ITEM_H - 4)) continue;
-        g_items[i].active = 0;
+                  (int)(it->x >> FIX_SHIFT) + 4, (int)(it->y >> FIX_SHIFT),
+                  ITEM_W - 4, ITEM_H - 4)) continue;
+        it->active = 0;
         Play_Sound_Sample(SFX_MENU_CONFIRM,0,0);
-        apply_item(g_items[i].kind);
+        apply_item(it->kind);
     }
 }
 
@@ -2266,7 +2295,8 @@ static void draw_game_sprites(void)
     for (i = 0; i < MAX_ITEMS && n < 54; ++i) {
         int sx, sy;
         if (!g_items[i].active) continue;
-        sx = g_items[i].x - g_camera_x; sy = g_items[i].y;
+        sx = (int)(g_items[i].x >> FIX_SHIFT) - g_camera_x;
+        sy = (int)(g_items[i].y >> FIX_SHIFT);
         if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
         set_sprite_entry(satb,n++,sx,sy,
             (u16)(ITEM_BASE_WORD + (g_items[i].kind-1)*ITEM_CELL_WORDS),
