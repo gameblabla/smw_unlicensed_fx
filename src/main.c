@@ -370,11 +370,12 @@ static void enter_menu(void);
 static void enter_boot(void);
 static void start_boss(int fade_in);
 
-/* Boss 3 (level 8 slot) alternates between a slow patrol and a fast spin.
-   Actions 6 and 7 are the two spin paths. */
+/* Boss 3 (level 8 slot).  $80D8 selects animation $B=5 for every action from
+   6 up, so the two spin paths (6/7) and the crate drop (8) all play the spin
+   strip; only the patrol actions below 6 use the walk poses. */
 static int boss8_spinning(void)
 {
-    return g_boss_class==1 && (g_boss_action==6 || g_boss_action==7);
+    return g_boss_class==1 && g_boss_action>=6;
 }
 
 static void submit_front_satb(u16 *satb);
@@ -2492,9 +2493,11 @@ static int boss8_crate_index(void)
 static int boss8_drop_crate(void)
 {
     int i;
-    /* $8570: a crate already resting in the room makes the source skip the
-       whole action rather than stack a second one. */
-    for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active)return 0;
+    /* $8570 skips the action only when the room's crate slot is occupied.
+       Once Mario picks a box up or throws it that slot is free again, so a
+       carried or thrown crate must not hold the next drop off. */
+    for(i=0;i<MAX_CRATES;++i)
+        if(g_crates[i].active&&!g_crates[i].carried&&!g_crates[i].thrown)return 0;
     for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
         Crate *c=&g_crates[i];
         c->active=1;c->carried=0;c->thrown=0;c->extra=1;c->flight_timer=0;
@@ -2503,7 +2506,7 @@ static int boss8_drop_crate(void)
            box on the body and start it just under the belly. */
         c->x=g_boss_x+(s32)20*FIX_ONE;
         c->y=g_boss_y+(s32)56*FIX_ONE;
-        c->vx=0;c->vy=2*FIX_ONE;
+        c->vx=0;c->vy=(s32)2*FIX_ONE-80;
         g_boss8_crate=i;
         return 1;
     }
@@ -2686,7 +2689,13 @@ static void update_boss_motion(void)
                 if(!boss8_drop_crate())g_boss_action_timer=-1;
             }else if((ci=boss8_crate_index())<0)g_boss_action_timer=-1;
             else if(g_crates[ci].vy==0&&g_boss_action_timer>2)g_boss_action_timer=-1;
-            else ++g_boss_action_timer;
+            else{
+                /* $859C walks it down a flat two pixels a frame.  update_crates()
+                   adds one gravity step on top before it moves, so hold the
+                   velocity here every frame rather than letting it accelerate. */
+                g_crates[ci].vy=(s32)2*FIX_ONE-80;
+                ++g_boss_action_timer;
+            }
         }
         /* $8270: every state but the two spins branches into the common
            tail.  $82F4/$83E4 reach it only when a drop is already live, and
