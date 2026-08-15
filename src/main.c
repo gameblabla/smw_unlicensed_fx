@@ -316,13 +316,15 @@ static int g_boss_random_drop_timer;
 /* Boss 3 room geometry, in room space.  X is the source object coordinate
    minus $A0 (the ordinary -$80 room offset plus the pig metasprite's -32
    bbox origin); Y keeps the plain -$80 offset because the port's boss room
-   is not the full-height MD plane.  $A8/$158 -> 8/184, $C8/$130 -> 72/176. */
+   is not the full-height MD plane, less a further 32 that lifts the pig to
+   the height it flies at in the source.  $A8/$158 -> 8/184, $C8/$130 -> 40/144. */
 #define BOSS8_LEFT_X   8
 #define BOSS8_RIGHT_X  184
-#define BOSS8_TOP_Y    72
-#define BOSS8_BOTTOM_Y 176
-/* $827C refuses to spawn a drop below $F0; $82DA splashes it at $15E. */
-#define BOSS8_DROP_MAX_Y   112
+#define BOSS8_TOP_Y    40
+#define BOSS8_BOTTOM_Y 144
+/* $827C refuses to spawn a drop below $F0; $82DA splashes it at $15E.
+   $F0 carries the same -32 lift as the anchored positions above. */
+#define BOSS8_DROP_MAX_Y   80
 #define BOSS8_DROP_END_Y   222
 
 static const unsigned char g_boss8_arc[45]={
@@ -1915,12 +1917,16 @@ static int later_boss_frame(const BossVisualData *v)
        trailing poses are attack states and are selected while its projectile
        object is live. */
     switch(g_boss_class){
-    case 1: /* Pig strip: walk 0/1, spin 2/3/4, hurt 5, death 6. */
+    case 1:
+        /* Pig strip: 0/1 are the two propeller-flight poses, 2 and 4 the two
+           tucked spin poses, 5 hurt, 6 death.  Frame 3 draws the pig already
+           gripping a crate, which the port supplies as its own falling object,
+           so it stays out of the cycle.  Both cycles are two frames - picking
+           one pose per action left the pig standing completely still. */
         if(g_boss_defeated)frame=6;
         else if(g_boss_invuln>0)frame=5;
-        else if(boss8_spinning())
-            frame=2+(t/5)%3;
-        else frame=(g_boss_action==2||g_boss_action==4)?1:0;
+        else if(boss8_spinning())frame=((t/4)&1)?4:2;
+        else frame=(t/4)&1;
         break; /* Pig */
     case 2: frame=(t/8)%3;break;                              /* ostrich */
     case 3: frame=g_boss_shot_active?3+(t/8)%7:(t/8)%3;break; /* tank */
@@ -2406,7 +2412,7 @@ static void start_boss(int fade_in)
     /* Boss 3's object X is drawn through a bottom-centre metasprite anchor
        (bbox x0 = -32).  Fold that into the actor so motion, art and hitbox
        all share one coordinate. */
-    if(g_boss_class==1)x-=32;
+    if(g_boss_class==1){x-=32;y-=32;}
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
@@ -2505,7 +2511,7 @@ static int boss8_drop_crate(void)
            The port anchors the 64x80 pig art by its top-left, so centre the
            box on the body and start it just under the belly. */
         c->x=g_boss_x+(s32)20*FIX_ONE;
-        c->y=g_boss_y+(s32)56*FIX_ONE;
+        c->y=g_boss_y+(s32)48*FIX_ONE;
         c->vx=0;c->vy=(s32)2*FIX_ONE-80;
         g_boss8_crate=i;
         return 1;
