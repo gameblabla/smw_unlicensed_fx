@@ -1211,6 +1211,8 @@ static void prepare_hud_band_cell(void)
 #define LEVEL_SCREEN_H     256
 #define LEVEL_SCREEN_ROWS  32
 #define LEVEL_PICTURE_ROWS 28           /* MD V28 picture inside the storey */
+#define SEGMENT_BAT_ROWS   34           /* 30 picture rows + the 4 band rows */
+#define SEGMENT_BAND_ROW   30           /* source map row 28 lands here */
 #define LEVEL_MAX_SCREENS  40
 #define LEVEL_GRID_COLS    40
 #define LEVEL_GRID_ROWS    20   /* slot 12 is a 17-screen tower */
@@ -1340,24 +1342,31 @@ static int world_y_from_flat(int flat_x,int y)
     return (int)g_screen_row[route_index_for_flat_x(flat_x)]*LEVEL_SCREEN_H+y;
 }
 
+/* Row of a segment's bank to read for a storey-local tile row.  The bank holds
+   the 28 picture rows, the two rows the PC-FX's taller raster needs under them
+   -- the bottom storey's HUD band -- and then the source's own map rows 28..31,
+   which are the wall behind the 32-line gap between two stacked storeys. */
+static int segment_bat_row(int lr,int gr)
+{
+    if(lr<LEVEL_PICTURE_ROWS)return lr;
+    if(g_level_rows>1&&gr!=g_level_rows-1)return SEGMENT_BAND_ROW+(lr-LEVEL_PICTURE_ROWS);
+    return (lr<30)?lr:-1;
+}
+
 static u16 level_fg_bat_entry(int world_col,int tile_row)
 {
-    int seg,lx,si,lr;
+    int seg,lx,si,lr,row;
     if(!g_level||!g_stage_set||world_col<0||world_col>=g_level_width_tiles||tile_row<0)
         return FG_TILE_BASE_INDEX;
     {
         int gr=split_world_row(tile_row,&lr);
         si=screen_index_at(world_col,gr);
-        /* Only the bottom storey keeps the two duplicated rows under the
-           picture -- that band is the HUD's.  Between storeys the source's
-           own map rows 28..31 are blank, and so is the gap here. */
-        if(lr>=LEVEL_PICTURE_ROWS && (lr>=30 || gr!=g_level_rows-1))
-            return FG_TILE_BASE_INDEX;
+        row=segment_bat_row(lr,gr);
     }
-    if(si<0||lr<0)return FG_TILE_BASE_INDEX;
+    if(si<0||lr<0||row<0)return FG_TILE_BASE_INDEX;
     lx=world_col&31;
     seg=g_level->route[si]; if(seg==255||seg>=g_stage_set->segment_count)return FG_TILE_BASE_INDEX;
-    return relocate_bat(g_stage_set->segment_bat[(seg*30+lr)*32+lx],FG_TILE_BASE_INDEX);
+    return relocate_bat(g_stage_set->segment_bat[(seg*SEGMENT_BAT_ROWS+row)*32+lx],FG_TILE_BASE_INDEX);
 }
 
 static void stream_level_column(int world_col, int display_enabled)
@@ -1483,6 +1492,11 @@ static unsigned char collision_at(int x,int y)
     {int lr;screen=screen_index_at(tx,split_world_row(ty,&lr));ty=lr;}
     if(screen<0||ty<0||ty>=32)return 0;
     lx=tx&31;seg=g_level->route[screen];if(seg==255||seg>=g_stage_set->segment_count)return 0;
+    /* The band under a storey's picture is drawn with the room's masonry but
+       the source grid leaves it clear, and that is deliberate: rows 28..31 are
+       the 32-line gap the climb passes through, so the whole grid stays the
+       ROM's.  Giving the drawn masonry a collision of its own walls the seam
+       off across the full width and traps Mario between two storeys. */
     return g_stage_set->collision[seg*1024+ty*32+lx];
 }
 
