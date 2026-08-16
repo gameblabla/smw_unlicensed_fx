@@ -1755,16 +1755,23 @@ static void update_camera(void)
        BXR, so replacing a column at the exact 8-pixel boundary exposes a
        sliver of the far-ahead column as scrolling garbage on the left edge. */
     /* Vertical follow first: a new BAT row has to be pasted with the window
-       the columns are about to be streamed against.  The band only has room
-       to move while the route actually links Mario's screen to the storey
-       above or below it; inside a horizontal run min_camera_y == max_camera_y
-       pins the view to his own storey, which is what $14804 does by leaving
-       the vertical scroll alone until FF0050 >= 2. */
+       the columns are about to be streamed against.
+
+       The source has no vertical dead-zone.  $14804's horizontal handler is
+       skipped entirely once FF0050 >= 2 and the room hands over to $17818,
+       which scrolls the picture by exactly the jump step until the walk loads
+       the next record; $14370 only performs that load when the accumulator has
+       completed a whole screen, so the view comes to rest on a storey and
+       never sits astride two of them.  Reproduce that: the camera belongs to
+       the live room, and it travels -- one screen, at a rate that outruns the
+       83-pixel jump so Mario cannot climb out of the top of the picture --
+       only while a hand-over is in progress. */
     if(g_level_rows>1){
-        if(py-target_y<72)target_y=py-72;
-        if(py-target_y>144)target_y=py-144;
-        if(target_y<min_camera_y)target_y=min_camera_y;
-        if(target_y>max_camera_y)target_y=max_camera_y;
+        int home=(int)g_screen_row[g_room]*LEVEL_SCREEN_H;
+        if(home<min_camera_y)home=min_camera_y;
+        if(home>max_camera_y)home=max_camera_y;
+        if(target_y<home){target_y+=8; if(target_y>home)target_y=home;}
+        else if(target_y>home){target_y-=8; if(target_y<home)target_y=home;}
         new_row=target_y>>3;
         while(g_camera_row<new_row){++g_camera_row;stream_level_row(g_camera_row+30);}
         while(g_camera_row>new_row){--g_camera_row;stream_level_row(g_camera_row-1);}
@@ -4192,6 +4199,17 @@ static void start_gameplay(int fade_in)
 #ifdef FORCE_PLAYER_Y
     g_player_y=(s32)FORCE_PLAYER_Y<<FIX_SHIFT;
 #endif
+    /* The walk starts on the record the level entered through, which is the
+       one holding the spawn -- normally route 0, but the debug warps drop
+       Mario straight into a later room. */
+    if(g_level_rows>1){
+        int k,lr,gr=split_world_row((int)((g_player_y>>FIX_SHIFT)+16)>>3,&lr);
+        int sc=(int)((g_player_x>>FIX_SHIFT)+8)>>8;
+        for(k=0;k<g_screen_count;++k)
+            if(g_screen_col[k]==sc&&g_screen_row[k]==gr){g_room=k;break;}
+        g_camera_y=g_camera_target_y=(int)g_screen_row[g_room]*LEVEL_SCREEN_H;
+        g_camera_row=g_camera_y>>3;
+    }
     g_vx=g_vy=0;
     g_grounded=1;
     g_facing=1;
