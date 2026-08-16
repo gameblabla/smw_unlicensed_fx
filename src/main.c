@@ -2372,10 +2372,16 @@ static void update_enemies(void)
                    that loop, with the range test standing in for the window. */
                 e->vx=e->vy=0;
                 if(e->behavior_phase==0){
-                    /* $C630's counter saturates: once the sixteen ticks are up
-                       the fish leaps as soon as Mario is in range. */
-                    if(e->behavior_timer<FISH_LEAP_DELAY)++e->behavior_timer;
-                    else if(near<=FISH_LEAP_RANGE){e->behavior_phase=1;e->behavior_timer=0;}
+                    /* The source has no waiting fish at all: outside the
+                       window there is no object, and $C630's sixteen ticks are
+                       the whole of its life before the leap.  Those ticks are
+                       state 0, which surfaces -- flat cel for four, then the
+                       rising cel -- so run them as the approach, and let the
+                       fish lie flat in the water until Mario is in range. */
+                    if(near>FISH_LEAP_RANGE)e->behavior_timer=0;
+                    else if(++e->behavior_timer>=FISH_LEAP_DELAY){
+                        e->behavior_phase=1;e->behavior_timer=0;
+                    }
                 }else if(e->behavior_phase==1){
                     e->y+=(s32)g_fish_leap_dy[e->behavior_timer]*FIX_ONE;
                     if(++e->behavior_timer>=FISH_LEAP_STEPS){e->behavior_phase=2;e->behavior_timer=0;}
@@ -2877,16 +2883,22 @@ static void draw_game_sprites(void)
                 anim=e->behavior_phase?(1+((e->behavior_timer/8)&1)):0;
             else if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=e->behavior_phase?((e->behavior_timer<28)?1:2):0;
             else if(e->kind==ENEMY_KIND_CRATE_MIMIC)anim=(e->behavior_phase==0)?0:((e->behavior_phase==1)?1:(1+((g_state_frame/12)&1)));
-            /* Every fish script is two cels.  State 0 surfaces -- selector 0
-               for four ticks, then selector 1, which $D0B8 holds until the
-               leap.  State 1 flaps selectors 2 and 3 seven ticks each and
-               loops on its $8888, so the whole jump is that pair: selector 2
-               in the attack bank, selector 3 in the alt bank.  State 3 sinks
-               on selectors 4 and 5, whose art the port does not keep; the
-               surfacing cel is the closest of the four it has. */
+            /* Every fish script is two cels.  Selector 0 is the fish lying
+               flat in the water and selector 1 is it half risen out of it, so
+               state 0 surfaces by running 0 for four ticks and then 1, which
+               $D0B8 holds until the leap: 0 is the pose to wait on and 1 the
+               pose it comes out of the water on.  State 1 flaps selectors 2
+               and 3 seven ticks each and loops on its $8888, so the whole jump
+               is that pair -- selector 2 in the attack bank, selector 3 in the
+               alt bank.  State 3 sinks on selectors 4 and 5, whose art the
+               port does not keep; running the surfacing pair backwards is the
+               closest the four cels it has can come. */
             else if(e->kind==ENEMY_KIND_FLOOR_SNAKE)
+            {
+                int early=e->behavior_timer<FISH_IDLE_CEL0_TICKS;
                 anim=(e->behavior_phase==1)?(((e->behavior_timer/7)&1)?2:3):
-                     (e->behavior_phase==0&&e->behavior_timer<FISH_IDLE_CEL0_TICKS)?0:1;
+                     (e->behavior_phase==0)?(early?0:1):(early?1:0);
+            }
             /* The rock's cycle is the three poses the family stores, and the
                third repeats the first: only two of the ball's images are
                distinct, which is the pair the port keeps in VRAM.  (The walk
