@@ -4,7 +4,7 @@ import json,csv,sys
 from PIL import Image
 sys.path.insert(0,str(Path(__file__).parent))
 import build_assets as ba
-from level_extension import foreground_words_240
+from level_extension import foreground_words_240, MAP_WIDTH
 
 import os
 PROJECT=Path(__file__).resolve().parent.parent
@@ -252,6 +252,16 @@ def build_sets(stage_manifest):
             default_words=foreground_words_240(sx['set_id'],words)
             edited_words=override_words(f'set_{sx["set_id"]:02d}_segment_{seg:02d}.json',default_words,32*30)
             for word in edited_words:segbat.append(ba.append_genesis_word(word,vram,tiles,lookup))
+            # Rows 28..31 of the source map are not workspace on a stacked
+            # stage: a storey is 256 pixels tall and the 32 lines under its
+            # V28 picture are the band the climb passes through, which the
+            # Mega Drive fills with the room's own art -- the stone the level
+            # 11/12 barrel walls stand on.  The picture rows above already
+            # spend 28..29 on the PC-FX's two extra visible rows, so carry the
+            # source band separately, after them.
+            band=words[28*MAP_WIDTH:32*MAP_WIDTH]
+            band=band+[0]*(4*MAP_WIDTH-len(band))
+            for word in band:segbat.append(ba.append_genesis_word(word,vram,tiles,lookup))
             bat.extend(segbat)
             cf=next(sd.glob('collision_ROM_*.bin')).read_bytes()[:1024]
             if sx['set_id']==3:
