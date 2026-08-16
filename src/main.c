@@ -2683,11 +2683,12 @@ static int later_boss_frame(const BossVisualData *v)
         else if(boss8_spinning())frame=2+(t/4)%3;
         else frame=(t/4)&1;
         break; /* Pig */
-    /* Ostrich strip: 0 and 1 are the two 96-pixel running poses and 2 is the
-       taller pose the rider throws from, so it belongs to move 11 alone.
-       Every pose is bottom-aligned in the shared canvas, so the extra height
-       grows upward and the feet stay put. */
-    case 2: frame=(g_boss_action==11)?2:((t/6)&1);break;      /* ostrich */
+    /* Ostrich strip: 0 and 1 are the two 96-pixel poses used for everything
+       it normally does (standing, running, spitting) and 2 is the taller
+       recoil pose, which belongs to being hit alone.  Every pose is
+       bottom-aligned in the shared canvas, so the extra height grows upward
+       and the feet stay put. */
+    case 2: frame=(g_boss_invuln>0)?2:((t/6)&1);break;        /* ostrich */
     case 3: frame=g_boss_shot_active?3+(t/8)%7:(t/8)%3;break; /* tank */
     case 4: frame=g_boss_shot_active?3+(t/8)%2:(t/8)%3;break; /* mage */
     default:frame=g_boss_shot_active?2+(t/8)%3:(t/8)%2;break; /* elephant */
@@ -3796,6 +3797,13 @@ static void update_boss_actor(void)
         static const unsigned char hit_w[5]={48,64,80,112,96};
         static const unsigned char hit_h[5]={64,80,56,64,80};
         hitx=bx+8;hity=by+8;hitw=hit_w[g_boss_class-1];hith=hit_h[g_boss_class-1];
+        /* The ostrich art fills the canvas from y+12 down to its feet at
+           y+108, so the generic box sat 36 pixels too high and poked through
+           the one-way platform its arena hangs 72 pixels above the floor.
+           Mario standing up there was hurt by the neck, and his fireballs and
+           crates could hit it from a floor away.  Keep the feet as the bottom
+           edge and stop the body just below whichever surface it stands on. */
+        if(g_boss_class==2){hitx=bx+6;hitw=80;hity=by+44;hith=64;}
     }
     else{hitx=bx+12;hity=by-8;hitw=72;hith=72;
         if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
