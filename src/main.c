@@ -345,6 +345,7 @@ static int g_camera_target_y;
 static int g_camera_row;   /* world tile row at the top of the streamed window */
 static int g_level_rows=1; /* stacked screens; 1 for a purely horizontal level */
 static int g_level_cols;
+static int g_room;      /* route index of the live room, the port's FF0046 */
 static int g_satb_page;
 static int g_player_anim_clock;
 static int g_player_down;
@@ -1277,13 +1278,13 @@ static int screen_index_at(int world_col,int grid_row)
    route neighbour, and only along the axis that neighbour is pasted on.  A
    room whose exit is upwards therefore has no horizontal travel at all, and a
    room in the middle of a horizontal run has no vertical travel. */
-static void room_window(int sc,int gr,int *clo,int *chi,int *rlo,int *rhi)
+static void room_window(int si,int *clo,int *chi,int *rlo,int *rhi)
 {
-    int si,k;
+    int k,sc,gr;
+    *clo=*chi=*rlo=*rhi=0;
+    if(si<0||si>=g_screen_count)return;
+    sc=g_screen_col[si]; gr=g_screen_row[si];
     *clo=*chi=sc; *rlo=*rhi=gr;
-    if(sc<0||sc>=LEVEL_GRID_COLS||gr<0||gr>=g_level_rows)return;
-    si=g_screen_grid[gr*LEVEL_GRID_COLS+sc];
-    if(si==255)return;
     for(k=si-1;k<=si+1;k+=2){
         int nc,nr;
         if(k<0||k>=g_screen_count)continue;
@@ -1291,6 +1292,21 @@ static void room_window(int sc,int gr,int *clo,int *chi,int *rlo,int *rhi)
         if(nr==gr){ if(nc<*clo)*clo=nc; if(nc>*chi)*chi=nc; }
         else if(nc==sc){ if(nr<*rlo)*rlo=nr; if(nr>*rhi)*rhi=nr; }
     }
+}
+
+/* $14370 walks the route one record at a time, so the live room can only ever
+   become the neighbour the walk has just pasted.  Deriving the room from
+   Mario's coordinates instead let a jump that crossed a storey boundary hand
+   the camera a screen the route had not reached -- jumping on the first
+   screen of a stacked level threw the view a whole storey up. */
+static void update_current_room(int px,int py)
+{
+    int lr,gr=split_world_row((py+16)>>3,&lr),sc=(px+8)>>8,k;
+    if(g_screen_count<=0)return;
+    if(g_room<0||g_room>=g_screen_count)g_room=0;
+    if(g_screen_col[g_room]==sc&&g_screen_row[g_room]==gr)return;
+    for(k=g_room-1;k<=g_room+1;k+=2)
+        if(k>=0&&k<g_screen_count&&g_screen_col[k]==sc&&g_screen_row[k]==gr){g_room=k;return;}
 }
 
 /* Flat generator coordinates are (route index * 256 + offset); with stacked
@@ -1413,7 +1429,7 @@ static void init_level_ring(void)
 {
     int col,i,chip;
     g_level=&g_game_levels[g_current_level]; g_stage_set=&g_stage_sets[g_level->set_index];
-    build_level_layout(); g_level_width_tiles=g_level_cols*32;
+    build_level_layout(); g_level_width_tiles=g_level_cols*32; g_room=0;
     clear_bat(BACK_CHIP,BG_BAT_WORDS); clear_bat(FRONT_CHIP,FG_BAT_WORDS);
     set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
     if(g_level_rows>1) set_map_height(level_stage_chip(),1);
@@ -1684,13 +1700,8 @@ static int level_exit_reached(void)
 {
     int px=(int)(g_player_x>>FIX_SHIFT);
     if(g_level_rows<=1)return px>=g_level_width_tiles*8-48;
-    if(g_screen_count<=0)return 0;
-    {
-        int last=g_screen_count-1,lr;
-        int gr=split_world_row((int)((g_player_y>>FIX_SHIFT)+16)>>3,&lr);
-        if(gr!=(int)g_screen_row[last])return 0;
-        return px>=(int)g_screen_col[last]*256+256-48;
-    }
+    if(g_screen_count<=0||g_room!=g_screen_count-1)return 0;
+    return px>=(int)g_screen_col[g_room]*256+256-48;
 }
 
 static void update_camera(void)
@@ -1718,8 +1729,8 @@ static void update_camera(void)
        neighbour the route pastes beside it. */
     if(g_level_rows>1){
         int clo,chi,rlo,rhi;
-        int lr,gr=split_world_row((py+16)>>3,&lr);
-        room_window((px+8)>>8,gr,&clo,&chi,&rlo,&rhi);
+        update_current_room(px,py);
+        room_window(g_room,&clo,&chi,&rlo,&rhi);
         min_camera=clo*256;
         if((chi+1)*256-SCREEN_W<max_camera)max_camera=(chi+1)*256-SCREEN_W;
         min_camera_y=rlo*LEVEL_SCREEN_H;
@@ -4338,9 +4349,9 @@ static void update_play(u16 btn, u16 pressed)
     /* $17238/$170F8 stop Mario at the room edge when the route does not carry
        on that way, so he cannot walk out over the void beside a shaft. */
     if (g_level_rows>1) {
-        int px=(int)(g_player_x>>FIX_SHIFT),clo,chi,rlo,rhi,lr;
-        int gr=split_world_row((int)((g_player_y>>FIX_SHIFT)+16)>>3,&lr);
-        room_window((px+8)>>8,gr,&clo,&chi,&rlo,&rhi);
+        int px=(int)(g_player_x>>FIX_SHIFT),clo,chi,rlo,rhi;
+        update_current_room(px,(int)(g_player_y>>FIX_SHIFT));
+        room_window(g_room,&clo,&chi,&rlo,&rhi);
         if (px<clo*256) { g_player_x=(s32)(clo*256)<<FIX_SHIFT; if(g_vx<0)g_vx=0; }
         else if (px>(chi+1)*256-24) { g_player_x=(s32)((chi+1)*256-24)<<FIX_SHIFT; if(g_vx>0)g_vx=0; }
     }
