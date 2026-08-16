@@ -1000,6 +1000,12 @@ STAGE_OBJECT_KINDS={
     5: 7,   # $F934: descends 1px/frame, wrapping 0x1C2 -> 0x6E
     6: 8,   # $F980: climbs 1px/frame, wrapping 0x64 -> 0x17C
     7: 9,   # $F9C6: walks the 80-step path table at $FA58, every other frame
+    # The dispatch at $F4E4 indexes $F4FA with handler-1, so 8/9/10 are the
+    # three handlers the extractor used to drop -- seven of level 11's twelve
+    # records, which is why half that stage's carriers were missing.
+    8: 13,  # $FAF8: phases out and back on a 186-frame cycle, bobbing 8px
+    9: 14,  # $FC1E: carries 133px right over 133 frames, then reappears home
+    10:15,  # $FDAC: the same to the left
     11:10,  # $FF3A: 48-frame diamond orbit, +1/+1 +1/-1 -1/-1 -1/+1
     # Not a $F4FA handler: the falling boulder of the second object table
     # below, given a synthetic key so it can ride the same record pipeline.

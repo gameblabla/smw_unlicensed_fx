@@ -145,6 +145,9 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_DIAMOND  10   /* handler 11 */
 #define PLATFORM_KIND_SINKER   11   /* handler 1: the level 2/6 lift elsewhere */
 #define PLATFORM_KIND_BOULDER  12   /* $B086, from the $B31E table */
+#define PLATFORM_KIND_PHASE    13   /* handler 8:  $FAF8 */
+#define PLATFORM_KIND_DRIFT_R  14   /* handler 9:  $FC1E */
+#define PLATFORM_KIND_DRIFT_L  15   /* handler 10: $FDAC */
 #define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
 /* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
    climbing one from 0x64 back to 0x17C, in the object space the records store,
@@ -285,6 +288,9 @@ typedef struct {
     /* Index into the level's stage object shape table, and the step counter
        handler 7 uses to walk its 80-entry path. */
     unsigned char shape, step;
+    /* $FAF8/$FC1E/$FDAC park their object by writing metasprite 0 for part of
+       the cycle; a hidden carrier is neither drawn nor stood on. */
+    unsigned char hidden;
 } MovingPlatform;
 
 /* Exact Level-2 carrier metasprite 741 ($01D956): tiles 491..496 form a
@@ -1258,39 +1264,33 @@ static int screen_index_at(int world_col,int grid_row)
     return (si==255)?-1:si;
 }
 
-/* The Mega Drive never has more than the live room and its successor in the
-   collision buffer, so Mario cannot leave the room he is in: $17238 lets him
-   walk right only as far as screen x $160 unless FF0050 == 0 (the route
-   continues to the right), and $170F8 mirrors that on the left at x $80.
-   Here the whole grid is resident at once, so the equivalent limit is the
-   contiguous run of pathed cells around him -- along his storey for the
-   horizontal camera, and up his shaft for the vertical one.  Empty grid cells
-   are exactly the screens the route never visits, which is what the camera
-   used to scroll into. */
-static void screen_run_x(int grid_row,int sc,int *lo,int *hi)
-{
-    int i;
-    *lo=0;*hi=g_level_cols-1;
-    if(grid_row<0||grid_row>=g_level_rows)return;
-    if(sc<0)sc=0; if(sc>g_level_cols-1)sc=g_level_cols-1;
-    if(g_screen_grid[grid_row*LEVEL_GRID_COLS+sc]==255)return;
-    for(i=sc;i>0&&g_screen_grid[grid_row*LEVEL_GRID_COLS+i-1]!=255;--i){}
-    *lo=i;
-    for(i=sc;i<g_level_cols-1&&g_screen_grid[grid_row*LEVEL_GRID_COLS+i+1]!=255;++i){}
-    *hi=i;
-}
+/* The Mega Drive holds only the live room and the one the route pastes next
+   to it, so the viewport never leaves that pair.  $17238 lets Mario walk right
+   past screen x $F5 only when FF0050 == 0 (the next room is pasted to the
+   right); $170F8 mirrors it for mode 1, and $14804's whole horizontal scroll
+   handler is skipped when FF0050 >= 2, where the room hands over to the
+   vertical scroll at $17818 instead.  FF0050 is the mode of the record that
+   was loaded last, i.e. the mode of the *next* room, so route_modes[si+1]
+   governs while Mario stands in room si.
 
-static void screen_run_y(int sc,int grid_row,int *lo,int *hi)
+   Reproduce that window here: the camera may span Mario's own screen plus a
+   route neighbour, and only along the axis that neighbour is pasted on.  A
+   room whose exit is upwards therefore has no horizontal travel at all, and a
+   room in the middle of a horizontal run has no vertical travel. */
+static void room_window(int sc,int gr,int *clo,int *chi,int *rlo,int *rhi)
 {
-    int i;
-    *lo=0;*hi=g_level_rows-1;
-    if(sc<0||sc>=g_level_cols)return;
-    if(grid_row<0)grid_row=0; if(grid_row>g_level_rows-1)grid_row=g_level_rows-1;
-    if(g_screen_grid[grid_row*LEVEL_GRID_COLS+sc]==255)return;
-    for(i=grid_row;i>0&&g_screen_grid[(i-1)*LEVEL_GRID_COLS+sc]!=255;--i){}
-    *lo=i;
-    for(i=grid_row;i<g_level_rows-1&&g_screen_grid[(i+1)*LEVEL_GRID_COLS+sc]!=255;++i){}
-    *hi=i;
+    int si,k;
+    *clo=*chi=sc; *rlo=*rhi=gr;
+    if(sc<0||sc>=LEVEL_GRID_COLS||gr<0||gr>=g_level_rows)return;
+    si=g_screen_grid[gr*LEVEL_GRID_COLS+sc];
+    if(si==255)return;
+    for(k=si-1;k<=si+1;k+=2){
+        int nc,nr;
+        if(k<0||k>=g_screen_count)continue;
+        nc=g_screen_col[k]; nr=g_screen_row[k];
+        if(nr==gr){ if(nc<*clo)*clo=nc; if(nc>*chi)*chi=nc; }
+        else if(nc==sc){ if(nr<*rlo)*rlo=nr; if(nr>*rhi)*rhi=nr; }
+    }
 }
 
 /* Flat generator coordinates are (route index * 256 + offset); with stacked
@@ -1595,7 +1595,7 @@ static void resolve_player_vertical(s32 next_y)
             int px, top, platform_w;
             /* The boulder is a hazard rolling through the stage, not one of
                the carriers: $B086 keeps no standing surface. */
-            if (p->kind==PLATFORM_KIND_BOULDER) continue;
+            if (p->kind==PLATFORM_KIND_BOULDER || p->hidden) continue;
             px=platform_draw_x(p); top=platform_draw_y(p);
             platform_w=platform_width(p);
             if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+platform_w) continue;
@@ -1714,20 +1714,17 @@ static void update_camera(void)
     int target_y=g_camera_y;
     int new_tile,new_row;
 
-    /* Confine the viewport to the storey and shaft Mario is actually standing
-       in, so a level that climbs no longer scrolls sideways over screens its
-       route never visits. */
+    /* Confine the viewport to the room Mario is standing in and whichever
+       neighbour the route pastes beside it. */
     if(g_level_rows>1){
-        int lo,hi,gr,lr,sc=(px+8)>>8;
-        gr=split_world_row((py+16)>>3,&lr);
-        screen_run_x(gr,sc,&lo,&hi);
-        min_camera=lo*256;
-        if((hi+1)*256-SCREEN_W<max_camera)max_camera=(hi+1)*256-SCREEN_W;
-        screen_run_y(sc,gr,&lo,&hi);
-        min_camera_y=lo*LEVEL_SCREEN_H;
-        if(hi*LEVEL_SCREEN_H<max_camera_y)max_camera_y=hi*LEVEL_SCREEN_H;
+        int clo,chi,rlo,rhi;
+        int lr,gr=split_world_row((py+16)>>3,&lr);
+        room_window((px+8)>>8,gr,&clo,&chi,&rlo,&rhi);
+        min_camera=clo*256;
+        if((chi+1)*256-SCREEN_W<max_camera)max_camera=(chi+1)*256-SCREEN_W;
+        min_camera_y=rlo*LEVEL_SCREEN_H;
+        max_camera_y=rhi*LEVEL_SCREEN_H;
         if(max_camera<min_camera)max_camera=min_camera;
-        if(max_camera_y<min_camera_y)max_camera_y=min_camera_y;
     }
 
     /* The MD stage camera does not re-center on Mario every frame. Keep Mario
@@ -1747,9 +1744,11 @@ static void update_camera(void)
        BXR, so replacing a column at the exact 8-pixel boundary exposes a
        sliver of the far-ahead column as scrolling garbage on the left edge. */
     /* Vertical follow first: a new BAT row has to be pasted with the window
-       the columns are about to be streamed against.  There is no one-way
-       rule here -- the source's climbs are walked back down again -- so the
-       camera keeps Mario inside a band and clamps to the stacked height. */
+       the columns are about to be streamed against.  The band only has room
+       to move while the route actually links Mario's screen to the storey
+       above or below it; inside a horizontal run min_camera_y == max_camera_y
+       pins the view to his own storey, which is what $14804 does by leaving
+       the vertical scroll alone until FF0050 >= 2. */
     if(g_level_rows>1){
         if(py-target_y<72)target_y=py-72;
         if(py-target_y>144)target_y=py-144;
@@ -1857,6 +1856,7 @@ static void init_moving_platforms(void)
         g_moving_platforms[i].kind=PLATFORM_KIND_LIFT;
         g_moving_platforms[i].state=PLATFORM_STATE_IDLE;
         g_moving_platforms[i].timer=0;
+        g_moving_platforms[i].hidden=0;
     }
     g_moving_platform_count=0;
     g_on_moving_platform=-1;
@@ -1914,7 +1914,7 @@ static void init_moving_platforms(void)
             p->y=p->home_y=(s32)ry<<FIX_SHIFT;
             p->shape=(unsigned char)rec[2];
             p->kind=(unsigned char)rec[3];
-            p->state=PLATFORM_STATE_IDLE;p->timer=0;p->step=0;
+            p->state=PLATFORM_STATE_IDLE;p->timer=0;p->step=0;p->hidden=0;
             /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
             p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
             p->min_y=(short)ry;p->max_y=(short)(ry+32);
@@ -1988,6 +1988,42 @@ static void update_stage_object(MovingPlatform *p, int index)
         p->y+=(s32)p->dir*FIX_ONE;
         if (++p->timer>=100) { p->timer=0; p->dir=(signed char)-p->dir; }
         break;
+    case PLATFORM_KIND_PHASE:        /* $FAF8 */
+        /* Six timed phases, 80/21/16/32/16/21 frames.  The object drops 8px
+           entering phase 2 and lifts back entering phase 5, and $FB80 blanks
+           its metasprite for the whole of phase 3. */
+        ++p->timer;
+        switch (p->state) {
+        case 0: if (p->timer>=0x50){p->state=1;p->timer=0;} break;
+        case 1: if (p->timer>=0x15){p->state=2;p->timer=0;p->y+=8*FIX_ONE;} break;
+        case 2: if (p->timer>=0x10){p->state=3;p->timer=0;p->hidden=1;} break;
+        case 3: if (p->timer>=0x20){p->state=4;p->timer=0;p->hidden=0;} break;
+        case 4: if (p->timer>=0x10){p->state=5;p->timer=0;p->y-=8*FIX_ONE;} break;
+        default:if (p->timer>=0x15){p->state=0;p->timer=0;} break;
+        }
+        break;
+    case PLATFORM_KIND_DRIFT_R:      /* $FC1E */
+    case PLATFORM_KIND_DRIFT_L: {    /* $FDAC, the same run mirrored */
+        s32 step=(p->kind==PLATFORM_KIND_DRIFT_R)?FIX_ONE:-FIX_ONE;
+        ++p->timer;
+        switch (p->state) {
+        /* 0x40 + 0x25 + 0x20 = 0x85 pixels of travel, stepping down 8 pixels
+           at each phase change. */
+        case 0: p->x+=step; if(p->timer>=0x40){p->state=1;p->timer=0;} break;
+        case 1: p->x+=step; if(p->timer>=0x25){p->state=2;p->timer=0;p->y+=8*FIX_ONE;} break;
+        case 2: p->x+=step; if(p->timer>=0x20){p->state=3;p->timer=0;p->y+=8*FIX_ONE;} break;
+        case 3: if(p->timer>=0x20){p->state=4;p->timer=0;p->hidden=1;} break;
+        /* $FD90/$FF1E undo the two 8px drops and the whole 0x85 of travel, so
+           the carrier reappears exactly on its record position. */
+        default:if(p->timer>=0x30){
+                    p->state=0;p->timer=0;p->hidden=0;
+                    p->y-=16*FIX_ONE; p->x-=step*0x85;
+                    if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
+                }
+                break;
+        }
+        break;
+    }
     case PLATFORM_KIND_BOULDER:      /* $B086 */
         /* $B242 streams these in on their tile trigger; with every record
            instantiated at level load instead, the boulder waits above its own
@@ -3149,8 +3185,10 @@ static void draw_game_sprites(void)
        enemies so a busy screen cannot make the floor disappear. */
     for (i=0;i<g_moving_platform_count && n<58;++i) {
         MovingPlatform *mp=&g_moving_platforms[i];
-        int sx=platform_draw_x(mp)-g_camera_x;
-        int sy=platform_draw_y(mp)-g_camera_y;
+        int sx,sy;
+        if (mp->hidden) continue;   /* metasprite 0: parked out of the cycle */
+        sx=platform_draw_x(mp)-g_camera_x;
+        sy=platform_draw_y(mp)-g_camera_y;
         if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
         if(PLATFORM_KIND_IS_STAGE_OBJECT(mp->kind)){
             /* Cells are stored row-major with an even pitch, so each pair is
@@ -4298,14 +4336,13 @@ static void update_play(u16 btn, u16 pressed)
         if (g_vx<0) g_vx=0;
     }
     /* $17238/$170F8 stop Mario at the room edge when the route does not carry
-       on that way; on a stacked level the run of pathed screens on his storey
-       is that room, so he cannot walk out over the void beside a shaft. */
+       on that way, so he cannot walk out over the void beside a shaft. */
     if (g_level_rows>1) {
-        int px=(int)(g_player_x>>FIX_SHIFT),lo,hi,lr;
+        int px=(int)(g_player_x>>FIX_SHIFT),clo,chi,rlo,rhi,lr;
         int gr=split_world_row((int)((g_player_y>>FIX_SHIFT)+16)>>3,&lr);
-        screen_run_x(gr,(px+8)>>8,&lo,&hi);
-        if (px<lo*256) { g_player_x=(s32)(lo*256)<<FIX_SHIFT; if(g_vx<0)g_vx=0; }
-        else if (px>(hi+1)*256-24) { g_player_x=(s32)((hi+1)*256-24)<<FIX_SHIFT; if(g_vx>0)g_vx=0; }
+        room_window((px+8)>>8,gr,&clo,&chi,&rlo,&rhi);
+        if (px<clo*256) { g_player_x=(s32)(clo*256)<<FIX_SHIFT; if(g_vx<0)g_vx=0; }
+        else if (px>(chi+1)*256-24) { g_player_x=(s32)((chi+1)*256-24)<<FIX_SHIFT; if(g_vx>0)g_vx=0; }
     }
 
     if (g_bounce_active) {
