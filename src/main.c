@@ -385,6 +385,8 @@ static s32 g_boss_x,g_boss_y,g_boss_vx,g_boss_vy;
 static int g_boss_hp,g_boss_timer,g_boss_invuln,g_boss_defeated;
 static int g_boss_class,g_boss_phase,g_boss_face=1,g_boss_ground_y;
 static int g_boss_action,g_boss_action_timer,g_boss_action_dir;
+/* The storey the ostrich belongs to: its Y while it is not mid-hop. */
+static int g_boss10_floor_y;
 /* Bowser's script cursor is not itself the Mega Drive action/state number.
    Each six-byte record selected by $6F3A supplies the action separately. */
 static const unsigned char g_bowser_action_script[12]={1,5,2,6,3,4,1,5,2,5,3,4};
@@ -531,6 +533,10 @@ static const signed char g_fish_leap_dy[51]={
 #define BOSS10_LEFT_STOP  BOSS10_X(0xB0)
 #define BOSS10_AIR_Y      BOSS10_Y(0xC8)
 #define BOSS10_GROUND_Y   BOSS10_Y(0x110)
+/* Room 2's collision grid holds a one-way platform on row 9 (y=72..79) and
+   the arena floor on row 18 (y=144), so the arena is two storeys tall. */
+#define BOSS10_PLATFORM_TOP    72
+#define BOSS10_PLATFORM_BOTTOM 80
 
 static Crate g_crates[MAX_CRATES];
 static Gem g_gems[MAX_GEMS];
@@ -3275,6 +3281,7 @@ static void start_boss(int fade_in)
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
+    g_boss10_floor_y=y;
     g_boss8_crate=-1;
 
     /* Exact 1P HP table $6D6E: 8,8,10,10,12,12,12 for the seven bosses.
@@ -3610,6 +3617,9 @@ static void update_boss_motion(void)
         state=g_boss_action;dir=g_boss_action_dir;
         bx=(int)(g_boss_x>>FIX_SHIFT);
         g_boss_vx=0;g_boss_vy=0;
+        /* Every move but the hop keeps Y fixed, so the last such Y is the
+           storey it is standing on and the one the hop comes back down to. */
+        if(state!=8)g_boss10_floor_y=(int)(g_boss_y>>FIX_SHIFT);
         if(state==1||state==2){ /* $8806 / $883A: 80 frames of flat walking */
             step=(state==1)?1:2;
             g_boss_vx=(s32)(dir?step:-step)*FIX_ONE;
@@ -3803,7 +3813,18 @@ static void update_boss_actor(void)
            Mario standing up there was hurt by the neck, and his fireballs and
            crates could hit it from a floor away.  Keep the feet as the bottom
            edge and stop the body just below whichever surface it stands on. */
-        if(g_boss_class==2){hitx=bx+6;hitw=80;hity=by+44;hith=64;}
+        if(g_boss_class==2){
+            hitx=bx+6;hitw=80;hity=by+44;hith=64;
+            /* $89F8's hop lifts it 65 pixels without leaving the floor it
+               started on, so the body sails up past the one-way platform and
+               back down.  Nothing on the far side of that platform may take
+               part: while its home floor is the lower one, clip the box at
+               the platform's underside; while it is up on the platform, clip
+               it at the platform's surface. */
+            if(g_boss10_floor_y>=BOSS10_GROUND_Y){if(hity<BOSS10_PLATFORM_BOTTOM)hity=BOSS10_PLATFORM_BOTTOM;}
+            else{int bottom=hity+hith;if(bottom>BOSS10_PLATFORM_TOP)bottom=BOSS10_PLATFORM_TOP;hith=bottom-hity;}
+            if(hith<=0){hitw=0;hith=0;}
+        }
     }
     else{hitx=bx+12;hity=by-8;hitw=72;hith=72;
         if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
@@ -3813,7 +3834,7 @@ static void update_boss_actor(void)
            the recovered body so a crate thrown on the platform above cannot
            hit him while he is below it.  Keep the bottom edge unchanged. */
         hity+=16;hith-=16;}
-    if(g_boss_invuln==0){
+    if(g_boss_invuln==0&&hitw>0&&hith>0){
         for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
         for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT)+bowser_room_object_y_offset();if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
         if(!g_boss_defeated&&g_invuln==0&&aabb(player_body_x()+4,player_body_y()+bowser_room_object_y_offset()+5,8,PLAYER_BODY_H-10,hitx+4,hity+4,hitw-8,hith-8))hurt_player();
