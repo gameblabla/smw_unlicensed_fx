@@ -1502,11 +1502,16 @@ static int solid_v(int x, int y)
     return c == 1 || c == 2;
 }
 
-/* Collision value 2 is the Stage-1 brown-brick/platform surface. It is solid
-   only when approached from above. Full terrain (1) still blocks Mario's head. */
+/* Level surfaces are one-way.  The extracted grids mark a floor with a single
+   row of 1 (or 2) and mark the walls that hold it up separately with 4, and
+   the source terrain walker at $17E2E only ever asks which surface an actor
+   stands on - it has no upward test at all.  So the brown ledges are entered
+   from below on the Mega Drive, and jumping through them has to work here too.
+   Boss rooms keep their ceilings: their 32x32 grids draw the arena as a closed
+   box, and the room has no other bound to stop Mario leaving through the top. */
 static int solid_ceiling(int x, int y)
 {
-    return collision_at(x,y) == 1;
+    return g_in_boss && collision_at(x,y) == 1;
 }
 
 static int player_body_x(void) { return (int)(g_player_x >> FIX_SHIFT) + PLAYER_BODY_XOFF; }
