@@ -577,6 +577,7 @@ static int boss8_spinning(void)
 
 static void submit_front_satb(u16 *satb);
 static void clear_front_sprites(void);
+static void hurt_player(void);
 static void set_front_sprites_enabled(int enabled);
 static void set_sprite_entry(u16 *satb, int index, int x, int y, u16 addr, u16 ctrl);
 
@@ -1745,6 +1746,15 @@ static void update_stage_object(MovingPlatform *p, int index)
         }
         /* $B0F0 rolls it one pixel left on even frames only. */
         if ((g_state_frame&1)==0) p->x-=FIX_ONE;
+        /* The rock is a hazard: touching it costs a heart, on the same
+           invulnerability window every other contact damage uses. */
+        if (g_invuln==0) {
+            const unsigned short *sh=platform_shape(p);
+            int bw=sh?(int)sh[5]:32, bh=sh?(int)sh[6]:32;
+            if (aabb(player_body_x(),player_body_y(),PLAYER_BODY_W,PLAYER_BODY_H,
+                     platform_draw_x(p),platform_draw_y(p),bw,bh))
+                hurt_player();
+        }
         break;
     case PLATFORM_KIND_DIAMOND:      /* $FF3A */
         p->x+=(p->state==0||p->state==1)?FIX_ONE:-FIX_ONE;
