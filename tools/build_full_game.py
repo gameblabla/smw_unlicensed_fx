@@ -1151,11 +1151,16 @@ def make_stage_objects(r,routes):
             canvas=(art_canvas(art,cols,rows) if art
                     else [[0]*(cols*16) for _ in range(rows*16)])
             for x0,y0,tw,th,attr in (() if art else parts):
-                tile=attr&0x7FF
-                # Mega Drive sprite patterns run column-major inside the piece.
+                tile=attr&0x7FF; hf=bool(attr&0x800); vf=bool(attr&0x1000)
+                # Mega Drive sprite patterns run column-major inside the piece,
+                # and a mirrored piece keeps its place while its tiles walk the
+                # other way -- level 11's rightward turtle is metasprite 144,
+                # the leftward one flipped.  Dropping the flip bits laid its
+                # halves down swapped, which is what tore that turtle apart.
                 for cx in range(tw):
                     for cy in range(th):
-                        pix=ba.tilepix(vram,tile+cx*th+cy)
+                        sx=(tw-1-cx) if hf else cx; sy=(th-1-cy) if vf else cy
+                        pix=ba.tilepix(vram,tile+sx*th+sy,hf,vf)
                         for yy in range(8):
                             for xx in range(8):
                                 v=pix[yy*8+xx]
@@ -1222,11 +1227,13 @@ def make_level8_platform_words(r):
     def canvas_for(mid,w,h):
         canvas=[[0]*w for _ in range(h)]
         for x0,y0,tw,th,attr in metasprite(mid):
-            tile=attr&0x7FF
-            # Mega Drive sprite patterns run column-major inside the piece.
+            tile=attr&0x7FF; hf=bool(attr&0x800); vf=bool(attr&0x1000)
+            # Mega Drive sprite patterns run column-major inside the piece,
+            # mirrored pieces backwards.
             for cx in range(tw):
                 for cy in range(th):
-                    pix=ba.tilepix(vram,tile+cx*th+cy)
+                    sx=(tw-1-cx) if hf else cx; sy=(th-1-cy) if vf else cy
+                    pix=ba.tilepix(vram,tile+sx*th+sy,hf,vf)
                     for y in range(8):
                         for x in range(8):
                             v=pix[y*8+x]
