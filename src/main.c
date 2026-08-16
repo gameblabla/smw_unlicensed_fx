@@ -330,6 +330,15 @@ static int g_facing; /* -1 left, +1 right */
 static int g_camera_x;
 static int g_camera_target_x;
 static int g_camera_tile;
+/* Route steps whose mode is 2 or 3 stack the next screen above or below the
+   current one instead of beside it ($145E2 drives VSRAM instead of HSCROLL).
+   Levels 11..12, 15, 16 and 19 of the source use them, so the stage is a path
+   through a 2-D grid of screens, not a single horizontal ribbon. */
+static int g_camera_y;
+static int g_camera_target_y;
+static int g_camera_row;   /* world tile row at the top of the streamed window */
+static int g_level_rows=1; /* stacked screens; 1 for a purely horizontal level */
+static int g_level_cols;
 static int g_satb_page;
 static int g_player_anim_clock;
 static int g_player_down;
@@ -626,6 +635,16 @@ static void clear_bat(int chip, int words)
     for (i = 0; i < words; ++i) vdc_vram_write(chip, 0);
 }
 
+/* Only the first 2048 words of each VDC hold a BAT; the tile patterns start
+   at $0800.  A 64x64 virtual map therefore aliases pattern data into map rows
+   32..63, so a plane that has to scroll vertically must be told it is 64x32
+   and wrap every 256 pixels instead. */
+static void set_map_height(int chip,int rows32)
+{
+    vdc_setreg(chip,VDC_REG_MWR,
+               (u16)(rows32?VDC_MWR_SCREEN_64x32:VDC_MWR_SCREEN_64x64));
+}
+
 static void show_black(void)
 {
     int i;
@@ -636,6 +655,7 @@ static void show_black(void)
     vdc_setreg(FRONT_CHIP, VDC_REG_CR, 0);
     clear_bat(BACK_CHIP, BG_BAT_WORDS);
     clear_bat(FRONT_CHIP, FG_BAT_WORDS);
+    set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
     for (i = 0; i < 256; ++i) tetsu_set_palette((u16)i, 0x0088);
     vdc_set_scroll(BACK_CHIP, 0, 0);
     vdc_set_scroll(FRONT_CHIP, 0, 0);
@@ -732,6 +752,7 @@ static void boot_exact_setup(void)
     int y,x;
     clear_bat(BACK_CHIP,BG_BAT_WORDS);
     clear_bat(FRONT_CHIP,FG_BAT_WORDS);
+    set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
     for (y=0;y<30;++y) {
         vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));
         for (x=0;x<32;++x) {
@@ -1164,13 +1185,112 @@ static void prepare_hud_band_cell(void)
     g_hud_band_cell=(u16)(((entry>>4)<<12)|(HUD_BAND_BLACK_TILE_WORD/TILE_WORDS));
 }
 
-static u16 level_fg_bat_entry(int world_col,int row)
+/* --- Screen grid -------------------------------------------------------
+   $14370 walks the route one record at a time; the record's mode selects
+   where the incoming screen is pasted relative to the outgoing one (table
+   $144B6: mode 0 right, 1 left, 2 above, 3 below).  Reconstruct that walk
+   once at level load so every world coordinate can be resolved to a route
+   index, and so the camera knows how tall the stage really is.
+
+   The first route entry is always the stage entrance, so after normalising
+   the upward steps it sits on the bottom row of the grid. */
+#define LEVEL_SCREEN_H     224           /* MD V28 picture: 28 tile rows */
+#define LEVEL_SCREEN_ROWS  28
+#define LEVEL_MAX_SCREENS  40
+#define LEVEL_GRID_COLS    40
+#define LEVEL_GRID_ROWS    20   /* slot 12 is a 17-screen tower */
+static unsigned char g_screen_col[LEVEL_MAX_SCREENS];
+static unsigned char g_screen_row[LEVEL_MAX_SCREENS];
+static unsigned char g_screen_grid[LEVEL_GRID_ROWS*LEVEL_GRID_COLS];
+static int g_screen_count;
+
+static void build_level_layout(void)
 {
-    int screen,seg,lx;
-    if(!g_level||!g_stage_set||world_col<0||world_col>=g_level_width_tiles||row<0||row>=30)return FG_TILE_BASE_INDEX;
-    screen=world_col>>5; lx=world_col&31; if(screen>=g_level->route_len)return FG_TILE_BASE_INDEX;
-    seg=g_level->route[screen]; if(seg==255||seg>=g_stage_set->segment_count)return FG_TILE_BASE_INDEX;
-    return relocate_bat(g_stage_set->segment_bat[(seg*30+row)*32+lx],FG_TILE_BASE_INDEX);
+    signed char rows[LEVEL_MAX_SCREENS];
+    int i,c=0,r=0,min_r=0,max_r=0,max_c=0,n=g_level->route_len;
+    if(n>LEVEL_MAX_SCREENS)n=LEVEL_MAX_SCREENS;
+    g_screen_count=n;
+    for(i=0;i<LEVEL_GRID_ROWS*LEVEL_GRID_COLS;++i)g_screen_grid[i]=255;
+    g_screen_col[0]=0;rows[0]=0;
+    for(i=1;i<n;++i){
+        switch(g_level->route_modes[i]){
+        case 1: if(c>0)--c; break;
+        case 2: --r; break;
+        case 3: ++r; break;
+        default: ++c; break;
+        }
+        if(c>LEVEL_GRID_COLS-1)c=LEVEL_GRID_COLS-1;
+        if(r<min_r)min_r=r;
+        if(r>max_r)max_r=r;
+        if(c>max_c)max_c=c;
+        g_screen_col[i]=(unsigned char)c;rows[i]=(signed char)r;
+    }
+    if(max_r-min_r>LEVEL_GRID_ROWS-1)max_r=min_r+LEVEL_GRID_ROWS-1;
+    g_level_rows=max_r-min_r+1;
+    g_level_cols=max_c+1;
+    for(i=0;i<n;++i){
+        int gr=rows[i]-min_r;
+        if(gr<0)gr=0; if(gr>=g_level_rows)gr=g_level_rows-1;
+        g_screen_row[i]=(unsigned char)gr;
+        /* A later pass over the same cell wins, exactly as the streamer's
+           quadrant overwrite does when a route doubles back. */
+        g_screen_grid[gr*LEVEL_GRID_COLS+g_screen_col[i]]=(unsigned char)i;
+    }
+}
+
+/* Split a world tile row into (grid row, row inside the 30-row segment).
+   Only the bottom screen owns the two extension rows below the 224-line
+   picture, which is where the HUD band lives. */
+static int split_world_row(int tile_row,int *local)
+{
+    int r=0;
+    while(tile_row>=LEVEL_SCREEN_ROWS && r+1<g_level_rows){tile_row-=LEVEL_SCREEN_ROWS;++r;}
+    *local=tile_row;
+    return r;
+}
+
+/* Route index covering a world tile, or -1 where the path never goes. */
+static int screen_index_at(int world_col,int grid_row)
+{
+    int sc=world_col>>5,si;
+    if(sc<0||sc>=LEVEL_GRID_COLS||grid_row<0||grid_row>=g_level_rows)return -1;
+    si=g_screen_grid[grid_row*LEVEL_GRID_COLS+sc];
+    return (si==255)?-1:si;
+}
+
+/* Flat generator coordinates are (route index * 256 + offset); with stacked
+   screens the route index no longer equals the world column, so both axes
+   have to be rebuilt from it. */
+static int route_index_for_flat_x(int flat_x)
+{
+    int si=flat_x>>8;
+    if(si<0)si=0;
+    if(si>=g_screen_count)si=g_screen_count-1;
+    return si;
+}
+
+static int world_x_from_flat(int flat_x)
+{
+    if(g_in_boss||!g_level)return flat_x;
+    return (int)g_screen_col[route_index_for_flat_x(flat_x)]*256+(flat_x&255);
+}
+
+static int world_y_from_flat(int flat_x,int y)
+{
+    if(g_in_boss||!g_level)return y;
+    return (int)g_screen_row[route_index_for_flat_x(flat_x)]*LEVEL_SCREEN_H+y;
+}
+
+static u16 level_fg_bat_entry(int world_col,int tile_row)
+{
+    int seg,lx,si,lr;
+    if(!g_level||!g_stage_set||world_col<0||world_col>=g_level_width_tiles||tile_row<0)
+        return FG_TILE_BASE_INDEX;
+    si=screen_index_at(world_col,split_world_row(tile_row,&lr));
+    if(si<0||lr<0||lr>=30)return FG_TILE_BASE_INDEX;
+    lx=world_col&31;
+    seg=g_level->route[si]; if(seg==255||seg>=g_stage_set->segment_count)return FG_TILE_BASE_INDEX;
+    return relocate_bat(g_stage_set->segment_bat[(seg*30+lr)*32+lx],FG_TILE_BASE_INDEX);
 }
 
 static void stream_level_column(int world_col, int display_enabled)
@@ -1186,14 +1306,39 @@ static void stream_level_column(int world_col, int display_enabled)
 
     /* A BAT column is contiguous when MAWR advances by the 64-word map
        stride. Select the address once, stream the column, then restore the
-       normal +1 CHR/BAT mode used by sprite and pattern uploads. */
+       normal +1 CHR/BAT mode used by sprite and pattern uploads.
+
+       The column covers the whole 32-row BAT, which is the vertical window
+       the camera can be showing: world row R always lands on BAT row R&31,
+       so the burst has to be split where it wraps off the bottom. */
     vdc_setreg(chip,VDC_REG_CR,
                (u16)(planes|VDC_CR_IW_40));
-    vdc_set_vram_write(chip,(u16)map_col);
-    for(row=0;row<30;++row)
-        vdc_vram_write(chip,level_fg_bat_entry(world_col,row));
+    {
+        int first=g_camera_row-1,bat=first&(FG_BAT_H-1),head=FG_BAT_H-bat;
+        vdc_set_vram_write(chip,(u16)(bat*FG_BAT_W+map_col));
+        for(row=0;row<head;++row)
+            vdc_vram_write(chip,level_fg_bat_entry(world_col,first+row));
+        if(bat){
+            vdc_set_vram_write(chip,(u16)map_col);
+            for(;row<FG_BAT_H;++row)
+                vdc_vram_write(chip,level_fg_bat_entry(world_col,first+row));
+        }
+    }
     vdc_setreg(chip,VDC_REG_CR,
                (u16)(planes|VDC_CR_IW_01));
+}
+
+/* The vertical counterpart: one full 64-cell BAT row, used when a stacked
+   level scrolls a new tile row into the window. */
+static void stream_level_row(int world_row)
+{
+    int col,chip=level_stage_chip(),map_row=world_row&(FG_BAT_H-1);
+    if(world_row<0)return;
+    vdc_set_vram_write(chip,(u16)(map_row*FG_BAT_W));
+    for(col=0;col<FG_BAT_W;++col){
+        int world_col=g_camera_tile+((col-g_camera_tile)&(FG_BAT_W-1));
+        vdc_vram_write(chip,level_fg_bat_entry(world_col,world_row));
+    }
 }
 
 static int level_uses_front_backdrop(void)
@@ -1232,15 +1377,24 @@ static void upload_level_backdrop(void)
 static void init_level_ring(void)
 {
     int col,i,chip;
-    g_level=&g_game_levels[g_current_level]; g_stage_set=&g_stage_sets[g_level->set_index]; g_level_width_tiles=g_level->route_len*32;
+    g_level=&g_game_levels[g_current_level]; g_stage_set=&g_stage_sets[g_level->set_index];
+    build_level_layout(); g_level_width_tiles=g_level_cols*32;
     clear_bat(BACK_CHIP,BG_BAT_WORDS); clear_bat(FRONT_CHIP,FG_BAT_WORDS);
+    set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
+    if(g_level_rows>1) set_map_height(level_stage_chip(),1);
     upload_level_backdrop();
     chip=level_stage_chip();
     vdc_set_vram_write(chip,FG_TILE_BASE_WORD);
     for(i=0;i<g_stage_set->tile_count*TILE_WORDS;++i)vdc_vram_write(chip,g_stage_set->tile_words[i]);
-    for(col=0;col<FG_BAT_W;++col)stream_level_column(col,0);
+    /* The route always starts on the bottom row of the grid, so the camera
+       opens there and climbs. */
     g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
-    vdc_set_scroll(BACK_CHIP,0,0);vdc_set_scroll(FRONT_CHIP,0,0);
+    g_camera_y=g_camera_target_y=(g_level_rows-1)*LEVEL_SCREEN_H;
+    g_camera_row=g_camera_y>>3;
+    for(col=0;col<FG_BAT_W;++col)stream_level_column(col,0);
+    vdc_set_scroll(BACK_CHIP,0,0);
+    vdc_set_scroll(FRONT_CHIP,0,0);
+    vdc_set_scroll(level_stage_chip(),0,(u16)(g_camera_y&0x00FF));
     upload_game_sprites(); set_game_palette_fade(16);
 }
 
@@ -1258,8 +1412,10 @@ static unsigned char collision_at(int x,int y)
         return g_boss_collision[ci*1024+(y>>3)*32+(x>>3)];
     }
     if(x<0)return 1;tx=x>>3;ty=y>>3;
-    if(!g_level||tx<0||tx>=g_level_width_tiles)return 1;if(ty<0)return 0;if(ty>=32)return 0;
-    screen=tx>>5;lx=tx&31;if(screen>=g_level->route_len)return 1;seg=g_level->route[screen];if(seg==255||seg>=g_stage_set->segment_count)return 0;
+    if(!g_level||tx<0||tx>=g_level_width_tiles)return 1;if(ty<0)return 0;
+    {int lr;screen=screen_index_at(tx,split_world_row(ty,&lr));ty=lr;}
+    if(screen<0||ty<0||ty>=32)return 0;
+    lx=tx&31;seg=g_level->route[screen];if(seg==255||seg>=g_stage_set->segment_count)return 0;
     return g_stage_set->collision[seg*1024+ty*32+lx];
 }
 
@@ -1492,6 +1648,7 @@ static void update_camera(void)
 {
     if(g_in_boss){
         g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
+        g_camera_y=0;g_camera_target_y=0;g_camera_row=0;
         vdc_set_scroll(FRONT_CHIP,0,0);
         /* Handler $940E continuously advances the final room's wall plane;
            its collision/platform plane remains fixed. */
@@ -1499,9 +1656,12 @@ static void update_camera(void)
         return;
     }
     int px=(int)(g_player_x>>FIX_SHIFT);
+    int py=(int)(g_player_y>>FIX_SHIFT);
     int max_camera=g_level_width_tiles*8-SCREEN_W;
+    int max_camera_y=(g_level_rows-1)*LEVEL_SCREEN_H;
     int target=g_camera_x;
-    int new_tile;
+    int target_y=g_camera_y;
+    int new_tile,new_row;
 
     /* The MD stage camera does not re-center on Mario every frame. Keep Mario
        inside a forward dead-zone and never pull the map backwards because an
@@ -1519,6 +1679,21 @@ static void update_camera(void)
        BAT column.  The VDC fetch window retains a few pixels to the left of
        BXR, so replacing a column at the exact 8-pixel boundary exposes a
        sliver of the far-ahead column as scrolling garbage on the left edge. */
+    /* Vertical follow first: a new BAT row has to be pasted with the window
+       the columns are about to be streamed against.  There is no one-way
+       rule here -- the source's climbs are walked back down again -- so the
+       camera keeps Mario inside a band and clamps to the stacked height. */
+    if(g_level_rows>1){
+        if(py-target_y<72)target_y=py-72;
+        if(py-target_y>144)target_y=py-144;
+        if(target_y<0)target_y=0;
+        if(target_y>max_camera_y)target_y=max_camera_y;
+        new_row=target_y>>3;
+        while(g_camera_row<new_row){++g_camera_row;stream_level_row(g_camera_row+30);}
+        while(g_camera_row>new_row){--g_camera_row;stream_level_row(g_camera_row-1);}
+    }else target_y=0;
+    g_camera_target_y=target_y;
+
     new_tile=(target>=16)?((target>>3)-1):0;
     while (g_camera_tile<new_tile) {
         ++g_camera_tile;
@@ -1542,9 +1717,12 @@ static void commit_stage_camera(void)
        split from late scroll writes without putting a VRAM-write burst in the
        leading blanking interval, where it can disturb KING ADPCM playback. */
     g_camera_x=g_camera_target_x;
+    g_camera_y=g_camera_target_y;
     stage_chip=level_stage_chip();
     backdrop_chip=level_backdrop_chip();
-    vdc_set_scroll(stage_chip,(u16)(g_camera_x&0x01FF),0);
+    /* The stage BAT is 64x32 cells, so the vertical scroll wraps every 256
+       pixels; the streamer keeps world row R on BAT row R&31 to match. */
+    vdc_set_scroll(stage_chip,(u16)(g_camera_x&0x01FF),(u16)(g_camera_y&0x00FF));
     /* Level 6/7's "backdrop" map is really the stage's foreground scenery and
        is dithered against the stage plane behind it.  Half-rate parallax slides
        that dither over a plane moving at a different speed, so the checkerboard
@@ -1663,15 +1841,16 @@ static void init_moving_platforms(void)
         const StageObjectData *so=stage_objects();
         for (i=0;i<so->record_count && g_moving_platform_count<MAX_MOVING_PLATFORMS;++i) {
             const short *rec=so->records+i*STAGE_OBJECT_RECORD_WORDS;
+            int ry=world_y_from_flat(rec[0],rec[1]);
             p=&g_moving_platforms[g_moving_platform_count++];
-            p->x=p->home_x=(s32)rec[0]<<FIX_SHIFT;
-            p->y=p->home_y=(s32)rec[1]<<FIX_SHIFT;
+            p->x=p->home_x=(s32)world_x_from_flat(rec[0])<<FIX_SHIFT;
+            p->y=p->home_y=(s32)ry<<FIX_SHIFT;
             p->shape=(unsigned char)rec[2];
             p->kind=(unsigned char)rec[3];
             p->state=PLATFORM_STATE_IDLE;p->timer=0;p->step=0;
             /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
             p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
-            p->min_y=rec[1];p->max_y=(short)(rec[1]+32);
+            p->min_y=(short)ry;p->max_y=(short)(ry+32);
         }
     }
 }
@@ -1679,9 +1858,19 @@ static void init_moving_platforms(void)
 /* One $F4FA stage-object handler per kind.  All of them move the record and
    let the shared rider fix-up below carry whoever is standing on it, which is
    what $F546 does for the 68000. */
+/* The $F934/$F980 wrap thresholds are screen-space constants.  On a stacked
+   level each carrier belongs to the storey it was authored on, so anchor the
+   wrap to that screen instead of to the top of the world. */
+static int platform_storey_base(const MovingPlatform *p)
+{
+    int home=(int)(p->home_y>>FIX_SHIFT);
+    if(g_level_rows<=1||home<0)return 0;
+    return (home/LEVEL_SCREEN_H)*LEVEL_SCREEN_H;
+}
+
 static void update_stage_object(MovingPlatform *p, int index)
 {
-    int y;
+    int y,base;
     switch (p->kind) {
     case PLATFORM_KIND_STATIC:
         break;
@@ -1690,12 +1879,13 @@ static void update_stage_object(MovingPlatform *p, int index)
         if (++p->timer>=70) { p->timer=0; p->dir=(signed char)-p->dir; }
         break;
     case PLATFORM_KIND_FALLER:       /* $F8E2 */
+        base=platform_storey_base(p);
         if (p->state==PLATFORM_STATE_IDLE) {
             if (g_on_moving_platform==index) p->state=PLATFORM_STATE_FALL;
             break;
         }
         p->y+=4*FIX_ONE;
-        if ((int)(p->y>>FIX_SHIFT)>=PLATFORM_WRAP_BOTTOM) {
+        if ((int)(p->y>>FIX_SHIFT)>=base+PLATFORM_WRAP_BOTTOM) {
             /* $1312A despawns it; the record is restored once it is off camera
                so a second pass over the same trigger finds it again. */
             if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
@@ -1703,19 +1893,21 @@ static void update_stage_object(MovingPlatform *p, int index)
         }
         break;
     case PLATFORM_KIND_DESCEND:      /* $F934 */
+        base=platform_storey_base(p);
         p->y+=FIX_ONE;
         y=(int)(p->y>>FIX_SHIFT);
-        if (y>=PLATFORM_WRAP_BOTTOM) {
+        if (y>=base+PLATFORM_WRAP_BOTTOM) {
             if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
-            p->y=(s32)PLATFORM_WRAP_TOP<<FIX_SHIFT;
+            p->y=(s32)(base+PLATFORM_WRAP_TOP)<<FIX_SHIFT;
         }
         break;
     case PLATFORM_KIND_ASCEND:       /* $F980 */
+        base=platform_storey_base(p);
         p->y-=FIX_ONE;
         y=(int)(p->y>>FIX_SHIFT);
-        if (y<=PLATFORM_WRAP_CEIL) {
+        if (y<=base+PLATFORM_WRAP_CEIL) {
             if (g_on_moving_platform==index) { g_on_moving_platform=-1; g_grounded=0; }
-            p->y=(s32)PLATFORM_WRAP_REBASE<<FIX_SHIFT;
+            p->y=(s32)(base+PLATFORM_WRAP_REBASE)<<FIX_SHIFT;
         }
         break;
     case PLATFORM_KIND_PATH:         /* $F9C6 */
@@ -1838,13 +2030,22 @@ static void init_objects(void)
     for(i=0;i<4;++i)g_enemy_shots[i].active=0;
     if(!g_in_boss && g_level){
         for(i=0;i<g_level->crate_count && i<MAX_CRATES;++i){
-            g_crates[i].x=(s32)g_level->crates[i*3]<<FIX_SHIFT;g_crates[i].y=(s32)(g_level->crates[i*3+1]-ycrop)<<FIX_SHIFT;
+            int fx=g_level->crates[i*3];
+            g_crates[i].x=(s32)world_x_from_flat(fx)<<FIX_SHIFT;
+            g_crates[i].y=(s32)world_y_from_flat(fx,g_level->crates[i*3+1]-ycrop)<<FIX_SHIFT;
             g_crates[i].vx=g_crates[i].vy=0;g_crates[i].extra=(unsigned char)g_level->crates[i*3+2];g_crates[i].active=1;g_crates[i].flight_timer=0;
         }
-        for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){g_gems[i].x=g_level->gems[i*2];g_gems[i].y=g_level->gems[i*2+1]-ycrop;g_gems[i].active=1;}
+        for(i=0;i<g_level->gem_count && i<MAX_GEMS;++i){
+            int fx=g_level->gems[i*2];
+            g_gems[i].x=(short)world_x_from_flat(fx);
+            g_gems[i].y=(short)world_y_from_flat(fx,g_level->gems[i*2+1]-ycrop);
+            g_gems[i].active=1;
+        }
         for(i=0;i<g_level->enemy_count && i<MAX_ENEMIES;++i){
             const short *e=&g_level->enemies[i*ENEMY_RECORD_WORDS];
-            g_enemies[i].x=(s32)e[0]<<FIX_SHIFT;g_enemies[i].y=(s32)(e[1]-ycrop)<<FIX_SHIFT;g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
+            g_enemies[i].x=(s32)world_x_from_flat(e[0])<<FIX_SHIFT;
+            g_enemies[i].y=(s32)world_y_from_flat(e[0],e[1]-ycrop)<<FIX_SHIFT;
+            g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
             /* Flying Koopas and CHIP use the terrain-independent patrol.
@@ -1893,7 +2094,7 @@ static void update_crates(void)
                have completely left the visible 256-pixel playfield. */
             c->x+=c->vx;c->y+=c->vy;
             sx=(int)(c->x>>FIX_SHIFT)-g_camera_x;
-            sy=(int)(c->y>>FIX_SHIFT);
+            sy=(int)(c->y>>FIX_SHIFT)-g_camera_y;
             if ((c->vx>0 && sx>256) || (c->vx<0 && sx+CRATE_W<0) ||
                 sy+CRATE_H<0 || sy>240)
                 c->active=0;
@@ -2199,7 +2400,7 @@ static void update_items(void)
             it->y += it->vy;
             x = (int)(it->x >> FIX_SHIFT); y = (int)(it->y >> FIX_SHIFT);
             bottom = y + ITEM_H - 1;
-            if (y > 240) { it->active = 0; continue; }
+            if (y > g_camera_y+240) { it->active = 0; continue; }
             if (it->vy >= 0 && (solid_v(x+3,bottom) || solid_v(x+ITEM_W-4,bottom))) {
                 it->y = (s32)(((bottom>>3)<<3) - ITEM_H) << FIX_SHIFT;
                 it->vy = 0;
@@ -2276,7 +2477,7 @@ static void update_enemies(void)
             e->vy+=48;
             if (e->vy>6*FIX_ONE) e->vy=6*FIX_ONE;
             e->y+=e->vy;
-            if ((int)(e->y>>FIX_SHIFT)>256) e->active=0;
+            if ((int)(e->y>>FIX_SHIFT)>g_camera_y+256) e->active=0;
             continue;
         }
 
@@ -2296,6 +2497,10 @@ static void update_enemies(void)
             e->spawned=1;
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
+        /* Stacked levels repeat the same world X on every storey, so an
+           enemy two screens up is horizontally in range while being nowhere
+           near the view. */
+        if (g_level_rows>1 && (y<g_camera_y-96 || y>g_camera_y+336)) continue;
 
         /* The stopwatch item skips $B6E0's behavior dispatch and nothing else,
            so a frozen enemy still collides: it can be stomped, hit by a thrown
@@ -2497,7 +2702,7 @@ static void update_enemies(void)
                 }
                 x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
                 /* $130C6 retires it once it has rolled past the view. */
-                if(x-g_camera_x>320||y>256)e->active=0;
+                if(x-g_camera_x>320||y>g_camera_y+256)e->active=0;
                 goto enemy_attack_checks;
             }
         }
@@ -2652,7 +2857,7 @@ static void update_enemy_shots(void)
             s->x+=s->vx;s->vy+=48;if(s->vy>4*FIX_ONE)s->vy=4*FIX_ONE;s->y+=s->vy;
         }
         x=(int)(s->x>>FIX_SHIFT);y=(int)(s->y>>FIX_SHIFT);
-        if(x<g_camera_x-40||x>g_camera_x+280||y>240){s->active=0;continue;}
+        if(x<g_camera_x-40||x>g_camera_x+280||y>g_camera_y+240){s->active=0;continue;}
         w=s->cols?s->cols*16:16;
         if(g_invuln==0&&aabb(px,py,PLAYER_BODY_W,PLAYER_BODY_H,x,y,w,16)){hurt_player();s->active=0;}
     }
@@ -2717,7 +2922,7 @@ static void draw_game_sprites(void)
     int i, n = 0;
     int frame = current_player_frame();
     int px = (int)(g_player_x >> FIX_SHIFT) - g_camera_x;
-    int py = (int)(g_player_y >> FIX_SHIFT) + bowser_room_object_y_offset();
+    int py = (int)(g_player_y >> FIX_SHIFT) - g_camera_y + bowser_room_object_y_offset();
     u16 base = (u16)(g_satb_page ? SATB_BASE1 : SATB_BASE0);
     /* Every normal-level palette carries the original Mario/object colors in
        source line 0 (identical across all 19 level palettes).  r11 moved
@@ -2767,7 +2972,7 @@ static void draw_game_sprites(void)
         g_crates[g_carry_index].active && g_crates[g_carry_index].carried && n<64) {
         Crate *c=&g_crates[g_carry_index];
         int sx=(int)(c->x>>FIX_SHIFT)-g_camera_x;
-        int sy=(int)(c->y>>FIX_SHIFT)+bowser_room_object_y_offset();
+        int sy=(int)(c->y>>FIX_SHIFT)-g_camera_y+bowser_room_object_y_offset();
         if (sx>=-32 && sx<=255 && sy>=-32 && sy<=239) {
             u16 addr=CRATE_BASE_WORD,pal=player_pal;
             int width=2,height=2;
@@ -2832,7 +3037,7 @@ static void draw_game_sprites(void)
         for (i = 0; i < MAX_GEMS && n < 50; ++i) {
             int sx, sy;
             if (!g_gems[i].active) continue;
-            sx = g_gems[i].x - g_camera_x; sy = g_gems[i].y;
+            sx = g_gems[i].x - g_camera_x; sy = g_gems[i].y - g_camera_y;
             if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
             set_sprite_entry(satb,n++,sx,sy,(u16)(GEM_BASE_WORD + gf*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
         }
@@ -2844,7 +3049,7 @@ static void draw_game_sprites(void)
         int sx, sy;
         if (!g_items[i].active) continue;
         sx = (int)(g_items[i].x >> FIX_SHIFT) - g_camera_x;
-        sy = (int)(g_items[i].y >> FIX_SHIFT);
+        sy = (int)(g_items[i].y >> FIX_SHIFT) - g_camera_y;
         if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
         set_sprite_entry(satb,n++,sx,sy,
             (u16)(ITEM_BASE_WORD + (g_items[i].kind-1)*ITEM_CELL_WORDS),
@@ -2855,7 +3060,7 @@ static void draw_game_sprites(void)
         int sx, sy;
         if (!g_crates[i].active || g_crates[i].carried) continue;
         sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
-        sy = (int)(g_crates[i].y >> FIX_SHIFT) + bowser_room_object_y_offset();
+        sy = (int)(g_crates[i].y >> FIX_SHIFT) - g_camera_y + bowser_room_object_y_offset();
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
         {u16 addr=CRATE_BASE_WORD,pal=player_pal; int width=2,height=2;
         if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
@@ -2878,7 +3083,7 @@ static void draw_game_sprites(void)
     for (i=0;i<g_moving_platform_count && n<58;++i) {
         MovingPlatform *mp=&g_moving_platforms[i];
         int sx=platform_draw_x(mp)-g_camera_x;
-        int sy=platform_draw_y(mp);
+        int sy=platform_draw_y(mp)-g_camera_y;
         if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
         if(PLATFORM_KIND_IS_STAGE_OBJECT(mp->kind)){
             /* Cells are stored row-major with an even pitch, so each pair is
@@ -2923,7 +3128,7 @@ static void draw_game_sprites(void)
        objects can exhaust the 64-entry SATB, and dropping the thing that
        hurts the player is worse than dropping one enemy cell. */
     for(i=0;i<4&&n<62;++i)if(g_enemy_shots[i].active){
-        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-g_camera_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT);
+        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-g_camera_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT)-g_camera_y;
         int c;
         for(c=0;c<g_enemy_shots[i].cols&&n<62;++c)
             set_sprite_entry(satb,n++,sx+c*16,sy,(u16)(g_enemy_shots[i].base+c*64),
@@ -2934,7 +3139,7 @@ static void draw_game_sprites(void)
         int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0,use_atk=0,use_atk2=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
-        sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT);
+        sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT)-g_camera_y;
         /* The mimic's authored Y is the crate baseline.  Its revealed body
            grows upward from that footprint rather than down into the floor. */
         if(e->kind==ENEMY_KIND_CRATE_MIMIC){
@@ -3131,7 +3336,7 @@ static void draw_game_sprites(void)
         u16 ctrl=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|player_pal);
         if (!g_fireballs[i].active) continue;
         sx=(int)(g_fireballs[i].x>>FIX_SHIFT)-g_camera_x;
-        sy=(int)(g_fireballs[i].y>>FIX_SHIFT);
+        sy=(int)(g_fireballs[i].y>>FIX_SHIFT)-g_camera_y;
         if (sx<-32 || sx>255 || sy<-32 || sy>239) continue;
         if (g_fireballs[i].vx<0) ctrl|=VDC_SPR_X_INVERT;
         set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,ctrl);
@@ -3185,6 +3390,7 @@ static void load_continue_hidden(void)
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     clear_bat(BACK_CHIP,BG_BAT_WORDS);
     clear_bat(FRONT_CHIP,FG_BAT_WORDS);
+    set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
     upload_tiles(BACK_CHIP,CONTINUE_TILE_BASE_WORD,&g_continue_base_asset);
     for (y=0;y<30;++y) {
         vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));
@@ -3224,11 +3430,12 @@ static void start_boss(int fade_in)
     const unsigned short *bp;
     const BossVisualData *bv;
     const BossRoomData *br;
-    g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32;
+    g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32; g_level_rows=1;
     music_transition_to_boss();
     g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
     clear_bat(BACK_CHIP,BG_BAT_WORDS);clear_bat(FRONT_CHIP,FG_BAT_WORDS);
+    set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
     vdc_set_vram_write(BACK_CHIP,BOSS_BG_TILE_BASE_WORD);
     for(i=0;i<(bv?bv->bg_tile_count:br->tile_count)*TILE_WORDS;++i)vdc_vram_write(BACK_CHIP,bv?bv->bg_tile_words[i]:br->tile_words[i]);
     /* The final wall scrolls through a 224-line (28-row) source. Populate two
@@ -3861,8 +4068,8 @@ static void start_gameplay(int fade_in)
     init_level_ring();
     init_objects();
     ycrop=(g_current_level==2)?8:0;
-    g_player_x=(s32)g_level->spawn_x<<FIX_SHIFT;
-    g_player_y=(s32)(g_level->spawn_y-ycrop)<<FIX_SHIFT;
+    g_player_x=(s32)world_x_from_flat(g_level->spawn_x)<<FIX_SHIFT;
+    g_player_y=(s32)world_y_from_flat(g_level->spawn_x,g_level->spawn_y-ycrop)<<FIX_SHIFT;
 #ifdef FORCE_PLAYER_X
     g_player_x=(s32)FORCE_PLAYER_X<<FIX_SHIFT;
 #endif
@@ -4051,10 +4258,12 @@ static void update_play(u16 btn, u16 pressed)
     }
 
     /* Falling through an open pit is fatal once Mario leaves the 224-line
-       source playfield. The visual extension rows remain non-colliding. */
-    if ((int)(g_player_y>>FIX_SHIFT)>224) {
+       source playfield. The visual extension rows remain non-colliding.
+       In a stacked level only the bottom screen's floor is the pit: falling
+       out of an upper screen simply lands him on the one below. */
+    if ((int)(g_player_y>>FIX_SHIFT)>g_level_rows*LEVEL_SCREEN_H) {
         if(g_debug_mode){
-            g_player_y=(s32)96<<FIX_SHIFT;g_vy=0;g_jump_active=0;g_bounce_active=0;
+            g_player_y=(s32)(g_camera_y+96)<<FIX_SHIFT;g_vy=0;g_jump_active=0;g_bounce_active=0;
             draw_game_sprites();return;
         }
         begin_player_death();
