@@ -2283,7 +2283,16 @@ static void update_enemies(void)
         /* The source only advances encounter objects close to the raster.
            Keep the same generous pre-roll: 48 px left, 64 px right. */
         if (!e->spawned) {
-            if (x>g_camera_x+320) continue;
+            /* Every other record is authored at object X $180, which is the
+               right edge when the streamer's tile trigger fires, so the shared
+               pre-roll matches the source.  The rocks are authored at $D8..$E8
+               -- screen 88..104, the middle of the view -- because they are
+               meant to come down into the hole the player is walking up to.
+               Starting them on the 320-pixel pre-roll dropped them some 200
+               pixels of camera travel early: they had bounced away east and
+               been retired by $130C6 before the hole was ever on screen, which
+               is why none of level 10's five rocks were ever seen. */
+            if (x>g_camera_x+((e->kind==ENEMY_KIND_BOULDER)?112:320)) continue;
             e->spawned=1;
         }
         if (x<g_camera_x-48 || x>g_camera_x+320) continue;
