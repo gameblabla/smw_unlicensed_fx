@@ -1201,8 +1201,16 @@ static void prepare_hud_band_cell(void)
 
    The first route entry is always the stage entrance, so after normalising
    the upward steps it sits on the bottom row of the grid. */
-#define LEVEL_SCREEN_H     224           /* MD V28 picture: 28 tile rows */
-#define LEVEL_SCREEN_ROWS  28
+/* A stacked storey is pasted one whole collision quadrant away, not one
+   picture: the quadrants of the 64x64 buffer are 32 cells tall, $14370 only
+   loads the next record once the scroll accumulator has completed a multiple
+   of 256, and $10A8E takes the vertical trigger phase modulo 256 as well.
+   The V28 picture shows the top 224 lines of each 256-pixel storey; the 32
+   lines below carry the segment's four unused map rows, which is where the
+   climb between two storeys passes. */
+#define LEVEL_SCREEN_H     256
+#define LEVEL_SCREEN_ROWS  32
+#define LEVEL_PICTURE_ROWS 28           /* MD V28 picture inside the storey */
 #define LEVEL_MAX_SCREENS  40
 #define LEVEL_GRID_COLS    40
 #define LEVEL_GRID_ROWS    20   /* slot 12 is a 17-screen tower */
@@ -1337,8 +1345,16 @@ static u16 level_fg_bat_entry(int world_col,int tile_row)
     int seg,lx,si,lr;
     if(!g_level||!g_stage_set||world_col<0||world_col>=g_level_width_tiles||tile_row<0)
         return FG_TILE_BASE_INDEX;
-    si=screen_index_at(world_col,split_world_row(tile_row,&lr));
-    if(si<0||lr<0||lr>=30)return FG_TILE_BASE_INDEX;
+    {
+        int gr=split_world_row(tile_row,&lr);
+        si=screen_index_at(world_col,gr);
+        /* Only the bottom storey keeps the two duplicated rows under the
+           picture -- that band is the HUD's.  Between storeys the source's
+           own map rows 28..31 are blank, and so is the gap here. */
+        if(lr>=LEVEL_PICTURE_ROWS && (lr>=30 || gr!=g_level_rows-1))
+            return FG_TILE_BASE_INDEX;
+    }
+    if(si<0||lr<0)return FG_TILE_BASE_INDEX;
     lx=world_col&31;
     seg=g_level->route[si]; if(seg==255||seg>=g_stage_set->segment_count)return FG_TILE_BASE_INDEX;
     return relocate_bat(g_stage_set->segment_bat[(seg*30+lr)*32+lx],FG_TILE_BASE_INDEX);
