@@ -1258,6 +1258,41 @@ static int screen_index_at(int world_col,int grid_row)
     return (si==255)?-1:si;
 }
 
+/* The Mega Drive never has more than the live room and its successor in the
+   collision buffer, so Mario cannot leave the room he is in: $17238 lets him
+   walk right only as far as screen x $160 unless FF0050 == 0 (the route
+   continues to the right), and $170F8 mirrors that on the left at x $80.
+   Here the whole grid is resident at once, so the equivalent limit is the
+   contiguous run of pathed cells around him -- along his storey for the
+   horizontal camera, and up his shaft for the vertical one.  Empty grid cells
+   are exactly the screens the route never visits, which is what the camera
+   used to scroll into. */
+static void screen_run_x(int grid_row,int sc,int *lo,int *hi)
+{
+    int i;
+    *lo=0;*hi=g_level_cols-1;
+    if(grid_row<0||grid_row>=g_level_rows)return;
+    if(sc<0)sc=0; if(sc>g_level_cols-1)sc=g_level_cols-1;
+    if(g_screen_grid[grid_row*LEVEL_GRID_COLS+sc]==255)return;
+    for(i=sc;i>0&&g_screen_grid[grid_row*LEVEL_GRID_COLS+i-1]!=255;--i){}
+    *lo=i;
+    for(i=sc;i<g_level_cols-1&&g_screen_grid[grid_row*LEVEL_GRID_COLS+i+1]!=255;++i){}
+    *hi=i;
+}
+
+static void screen_run_y(int sc,int grid_row,int *lo,int *hi)
+{
+    int i;
+    *lo=0;*hi=g_level_rows-1;
+    if(sc<0||sc>=g_level_cols)return;
+    if(grid_row<0)grid_row=0; if(grid_row>g_level_rows-1)grid_row=g_level_rows-1;
+    if(g_screen_grid[grid_row*LEVEL_GRID_COLS+sc]==255)return;
+    for(i=grid_row;i>0&&g_screen_grid[(i-1)*LEVEL_GRID_COLS+sc]!=255;--i){}
+    *lo=i;
+    for(i=grid_row;i<g_level_rows-1&&g_screen_grid[(i+1)*LEVEL_GRID_COLS+sc]!=255;++i){}
+    *hi=i;
+}
+
 /* Flat generator coordinates are (route index * 256 + offset); with stacked
    screens the route index no longer equals the world column, so both axes
    have to be rebuilt from it. */
@@ -1644,6 +1679,20 @@ static const signed char g_flying_koopa_dy[58]={
     -1,-1,-2,-2,-2,-2,-3,-3,-3,-3,-4,-4,-4
 };
 
+/* True once Mario has walked off the right of the route's final screen. */
+static int level_exit_reached(void)
+{
+    int px=(int)(g_player_x>>FIX_SHIFT);
+    if(g_level_rows<=1)return px>=g_level_width_tiles*8-48;
+    if(g_screen_count<=0)return 0;
+    {
+        int last=g_screen_count-1,lr;
+        int gr=split_world_row((int)((g_player_y>>FIX_SHIFT)+16)>>3,&lr);
+        if(gr!=(int)g_screen_row[last])return 0;
+        return px>=(int)g_screen_col[last]*256+256-48;
+    }
+}
+
 static void update_camera(void)
 {
     if(g_in_boss){
@@ -1659,9 +1708,27 @@ static void update_camera(void)
     int py=(int)(g_player_y>>FIX_SHIFT);
     int max_camera=g_level_width_tiles*8-SCREEN_W;
     int max_camera_y=(g_level_rows-1)*LEVEL_SCREEN_H;
+    int min_camera=0;
+    int min_camera_y=0;
     int target=g_camera_x;
     int target_y=g_camera_y;
     int new_tile,new_row;
+
+    /* Confine the viewport to the storey and shaft Mario is actually standing
+       in, so a level that climbs no longer scrolls sideways over screens its
+       route never visits. */
+    if(g_level_rows>1){
+        int lo,hi,gr,lr,sc=(px+8)>>8;
+        gr=split_world_row((py+16)>>3,&lr);
+        screen_run_x(gr,sc,&lo,&hi);
+        min_camera=lo*256;
+        if((hi+1)*256-SCREEN_W<max_camera)max_camera=(hi+1)*256-SCREEN_W;
+        screen_run_y(sc,gr,&lo,&hi);
+        min_camera_y=lo*LEVEL_SCREEN_H;
+        if(hi*LEVEL_SCREEN_H<max_camera_y)max_camera_y=hi*LEVEL_SCREEN_H;
+        if(max_camera<min_camera)max_camera=min_camera;
+        if(max_camera_y<min_camera_y)max_camera_y=min_camera_y;
+    }
 
     /* The MD stage camera does not re-center on Mario every frame. Keep Mario
        inside a forward dead-zone and never pull the map backwards because an
@@ -1669,7 +1736,7 @@ static void update_camera(void)
        on throw/reversal frames. */
     if (!g_camera_hold && px-g_camera_x>112)
         target=px-112;
-    if (target<0) target=0;
+    if (target<min_camera) target=min_camera;
     if (target>max_camera) target=max_camera;
 
     /* Prepare wrapped BAT columns before publishing the target. These cells
@@ -1686,7 +1753,7 @@ static void update_camera(void)
     if(g_level_rows>1){
         if(py-target_y<72)target_y=py-72;
         if(py-target_y>144)target_y=py-144;
-        if(target_y<0)target_y=0;
+        if(target_y<min_camera_y)target_y=min_camera_y;
         if(target_y>max_camera_y)target_y=max_camera_y;
         new_row=target_y>>3;
         while(g_camera_row<new_row){++g_camera_row;stream_level_row(g_camera_row+30);}
@@ -4230,6 +4297,16 @@ static void update_play(u16 btn, u16 pressed)
         g_player_x=(s32)g_camera_x<<FIX_SHIFT;
         if (g_vx<0) g_vx=0;
     }
+    /* $17238/$170F8 stop Mario at the room edge when the route does not carry
+       on that way; on a stacked level the run of pathed screens on his storey
+       is that room, so he cannot walk out over the void beside a shaft. */
+    if (g_level_rows>1) {
+        int px=(int)(g_player_x>>FIX_SHIFT),lo,hi,lr;
+        int gr=split_world_row((int)((g_player_y>>FIX_SHIFT)+16)>>3,&lr);
+        screen_run_x(gr,(px+8)>>8,&lo,&hi);
+        if (px<lo*256) { g_player_x=(s32)(lo*256)<<FIX_SHIFT; if(g_vx<0)g_vx=0; }
+        else if (px>(hi+1)*256-24) { g_player_x=(s32)((hi+1)*256-24)<<FIX_SHIFT; if(g_vx>0)g_vx=0; }
+    }
 
     if (g_bounce_active) {
         int dy=(int)g_stomp_bounce_dy[g_bounce_index++];
@@ -4285,7 +4362,10 @@ static void update_play(u16 btn, u16 pressed)
     /* $16928-$1699A in the 68000 program advances ordinary stages, but for
        level slots 3,6,8,10,13,16,19 it sets FF00A8=1 and re-enters the level
        loader in boss mode. The PC-FX port keeps exactly that boss-bearing list. */
-    if(!g_in_boss && (int)(g_player_x>>FIX_SHIFT)>=g_level_width_tiles*8-48){
+    /* $143EA ends the stage when the route walk runs off its $8888 terminator,
+       i.e. on leaving the last screen of the route -- not the right edge of the
+       grid's bounding box, which a climbing level never reaches. */
+    if(!g_in_boss && level_exit_reached()){
         int next_level=g_current_level+1;
         g_after_boss=0;
         if(g_boss_level_flags[g_current_level]) music_stop_for_transition();
