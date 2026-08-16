@@ -122,7 +122,9 @@ extern void pcfx_tetsu_wait_frame(void);
 /* Level 8 streams 37 carrier records across its route; the engine has no
    trigger-driven spawner, so every record is instantiated at level load and
    simulated only while it is near the camera. */
-#define MAX_MOVING_PLATFORMS 56
+/* Level 9 fills 55 of these on its own now that its five $B31E boulders join
+   the $10B2A records, so the pool keeps a little headroom above that. */
+#define MAX_MOVING_PLATFORMS 64
 #define MOVING_PLATFORM_W 48
 #define MOVING_PLATFORM_H 16
 
@@ -142,6 +144,7 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_PATH      9   /* handler 7  */
 #define PLATFORM_KIND_DIAMOND  10   /* handler 11 */
 #define PLATFORM_KIND_SINKER   11   /* handler 1: the level 2/6 lift elsewhere */
+#define PLATFORM_KIND_BOULDER  12   /* $B086, from the $B31E table */
 #define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
 /* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
    climbing one from 0x64 back to 0x17C, in the object space the records store,
@@ -150,6 +153,12 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_WRAP_TOP    (0x6E - 128)
 #define PLATFORM_WRAP_CEIL   (0x64 - 128)
 #define PLATFORM_WRAP_REBASE (0x17C - 128)
+/* $B086's boulder falls 8px a frame from 0x64 until it reaches 0x128, bounces
+   through the arc at $B1A6, and recycles at 0x190 back to 0x64 and 23px right,
+   in the same object space. */
+#define BOULDER_TOP_Y   (0x64 - 128)
+#define BOULDER_LAND_Y  (0x128 - 128)
+#define BOULDER_WRAP_Y  (0x190 - 128)
 #define PLATFORM_STATE_IDLE  0
 #define PLATFORM_STATE_SLIDE 1
 #define PLATFORM_STATE_FALL  2
@@ -475,6 +484,17 @@ static const signed char g_boulder_bounce2[32]={
 };
 static const signed char g_boulder_bounce3[19]={
     -3,-3,-2,-2,-2,-1,-1,-1,0,0,0,1,1,1,2,2,2,3,3
+};
+
+/* $B1A6, the arc $B086's stage-object boulder follows after its first landing:
+   one signed word a frame, a short hop and then a long fall until the object
+   passes 0x190 and is recycled above the ceiling. */
+#define BOULDER_ARC_LEN 77
+static const signed char g_boulder_arc[BOULDER_ARC_LEN]={
+    -4,-4,-3,-2,-2,-2,-2,-2,-2,-1,-1,-1,-1,-1,0,0,
+    1,1,1,1,1,2,2,2,2,2,2,2,3,4,4,4,4,4,4,
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
+    8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8
 };
 
 /* $C6E0: the leap of the water fish, one signed word a frame for the fifty-one
@@ -1374,8 +1394,12 @@ static void resolve_player_vertical(s32 next_y)
            them, then land when his feet cross the top from above. */
         for (i=0;i<g_moving_platform_count && g_drop_platform_timer==0;++i) {
             MovingPlatform *p=&g_moving_platforms[i];
-            int px=platform_draw_x(p), top=platform_draw_y(p);
-            int platform_w=platform_width(p);
+            int px, top, platform_w;
+            /* The boulder is a hazard rolling through the stage, not one of
+               the carriers: $B086 keeps no standing surface. */
+            if (p->kind==PLATFORM_KIND_BOULDER) continue;
+            px=platform_draw_x(p); top=platform_draw_y(p);
+            platform_w=platform_width(p);
             if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+platform_w) continue;
             if (old_bottom<=top+2 && new_bottom+1>=top && top<best_top) {
                 best_top=top;
@@ -1697,6 +1721,30 @@ static void update_stage_object(MovingPlatform *p, int index)
     case PLATFORM_KIND_SINKER:       /* $F5B0, as the level 2/6 lifts */
         p->y+=(s32)p->dir*FIX_ONE;
         if (++p->timer>=100) { p->timer=0; p->dir=(signed char)-p->dir; }
+        break;
+    case PLATFORM_KIND_BOULDER:      /* $B086 */
+        /* $B242 streams these in on their tile trigger; with every record
+           instantiated at level load instead, the boulder waits above its own
+           column until the camera reaches it, which is the same moment. */
+        if (p->state==PLATFORM_STATE_IDLE) {
+            int sx=(int)(p->x>>FIX_SHIFT)-g_camera_x;
+            if (sx>SCREEN_W+96 || sx<-96) break;
+            p->state=PLATFORM_STATE_FALL; p->timer=0; p->step=0;
+        }
+        if (p->timer==0) {
+            p->y+=8*FIX_ONE;
+            if ((int)(p->y>>FIX_SHIFT)>=BOULDER_LAND_Y) p->timer=1;
+            break;
+        }
+        p->y+=(s32)g_boulder_arc[p->step]<<FIX_SHIFT;
+        if (p->step<BOULDER_ARC_LEN-1) ++p->step;
+        if ((int)(p->y>>FIX_SHIFT)>=BOULDER_WRAP_Y) {
+            p->y=(s32)BOULDER_TOP_Y<<FIX_SHIFT;
+            p->x+=23*FIX_ONE;
+            p->timer=0; p->step=0;
+        }
+        /* $B0F0 rolls it one pixel left on even frames only. */
+        if ((g_state_frame&1)==0) p->x-=FIX_ONE;
         break;
     case PLATFORM_KIND_DIAMOND:      /* $FF3A */
         p->x+=(p->state==0||p->state==1)?FIX_ONE:-FIX_ONE;

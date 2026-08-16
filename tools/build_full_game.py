@@ -1001,7 +1001,20 @@ STAGE_OBJECT_KINDS={
     6: 8,   # $F980: climbs 1px/frame, wrapping 0x64 -> 0x17C
     7: 9,   # $F9C6: walks the 80-step path table at $FA58, every other frame
     11:10,  # $FF3A: 48-frame diamond orbit, +1/+1 +1/-1 -1/-1 -1/+1
+    # Not a $F4FA handler: the falling boulder of the second object table
+    # below, given a synthetic key so it can ride the same record pipeline.
+    100:12, # $B086: drops from above the ceiling, then bounces and rolls
 }
+
+# $B242 streams a second, much smaller object table whose per-level pointers
+# live at $B31E, with 14-byte records (segment, tile trigger, object slot,
+# spawn x, spawn y, metasprite, state).  Only slots 9 and 10 have any: slot 9's
+# five metasprite-114 boulders and five metasprite-122 records, and slot 10's
+# hovering metasprite-135/152 pieces.  The state selects a handler from the
+# $ADFE table rather than $F4FA, and only state 4 -- $B086, the boulder that
+# falls from above the ceiling and then bounces in place -- is reproduced here.
+BOULDER_TABLE=0xB31E
+BOULDER_STATE=4
 # Levels 2, 6 and 8 already spawn their records through make_level8_carriers()
 # and the hand-built level-2/6 lifts.
 STAGE_OBJECT_SKIP_SLOTS={2,6,8}
@@ -1054,6 +1067,11 @@ def make_stage_objects(r):
                 off+=12
                 if handler in STAGE_OBJECT_KINDS and ms:
                     recs.append((seg,tile,x,y,ms,handler))
+        off=b32(r,BOULDER_TABLE+(slot-1)*4)
+        while b16(r,off)!=0x8888:
+            seg,tile,_slot,x,y,ms,state=[b16(r,off+i*2) for i in range(7)]
+            off+=14
+            if state==BOULDER_STATE: recs.append((seg,tile,x,y,ms,100))
         if not recs:
             levels.append(dict(shapes=[],words=[],records=[],palette=None)); continue
 
