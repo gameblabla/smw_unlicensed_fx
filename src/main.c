@@ -1508,10 +1508,17 @@ static int solid_v(int x, int y)
    stands on - it has no upward test at all.  So the brown ledges are entered
    from below on the Mega Drive, and jumping through them has to work here too.
    Boss rooms keep their ceilings: their 32x32 grids draw the arena as a closed
-   box, and the room has no other bound to stop Mario leaving through the top. */
+   box, and the room has no other bound to stop Mario leaving through the top.
+
+   A terrain mass two rows deep is a different thing from a ledge, though: the
+   grids mark the top of a stack that must be entered from above with a second
+   solid row under the first, and nothing the player is meant to pass through
+   is ever that thick.  Taking the row below into account keeps the one-way
+   ledges open while Mario's head still stops under a real overhang. */
 static int solid_ceiling(int x, int y)
 {
-    return g_in_boss && collision_at(x,y) == 1;
+    if (g_in_boss) return collision_at(x,y) == 1;
+    return collision_at(x,y) == 1 && collision_at(x,y-8) == 1;
 }
 
 static int player_body_x(void) { return (int)(g_player_x >> FIX_SHIFT) + PLAYER_BODY_XOFF; }
