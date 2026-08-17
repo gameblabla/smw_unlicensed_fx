@@ -1304,6 +1304,28 @@ static void set_game_palette_fade(int level)
     g_game_fade_level=level;
 }
 
+/* The conveyor gears are drawn once and turned in CRAM.  $ABBC gives level
+   slots 17, 18 and 19 a palette task that steps a phase every seventh call and
+   rewrites the three words at CRAM $6E -- palette line 3's colours 7, 8 and 9,
+   the machine's three purples -- from the table at $AC44.  Each phase there is
+   the level's own three colours rotated one place, so the whole animation is a
+   rotation of entries 55..57 and needs no extra colour.  The source task runs
+   at half the frame rate, which puts a step every fourteen frames here. */
+#define GEAR_PAL_FIRST 55
+static unsigned char g_gear_shift;
+
+static void update_gear_palette(void)
+{
+    int i;
+    if (g_in_boss||!g_level||g_game_fade_level!=16) return;
+    if (g_current_level<16||g_current_level>18) return;
+    if ((g_state_frame%14)!=0) return;
+    g_gear_shift=(unsigned char)((g_gear_shift+2)%3);
+    for (i=0;i<3;++i)
+        tetsu_set_palette((u16)(GEAR_PAL_FIRST+i),
+                          g_level->palette[GEAR_PAL_FIRST+(i+g_gear_shift)%3]);
+}
+
 static int level_stage_chip(void);
 static int level_backdrop_chip(void);
 
@@ -1687,10 +1709,19 @@ static int solid_h(int x, int y)
     return c == 1 || c == 4;
 }
 
+/* 8 is the warehouse conveyor the three "BARNETT'S" stages run their purple
+ * gears on.  The source terrain walker at $17E2E stores the cell under an
+ * actor and $1774E only keeps a fall going while that cell is 0, 4 or 6, so a
+ * conveyor stops one exactly like a floor does; $18054 then drags whatever
+ * came to rest on it one pixel left per tick.  Only the stage grids are read
+ * that way: the captured boss grids carry stray bytes outside 1/2/4 that were
+ * never terrain. */
+static int conveyor(unsigned char c) { return !g_in_boss && c == 8; }
+
 static int solid_v(int x, int y)
 {
     unsigned char c = collision_at(x,y);
-    return c == 1 || c == 2;
+    return c == 1 || c == 2 || conveyor(c);
 }
 
 /* Level surfaces are one-way.  The extracted grids mark a floor with a single
@@ -1714,6 +1745,15 @@ static int solid_ceiling(int x, int y)
 
 static int player_body_x(void) { return (int)(g_player_x >> FIX_SHIFT) + PLAYER_BODY_XOFF; }
 static int player_body_y(void) { return (int)(g_player_y >> FIX_SHIFT) + PLAYER_BODY_YOFF; }
+
+/* True while Mario's feet rest on a conveyor cell, i.e. on the row the landing
+   solver just put him on. */
+static int player_on_conveyor(void)
+{
+    int bx=player_body_x(), probe=player_body_y()+PLAYER_BODY_H;
+    return conveyor(collision_at(bx+3,probe))||
+           conveyor(collision_at(bx+PLAYER_BODY_W-4,probe));
+}
 
 /* The first two arenas retain the six-pixel raster lead from their captured
    Mega Drive room plane.  Bowser's extracted poses include that lead, whereas
@@ -1855,7 +1895,7 @@ static void resolve_player_vertical(s32 next_y)
            cannot tunnel through one-way/horizontal collision records. */
         for (probe=old_bottom;probe<=new_bottom+1;++probe) {
             unsigned char left=collision_at(bx+3,probe),right=collision_at(bx+PLAYER_BODY_W-4,probe);
-            int hit=(left==1||right==1)||
+            int hit=(left==1||right==1||conveyor(left)||conveyor(right))||
                 (g_drop_platform_timer==0&&(left==2||right==2));
             if (hit) {
                 int top=(probe>>3)<<3;
@@ -5319,6 +5359,7 @@ static void start_gameplay(int fade_in)
     g_throw_timer=0;
     g_death_timer=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;
+    g_gear_shift=0;
     set_game_palette_fade(fade_in?0:16);
     /* Both VDC outputs are disabled above and all palettes are now black. */
     music_start_at_black();
@@ -5331,6 +5372,8 @@ static void start_gameplay(int fade_in)
 static void update_play(u16 btn, u16 pressed)
 {
     const s32 run_speed=2*FIX_ONE;
+
+    update_gear_palette();
 
     if (pressed&JOY_MODE1) {
         g_debug_mode^=1;
@@ -5501,6 +5544,15 @@ static void update_play(u16 btn, u16 pressed)
         g_vy+=88;
         if (g_vy>5*FIX_ONE) g_vy=5*FIX_ONE;
         resolve_player_vertical(g_player_y+g_vy);
+    }
+
+    /* $18054 runs the belt: standing on a conveyor cell subtracts one from the
+       actor's X every tick, so Mario slides back along the machine while he
+       walks over it. */
+    if (g_grounded && player_on_conveyor()) {
+        g_player_x-=FIX_ONE;
+        if ((int)(g_player_x>>FIX_SHIFT)<g_camera_x)
+            g_player_x=(s32)g_camera_x<<FIX_SHIFT;
     }
 
     if (g_throw_timer>0) {
