@@ -1149,9 +1149,9 @@ def make_boss13_platform_words():
 
 # $F4FA dispatches one routine per stage-object record.  These are the ones
 # that carry the player and are reproduced on PC-FX; the rest of the table is
-# per-level set dressing (traps, switches, story triggers) the port does not
-# spawn yet, and records selecting them are dropped rather than drawn as
-# immovable blocks.
+# per-level set dressing (traps, story triggers) the port does not spawn yet,
+# and records selecting them are dropped rather than drawn as immovable
+# blocks.
 STAGE_OBJECT_KINDS={
     0: 4,   # no handler: a static platform
     1:11,   # $F5B0: sinks 1px/frame for 100 frames, then rises for 100
@@ -1167,6 +1167,12 @@ STAGE_OBJECT_KINDS={
     9: 14,  # $FC1E: carries 133px right over 133 frames, then reappears home
     10:15,  # $FDAC: the same to the left
     11:10,  # $FF3A: 48-frame diamond orbit, +1/+1 +1/-1 -1/-1 -1/+1
+    # The last three entries of the table, and slot 13's alone: three shaft
+    # lifts and the levers that release them.  Dropping all eight records left
+    # that stage's three vertical shafts with nothing in them to climb.
+    17:16,  # $10836: lever; latches $FF00BC and swaps its own metasprite
+    18:17,  # $10892: rises to 0x98 once ridden with $FF00BC set, then back
+    19:18,  # $1097C: descends to 0x128 once ridden, then climbs home to 0x94
     # Not a $F4FA handler: the falling boulder of the second object table
     # below, given a synthetic key so it can ride the same record pipeline.
     100:12, # $B086: drops from above the ceiling, then bounces and rolls
@@ -1257,6 +1263,13 @@ def make_stage_objects(r,routes):
         ids=[]
         for rec in recs:
             if rec[4] not in ids: ids.append(rec[4])
+            # $10836 writes metasprite $AF over its record's own $AE whenever
+            # the lever is free, so the raised pose is never named by a record
+            # and has to be banked alongside the pressed one.  The port reads
+            # it from the next shape index, which this append order gives it.
+            if rec[5]==17 and rec[4]+1 not in ids:
+                ids.append(rec[4]+1)
+                assert ids.index(rec[4])+2==len(ids), 'lever art must follow its record shape'
         line=STAGE_OBJECT_PAL_LINE.get(slot,2)
         def art_canvas(path,cols,rows):
             """Quantise a supplied RGBA image onto this level's palette line."""

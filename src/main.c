@@ -148,6 +148,9 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_PHASE    13   /* handler 8:  $FAF8 */
 #define PLATFORM_KIND_DRIFT_R  14   /* handler 9:  $FC1E */
 #define PLATFORM_KIND_DRIFT_L  15   /* handler 10: $FDAC */
+#define PLATFORM_KIND_LEVER    16   /* handler 17: $10836 */
+#define PLATFORM_KIND_RISER    17   /* handler 18: $10892 */
+#define PLATFORM_KIND_RETURN   18   /* handler 19: $1097C */
 #define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
 /* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
    climbing one from 0x64 back to 0x17C, in the object space the records store,
@@ -156,6 +159,12 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_WRAP_TOP    (0x6E - 128)
 #define PLATFORM_WRAP_CEIL   (0x64 - 128)
 #define PLATFORM_WRAP_REBASE (0x17C - 128)
+/* Slot 13's shaft lifts run between the same two ends of their shaft, two
+   pixels a frame and ungated: $10892 lifts from 0x128 to 0x98 and drops back,
+   $1097C drops from 0x98 to 0x128 and climbs back to its own 0x94. */
+#define STAGE_LIFT_TOP    (0x98 - 128)
+#define STAGE_LIFT_BOTTOM (0x128 - 128)
+#define STAGE_LIFT_HOME   (0x94 - 128)
 /* $B086's boulder falls 8px a frame from 0x64 until it reaches 0x128, bounces
    through the arc at $B1A6, and recycles at 0x190 back to 0x64 and 23px right,
    in the same object space. */
@@ -2072,6 +2081,12 @@ static int platform_draw_y(const MovingPlatform *p)
    boss handler tests; see boss13_lift_y(). */
 static short g_boss13_lift_prev[2];
 
+/* $FF00BC: one latch for the whole level.  A lever ($10836) raises it when a
+   player stands on it and it stays raised after they step off, which is what
+   lets one player press a lever and then walk to the lift it releases; the
+   lift ($10892) clears it again at the end of its round trip. */
+static unsigned char g_stage_switch;
+
 static void init_moving_platforms(void)
 {
     MovingPlatform *p;
@@ -2084,6 +2099,7 @@ static void init_moving_platforms(void)
     }
     g_moving_platform_count=0;
     g_on_moving_platform=-1;
+    g_stage_switch=0;
     g_drop_platform_timer=0;
     if (g_in_boss) {
         /* The $8CEC room owns two live carriers. They are not decoration:
@@ -2149,6 +2165,9 @@ static void init_moving_platforms(void)
             p->shape=(unsigned char)rec[2];
             p->kind=(unsigned char)rec[3];
             p->state=PLATFORM_STATE_IDLE;p->timer=0;p->step=0;p->hidden=0;
+            /* A lever keeps its record's pressed pose here so it can swap
+               back and forth with the raised one banked next to it. */
+            if (rec[3]==PLATFORM_KIND_LEVER) p->step=(unsigned char)rec[2];
             /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
             p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
             p->min_y=(short)ry;p->max_y=(short)(ry+32);
@@ -2289,6 +2308,52 @@ static void update_stage_object(MovingPlatform *p, int index)
             if (aabb(player_body_x(),player_body_y(),PLAYER_BODY_W,PLAYER_BODY_H,
                      platform_draw_x(p),platform_draw_y(p),bw,bh))
                 hurt_player();
+        }
+        break;
+    case PLATFORM_KIND_LEVER:        /* $10836 */
+        /* The lever never moves; it only latches $FF00BC under a rider and
+           shows the pressed pose for as long as the latch is up. */
+        if (g_on_moving_platform==index) {
+            if (!g_stage_switch) { g_stage_switch=1; p->shape=p->step; }
+        } else if (!g_stage_switch) {
+            p->shape=(unsigned char)(p->step+1);
+        }
+        break;
+    case PLATFORM_KIND_RISER:        /* $10892 */
+        base=platform_storey_base(p);
+        if (p->state==PLATFORM_STATE_IDLE) {
+            /* Both conditions, and in this order: the lift needs a rider of
+               its own and the lever already pressed.  A rider alone leaves it
+               parked, which is the whole of the shaft's puzzle. */
+            if (g_on_moving_platform==index && g_stage_switch) p->state=1;
+            break;
+        }
+        if (p->state==1) {
+            p->y-=2*FIX_ONE;
+            if ((int)(p->y>>FIX_SHIFT)<=base+STAGE_LIFT_TOP) p->state=2;
+        } else {
+            p->y+=2*FIX_ONE;
+            if ((int)(p->y>>FIX_SHIFT)>=base+STAGE_LIFT_BOTTOM) {
+                p->state=PLATFORM_STATE_IDLE; g_stage_switch=0;
+            }
+        }
+        break;
+    case PLATFORM_KIND_RETURN:       /* $1097C */
+        base=platform_storey_base(p);
+        if (p->state==PLATFORM_STATE_IDLE) {
+            if (g_on_moving_platform==index) p->state=1;
+            break;
+        }
+        if (p->state==1) {
+            p->y+=2*FIX_ONE;
+            if ((int)(p->y>>FIX_SHIFT)>=base+STAGE_LIFT_BOTTOM) p->state=2;
+        } else {
+            p->y-=2*FIX_ONE;
+            /* $10A2E reaches this one threshold through d1, the rider slot,
+               where its three siblings all use d6, the object -- a slip that
+               makes the end of the climb depend on who is aboard.  The test
+               is anchored to the lift, so it stops where 0x94 says. */
+            if ((int)(p->y>>FIX_SHIFT)<=base+STAGE_LIFT_HOME) p->state=PLATFORM_STATE_IDLE;
         }
         break;
     case PLATFORM_KIND_DIAMOND:      /* $FF3A */
