@@ -409,6 +409,37 @@ def make_monkey_special_frames(r):
         masks.append(mask)
     return frames,masks
 
+def make_chip_attack(r):
+    """Pack family 0's bombing pose and the bomb it drops.
+
+    $C748 puts the flier into animation state 1 for the whole of the drop, and
+    that script is one cel on graphics selector 3 -- the same DMA blob whose
+    tail holds the bomb's own two tiles, which $C7CE names as metasprite $1CB.
+    The three DMA-buffer variants of the family decode to the same pair of
+    images, so both live in one shared bank rather than per variant: the
+    attack and projectile arenas are already full to the word.
+    """
+    allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());byid={m['id']:m for m in allm}
+    gfx,sub=0,0;tbl=b32(r,0x7246C+gfx*4);addr=ba.vdp_addr(b32(r,0xF454+sub*4));want_tile=addr//32
+    ptr=b32(r,tbl+3*4);next_ptr=b32(r,tbl+4*4)
+    vv=bytearray(65536);vv[addr:addr+next_ptr-ptr]=r[ptr:next_ptr]
+    def blit(m,w,h,yoff=0):
+        canvas=[[0]*w for _ in range(h)]
+        for part in m['parts']:
+            ba.blit_gen_tiles_to_canvas(vv,part['tile_index'],part['width_tiles'],
+                                        part['height_tiles'],canvas,part['x_offset'],
+                                        part['y_offset']+yoff)
+        return canvas
+    pose=script_shape(allm,byid,anim_scripts(r,gfx)[1][0][1],want_tile)
+    canvas=blit(pose,32,32); words=[]; mask=0
+    for cy in range(2):
+        for cx in range(2):
+            cell=[[canvas[cy*16+y][cx*16+x] for x in range(16)] for y in range(16)]
+            if any(any(row) for row in cell): mask|=1<<(cy*2+cx)
+            words.extend(ba.encode_sprite_cell(cell))
+    bomb=ba.encode_sprite_cell(blit(byid[0x1CB],16,16))
+    return words,mask,bomb
+
 def make_crate_walk_frames(r):
     """Pack crate-mimic selectors 4/5, its two exposed walking poses."""
     allm=json.loads((KIT/'graphics/metasprites/all_metasprites.json').read_text());byid={m['id']:m for m in allm}
@@ -492,6 +523,10 @@ def build_enemy_variants(r,levels):
     # the duck draws its throwing pose out of animation state *3* and the
     # hopper holds animation state 1 through the whole recovery it spends
     # standing after a hop.
+    #
+    # Family 0's flier ($C748, state 1) writes 1 into that word too while it
+    # bombs, but its attack cel and its bomb ride their own banks -- see
+    # make_chip_attack() -- because the shared arenas are already full.
     atk_keys={(e[2],e[3],e[4]) for lev in levels for e in lev['enemies']
               if e[5] in (8,11,13,14) or (e[2]==3 and e[5]==4)}
     # Which animation state each family's attack pose lives in.  Only the duck
@@ -615,7 +650,11 @@ def build_enemy_variants(r,levels):
         # widen the box Mario stomps.
         width=max(poses[0][1]['bbox'][2],poses[1][1]['bbox'][2])+1
         height=max(poses[0][1]['bbox'][3],poses[1][1]['bbox'][3])+1
-        if gfx==1: width,height=32,48   # mimic hides its legs until it walks
+        # The mimic is authored as its closed crate and $C8B2/$C8F0 lift it
+        # eight pixels twice as it opens, so the object it starts as is 24 tall
+        # and the runtime grows the box with the reveal.  Handing the walking
+        # size to the crate made it sink through the ledge it is sitting on.
+        if gfx==1: width,height=32,24
         elif gfx==3: width,height=32,48 # floor attacker rises out of the floor
         shot=ENEMY_SHOT_ART.get(gfx)
         variants.append(dict(key=(gfx,base,sub),words=frames,masks=masks,palette=enemy_palette(r,gfx),width=width,height=height,
@@ -1544,7 +1583,7 @@ def main():
     routes=parse_routes(r,sm); sets=build_sets(sm); levels=parse_level_objects(r,routes,init); variants=build_enemy_variants(r,levels)
     set_index={slot:s['set_id']-1 for s in sets for slot in s['slots']}
     palettes={slot:palette_for_level(slot) for slot in range(1,20)}
-    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);stageobjs=make_stage_objects(r,routes,init);objpath=stage_object_path(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
+    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);stageobjs=make_stage_objects(r,routes,init);objpath=stage_object_path(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);chipatk,chipatkmask,chipbomb=make_chip_attack(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
     bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
     h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')
@@ -1564,7 +1603,7 @@ def main():
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned char g_bowser_flame_mask;\nextern const unsigned long long g_bowser_special_masks[10];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_banana_words[64];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_monkey_special_words[1152],g_monkey_special_masks[2];\nextern const unsigned short g_boss_hp_1p')
-    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_crate_walk_words[1152],g_crate_walk_masks[2];\nextern const unsigned short g_boss_hp_1p')
+    hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_crate_walk_words[1152],g_crate_walk_masks[2];\nextern const unsigned short g_chip_attack_words[256],g_chip_bomb_words[64],g_chip_attack_mask;\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned short g_boss_hp_1p','extern const unsigned short g_level8_snake_words[3072],g_level8_snake_palette[16],g_level8_snake_masks[3];\nextern const unsigned short g_boss_hp_1p')
     hs=hs.replace('extern const unsigned long g_boss_handler_address[19];',
         'extern const unsigned long g_boss_handler_address[19];\nextern const BossVisualData g_later_boss_visuals[5];\nextern const unsigned char g_boss_collision[6144];')
@@ -1607,6 +1646,8 @@ def main():
                 emit_u16(f,shot_syms[v['key'][0]],v['shot_words'],static=True)
         emit_u16(f,'g_monkey_special_words',monkeyspecial);emit_u16(f,'g_monkey_special_masks',monkeyspecialmasks)
         emit_u16(f,'g_crate_walk_words',cratewalk);emit_u16(f,'g_crate_walk_masks',cratewalkmasks)
+        emit_u16(f,'g_chip_attack_words',chipatk);emit_u16(f,'g_chip_bomb_words',chipbomb)
+        f.write(f'const unsigned short g_chip_attack_mask={chipatkmask};\n')
         emit_u16(f,'g_level8_snake_words',snakewords);emit_u16(f,'g_level8_snake_masks',snakemasks);emit_u16(f,'g_level8_snake_palette',snakepal)
         f.write(f'const unsigned short g_enemy_variant_count={len(variants)};\n')
         f.write('const EnemyVariantData g_enemy_variants[] = {\n')

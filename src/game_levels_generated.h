@@ -30,6 +30,7 @@ extern const unsigned long long g_bowser_special_masks[10];
 extern const unsigned short g_monkey_banana_words[64];
 extern const unsigned short g_monkey_special_words[1152],g_monkey_special_masks[2];
 extern const unsigned short g_crate_walk_words[1152],g_crate_walk_masks[2];
+extern const unsigned short g_chip_attack_words[256],g_chip_bomb_words[64],g_chip_attack_mask;
 extern const unsigned short g_level8_snake_words[3072],g_level8_snake_palette[16],g_level8_snake_masks[3];
 extern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];
 extern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];

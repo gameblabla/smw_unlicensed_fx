@@ -83,6 +83,12 @@ BANKS = [
     # gap above the pot is clear of every play-scene bank.
     ('ENEMY_SHOT_BASE_WORD',        FRONT, 0xE300, 256,    (PLAY,), 'thrown rock/spear/spark for the $C0C6, $BAD6 and $BCC8 throwers'),
     ('ENEMY_BANANA_BASE_WORD',      FRONT, 0xE400, 64,     (PLAY,), 'thrown banana (levels with monkeys)'),
+    # The flier's bombing pose and its bomb are shared by all three of the
+    # family's DMA-buffer variants, so they ride their own pair of banks in the
+    # clear run above the crouch poses rather than the per-variant attack and
+    # projectile arenas, which levels 16..18 already fill to the word.
+    ('CHIP_BOMB_BASE_WORD',         FRONT, 0xEC80, 64,     (PLAY,), 'bomb dropped by the $C748 flier (levels with CHIP)'),
+    ('CHIP_ATTACK_BASE_WORD',       FRONT, 0xECC0, 256,    (PLAY,), 'flier bombing pose, 24x24 (levels with CHIP)'),
     ('BOWSER_FLAME_BASE_WORD',      FRONT, 0xDD00, 384,    (BOSS,), 'Bowser flame'),
     ('BOSS_AUX_BASE_WORD',          FRONT, 0xE000, 2304,   (BOSS,), 'ring/hammer/pot/bell/bomb/crate4/platform'),
     ('BOSS_POT_BASE_WORD',          FRONT, 0xE200, 256,    (PLAY,), 'pot object, also uploaded by every normal stage',
@@ -199,12 +205,14 @@ def measure():
     }
 
 
-MONKEY, STRIKE_SNAKE, CRATE_MIMIC = 1, 3, 4
+MONKEY, STRIKE_SNAKE, CRATE_MIMIC, CHIP = 1, 3, 4, 7
 OPTIONAL_BY_KIND = {
     'MONKEY_SPECIAL_BASE_WORD': MONKEY,
     'ENEMY_BANANA_BASE_WORD': MONKEY,
     'STRIKE_SNAKE_BASE_WORD': STRIKE_SNAKE,
     'CRATE_MIMIC_WALK_BASE_WORD': CRATE_MIMIC,
+    'CHIP_BOMB_BASE_WORD': CHIP,
+    'CHIP_ATTACK_BASE_WORD': CHIP,
 }
 
 

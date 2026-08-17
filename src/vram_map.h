@@ -86,11 +86,15 @@
 #define GAMEPLAY_DOWN_MARIO_BASE_WORD 0xE980
 /* 0xEB00..0xEC80 [play,boss] crouch Luigi */
 #define GAMEPLAY_DOWN_LUIGI_BASE_WORD 0xEB00
+/* 0xEC80..0xECC0 [play] bomb dropped by the $C748 flier (levels with CHIP) */
+#define CHIP_BOMB_BASE_WORD 0xEC80
+/* 0xECC0..0xEDC0 [play] flier bombing pose, 24x24 (levels with CHIP) */
+#define CHIP_ATTACK_BASE_WORD 0xECC0
 /* 0xF000..0xF100 [boot,title,menu,play,boss,continue] sprite attribute table, page 0 */
 #define SATB_BASE0 0xF000
 /* 0xF200..0xF300 [boot,title,menu,play,boss,continue] sprite attribute table, page 1 */
 #define SATB_BASE1 0xF200
-/* 0xF300..0xFC00 [play] per-level stage object shapes */
+/* 0xF300..0xFC80 [play] per-level stage object shapes */
 #define STAGE_OBJECT_BASE_WORD 0xF300
 
 /* VDC 0 (back/background) */

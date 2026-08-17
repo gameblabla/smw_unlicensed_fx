@@ -290,10 +290,12 @@ typedef struct {
 /* mode 0 is the monkey's thrown banana, which arcs under the normal object
    gravity.  Mode 1 is $C25C's rock: its horizontal speed walks the $C360
    deceleration table while $C2A8 adds a flat two pixels of drop.  Mode 2 is
-   $BB98's spear, which only ever changes X. */
+   $BB98's spear, which only ever changes X.  Mode 3 is the bomb $C7CE hangs
+   under the flier: $C766 walks it straight down two pixels a frame. */
 #define SHOT_MODE_ARC   0
 #define SHOT_MODE_ROCK  1
 #define SHOT_MODE_SPEAR 2
+#define SHOT_MODE_DROP  3
 typedef struct { s32 x,y,vx,vy; u16 base; unsigned char active,palette,cols,mode,step; } EnemyShot;
 
 typedef struct {
@@ -1165,6 +1167,14 @@ static void upload_game_sprites(void)
        by the current level are copied to VDC1. */
     if (!g_in_boss && g_level) {
         if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
+        /* One copy of the flier's bombing pose and its bomb serves every
+           variant of the family: their DMA buffers hold the same images. */
+        if(level_has_enemy_kind(ENEMY_KIND_CHIP)){
+            vdc_set_vram_write(FRONT_CHIP,CHIP_BOMB_BASE_WORD);
+            for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_chip_bomb_words[i]);
+            vdc_set_vram_write(FRONT_CHIP,CHIP_ATTACK_BASE_WORD);
+            for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_chip_attack_words[i]);
+        }
         walk_top=ENEMY_BASE_WORD; hit_top=ENEMY_HIT_BASE_WORD; alt_top=ENEMY_ALT_BASE_WORD;
         shot_top=ENEMY_SHOT_BASE_WORD;
         for(i=0;i<g_level->variant_count;++i) {
@@ -2581,9 +2591,10 @@ static void init_objects(void)
             g_enemies[i].vx=-FIX_ONE;g_enemies[i].vy=0;
             g_enemies[i].variant=(unsigned char)e[2];g_enemies[i].state=(unsigned char)e[3];g_enemies[i].flags=(unsigned char)e[4];g_enemies[i].kind=(unsigned char)e[7];
             g_enemies[i].width=(unsigned char)e[5];g_enemies[i].height=(unsigned char)e[6];g_enemies[i].active=1;g_enemies[i].spawned=0;g_enemies[i].defeated=0;
-            /* Flying Koopas and CHIP use the terrain-independent patrol.
-               State-5 pterodactyls retain their separate $C472 behavior. */
-            g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA||e[7]==ENEMY_KIND_CHIP);
+            /* Flying Koopas use the terrain-independent patrol.  CHIP flies the
+               same path but breaks off to bomb, so $C748 drives it itself, and
+               state-5 pterodactyls retain their separate $C472 behavior. */
+            g_enemies[i].flying=(e[7]==ENEMY_KIND_FLYING_KOOPA);
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
             g_enemies[i].face_right=0;g_enemies[i].shot_slot=0;
@@ -2988,6 +2999,19 @@ static int enemy_crate_floor_top(const Enemy *e, int x, int old_bottom,
     return best;
 }
 
+/* One step of the mimic's reveal.  $C8B2 and $C8F0 each subtract eight from
+   the object's Y, and its metasprite grows by exactly those eight pixels --
+   24 tall closed, 32 half open, 40 walking -- so all three poses stand on one
+   line.  Carrying the growth in the record keeps the terrain solver honest:
+   handing the crate the walking height instead made it sink straight through
+   the ledge it was authored on and settle somewhere under the stage. */
+static void mimic_open(Enemy *e)
+{
+    e->y-=(s32)8*FIX_ONE;
+    e->height=(unsigned char)(e->height+8);
+    ++e->behavior_phase;
+}
+
 static void update_enemies(void)
 {
     int i;
@@ -3041,8 +3065,46 @@ static void update_enemies(void)
            ahead of the source's FF00A6 test as well and keeps running. */
         if (g_enemy_freeze) goto enemy_attack_checks;
 
-        if(e->kind!=ENEMY_KIND_GENERIC&&e->kind!=ENEMY_KIND_CHIP){
+        if(e->kind!=ENEMY_KIND_GENERIC){
             int near=iabs_i(px-x);
+            if(e->kind==ENEMY_KIND_CHIP){
+                /* State 1, ROM $C748.  The flier is not a Koopa on a loop: it
+                   runs the shared $C832 path exactly once -- 58 steps of one
+                   pixel left and the table's dy -- and $C828 then counts the
+                   traversal, which stops it dead.  $C7A0 puts a bomb in its
+                   child slot four pixels right and sixteen below its origin,
+                   holds animation state 1 while $C766 walks that bomb two
+                   pixels a frame straight down, and only when $130C6 has
+                   retired it off the bottom does $C784 clear the state and let
+                   the patrol start over.  The port used to hand the record to
+                   the flying-Koopa patrol, so it drifted across the stage for
+                   ever and never dropped anything. */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0){
+                    e->x-=FIX_ONE;
+                    e->y+=(s32)g_flying_koopa_dy[e->flight_phase]*FIX_ONE;
+                    if(++e->flight_phase>=58){e->flight_phase=0;e->behavior_phase=1;}
+                }else if(e->behavior_phase==1){
+                    /* $C7B8 offsets the bomb to the right whichever way the
+                       flier is travelling, so place it after the throw rather
+                       than through the facing-aware offset. */
+                    int k=throw_enemy_shot(e,16,0,0,SHOT_MODE_DROP);
+                    if(k>=0){
+                        g_enemy_shots[k].x=e->x+(s32)4*FIX_ONE;
+                        g_enemy_shots[k].base=CHIP_BOMB_BASE_WORD;
+                        g_enemy_shots[k].cols=1;
+                        e->shot_slot=(unsigned char)(k+1);
+                        e->behavior_phase=2;e->behavior_timer=0;
+                    }
+                }else{
+                    if(e->behavior_timer<255)++e->behavior_timer;
+                    if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
+                        e->shot_slot=0;e->behavior_phase=0;e->behavior_timer=0;
+                    }
+                }
+                x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
+                goto enemy_attack_checks;
+            }
             if(e->kind==ENEMY_KIND_MONKEY){
                 e->vx=e->vy=0;
                 /* State 7, ROM $C166.  The source bounds $90..$E0 map to
@@ -3099,14 +3161,16 @@ static void update_enemies(void)
                 goto enemy_attack_checks;
             }else if(e->kind==ENEMY_KIND_CRATE_MIMIC){ /* reveal, pause, then walk */
 #ifdef FORCE_CRATE_STAND
-                e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
+                if(e->behavior_phase==0)mimic_open(e);
+                e->behavior_timer=0;e->vx=0;
 #else
                 if(e->behavior_phase==0){
                     e->vx=0;
-                    if(near<=60){e->behavior_phase=1;e->behavior_timer=0;}
+                    if(near<=60){mimic_open(e);e->behavior_timer=0;}
                 }
-                else if(e->behavior_phase==1&&++e->behavior_timer>=24){e->behavior_phase=2;e->behavior_timer=0;e->vx=-FIX_ONE;}
+                else if(e->behavior_phase==1&&++e->behavior_timer>=24){mimic_open(e);e->behavior_timer=0;e->vx=-FIX_ONE;}
 #endif
+                y=(int)(e->y>>FIX_SHIFT);h=e->height;
                 /* Its reveal state only controls the animation.  Once it is
                    awake it deliberately falls through to the normal enemy
                    solver, so it walks left/right, lands on terrain and turns
@@ -3449,6 +3513,8 @@ static void update_enemy_shots(void)
             s->y+=2*FIX_ONE;
         }else if(s->mode==SHOT_MODE_SPEAR){
             s->x+=s->vx;
+        }else if(s->mode==SHOT_MODE_DROP){
+            s->y+=2*FIX_ONE;
         }else{
             s->x+=s->vx;s->vy+=48;if(s->vy>4*FIX_ONE)s->vy=4*FIX_ONE;s->y+=s->vy;
         }
@@ -3890,24 +3956,27 @@ static void draw_game_sprites(void)
     }
 
     for (i=0;i<MAX_ENEMIES && n<58;++i) {
-        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_frame,use_hit_frame,use_alt=0,use_atk=0,use_atk2=0; unsigned mask; u16 flip,base;
+        int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_chip,special_frame,use_hit_frame,use_alt=0,use_atk=0,use_atk2=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
         sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT)-g_camera_y;
-        /* The mimic's authored Y is the crate baseline.  Its revealed body
-           grows upward from that footprint rather than down into the floor. */
-        if(e->kind==ENEMY_KIND_CRATE_MIMIC){
-            if(e->behavior_phase==1)sy-=8;       /* 24px crate -> 32px rise */
-            else if(e->behavior_phase==2)sy-=14;/* walking art's visible baseline */
-        }
         if(sx<-56||sx>255||sy<-56||sy>239)continue;
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
+        /* mimic_open() keeps the record's box the same height as the pose on
+           screen, so every cel is simply bottom-aligned in it.  The variant's
+           own poses are packed onto the closed crate's 24-pixel floor and the
+           baseline shift below restores it; the separate walking bank is the
+           one bank packed at its full 40.  Drawing all of them from the top of
+           the box is what left the walking mimic hanging twenty-odd pixels
+           above the ledge it was supposed to be crossing. */
+        if(e->kind==ENEMY_KIND_CRATE_MIMIC)
+            sy+=(int)e->height-((e->behavior_phase==2&&!e->defeated)?40:24);
         anim=(int)((g_state_frame/8)&1);
         /* Frame selector 2 is a valid live wing-flap cel for MATTHEW, so
            keep the defeated state separate from the frame number. */
         use_hit_frame=e->defeated&&v->has_hit_frame;
         if(e->defeated)anim=use_hit_frame?2:1;
-        else if(e->kind!=ENEMY_KIND_GENERIC&&e->kind!=ENEMY_KIND_CHIP){
+        else if(e->kind!=ENEMY_KIND_GENERIC){
             if(e->kind==ENEMY_KIND_MONKEY)anim=(e->behavior_phase==2)?((g_state_frame/12)&1):0;
             else if(e->kind==ENEMY_KIND_PTERODACTYL)
                 /* Selector 0 hangs; selectors 1 and 2 are the two wide flight
@@ -3980,6 +4049,10 @@ static void draw_game_sprites(void)
         special_snake=(e->kind==ENEMY_KIND_STRIKE_SNAKE&&!use_hit_frame);
         special_monkey=(e->kind==ENEMY_KIND_MONKEY&&(e->defeated||e->behavior_phase==3));
         special_crate=(e->kind==ENEMY_KIND_CRATE_MIMIC&&e->behavior_phase==2&&!e->defeated);
+        /* $C7AC writes 1 into the flier's animation-state word the moment it
+           stops to bomb and holds it there until the bomb is gone, so the whole
+           drop plays on the one cel of that script -- the shared bank. */
+        special_chip=(e->kind==ENEMY_KIND_CHIP&&e->behavior_phase&&!e->defeated);
         special_frame=e->defeated?1:0;
 #ifdef FORCE_MONKEY_HURT
         if(e->kind==ENEMY_KIND_MONKEY){special_monkey=1;special_frame=1;}
@@ -3992,6 +4065,7 @@ static void draw_game_sprites(void)
             mask=g_level8_snake_masks[anim];cols=rows=grid_cols=4;
         }
         else if(special_monkey){mask=g_monkey_special_masks[special_frame];cols=rows=grid_cols=3;}
+        else if(special_chip){mask=g_chip_attack_mask;cols=rows=grid_cols=2;}
         else if(special_crate){special_frame=(g_state_frame/10)&1;mask=g_crate_walk_masks[special_frame];cols=rows=grid_cols=3;}
         else{
             /* Every pose of a variant is packed bottom-aligned in its cell grid
@@ -4014,6 +4088,7 @@ static void draw_game_sprites(void)
         if(special_snake)base=(u16)(STRIKE_SNAKE_BASE_WORD+anim*1024);
         else if(special_monkey)base=(u16)(MONKEY_SPECIAL_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
         else if(special_crate)base=(u16)(CRATE_MIMIC_WALK_BASE_WORD+special_frame*ENEMY_FRAME_WORDS);
+        else if(special_chip)base=CHIP_ATTACK_BASE_WORD;
         else if(use_atk2)base=g_enemy_atk2_vram[li];
         else if(use_atk)base=g_enemy_atk_vram[li];
         else if(use_alt)base=g_enemy_alt_vram[li];
