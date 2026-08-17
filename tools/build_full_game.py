@@ -1216,7 +1216,34 @@ def stage_object_path(r):
         out.append((dx-256 if dx>=128 else dx, dy-256 if dy>=128 else dy))
     return out
 
-def make_stage_objects(r,routes):
+def init_stage_objects(initdata,slot,modes):
+    """Stage objects the level's own init pool places, rather than the streamer.
+
+    $18918 copies each 8-byte record of the $1DB8C group into object slots
+    20..27 -- the same eight slots $10A48 streams the $10B2A records into, and
+    the same eight $F4B4 walks every frame -- writing x, y and metasprite to
+    the object's $0/$2/$4 and `extra` to its $E, which is the field $F4D0 uses
+    as the $F4FA handler index.  parse_level_objects() reads these groups for
+    their crates and gems and drops everything else, so an init-placed carrier
+    had nowhere to come from: level 13's metasprite-148 platform on handler 3
+    is the game's only one, and it is the platform that carries the player off
+    the opening ledge, which is why that stage began over an open pit.
+
+    Unlike a streamed record the position is already absolute, so it is only a
+    flat generator coordinate on a level whose route never turns.
+    """
+    out=[]
+    for group in initdata[slot]['groups']:
+        for rec in group['records']:
+            ms,extra=rec['metasprite_id'],rec['extra']
+            if ms in (91,97) or not ms or extra not in STAGE_OBJECT_KINDS: continue
+            if any(m for m in modes):
+                raise RuntimeError(f'slot {slot}: init object on a turning route')
+            out.append((rec['x']-128,rec['y']-128,ms,extra))
+    return out
+
+
+def make_stage_objects(r,routes,initdata):
     """Per-level stage objects from the record tables at $10B2A.
 
     Same 12-byte records make_level8_carriers() reads for level 8, but for
@@ -1229,9 +1256,11 @@ def make_stage_objects(r,routes):
     row with 32-pixel-wide sprites, which the SATB budget needs when a dozen
     carriers share the screen.
     """
+    byinit={x['level_slot']:x for x in initdata}
     levels=[]
     for slot in range(1,20):
         recs=[]
+        placed=init_stage_objects(byinit,slot,routes[slot][1])
         if slot not in STAGE_OBJECT_SKIP_SLOTS:
             off=b32(r,0x10B2A+(slot-1)*4)
             while b16(r,off)!=0x8888:
@@ -1244,7 +1273,7 @@ def make_stage_objects(r,routes):
             seg,tile,_slot,x,y,ms,state=[b16(r,off+i*2) for i in range(7)]
             off+=14
             if state==BOULDER_STATE: recs.append((seg,tile,x,y,ms,100))
-        if not recs:
+        if not recs and not placed:
             levels.append(dict(shapes=[],words=[],records=[],palette=None)); continue
 
         ld=KIT/('graphics/levels/level_%02d'%slot)
@@ -1270,6 +1299,8 @@ def make_stage_objects(r,routes):
             if rec[5]==17 and rec[4]+1 not in ids:
                 ids.append(rec[4]+1)
                 assert ids.index(rec[4])+2==len(ids), 'lever art must follow its record shape'
+        for _wx,_wy,ms,_handler in placed:
+            if ms not in ids: ids.append(ms)
         line=STAGE_OBJECT_PAL_LINE.get(slot,2)
         def art_canvas(path,cols,rows):
             """Quantise a supplied RGBA image onto this level's palette line."""
@@ -1331,6 +1362,8 @@ def make_stage_objects(r,routes):
             # handlers take the trigger-axis correction.
             if handler==100: wx,wy=ba.world_x_for_trigger(seg,tile)+(x-0x180), y-128
             else: wx,wy=trigger_world(seg,tile,x,y,modes)
+            out.append((wx, wy, ids.index(ms), STAGE_OBJECT_KINDS[handler]))
+        for wx,wy,ms,handler in placed:
             out.append((wx, wy, ids.index(ms), STAGE_OBJECT_KINDS[handler]))
         levels.append(dict(shapes=shapes,words=words,records=out,
                            palette=[ba.rgb_to_yuv(0,0,0)]+[ba.rgb_to_yuv(*rgb[line*16+i]) for i in range(1,16)]))
@@ -1491,7 +1524,7 @@ def main():
     routes=parse_routes(r,sm); sets=build_sets(sm); levels=parse_level_objects(r,routes,init); variants=build_enemy_variants(r,levels)
     set_index={slot:s['set_id']-1 for s in sets for slot in s['slots']}
     palettes={slot:palette_for_level(slot) for slot in range(1,20)}
-    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);stageobjs=make_stage_objects(r,routes);objpath=stage_object_path(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
+    bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);stageobjs=make_stage_objects(r,routes,init);objpath=stage_object_path(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
     bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
     h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')

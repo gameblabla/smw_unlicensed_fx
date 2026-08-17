@@ -49959,7 +49959,7 @@ static const unsigned short stageobj13_shapes[35] = {
   0x0000, 0x0000, 0x0010, 0x0020, 0x0200, 0x0001, 0x0002, 0x0000, 0x0000, 0x0010, 0x0020,
 };
 
-static const short stageobj13_records[156] = {
+static const short stageobj13_records[160] = {
   344, 112, 0, 10, 440, 112, 0, 10, 536, 112, 0, 10, 632, 112,
   0, 10, 792, 160, 1, 5, 808, 64, 0, 10, 952, 112, 0, 10,
   1048, 112, 0, 10, 1144, 112, 0, 10, 2080, 168, 2, 17, 2120, 176,
@@ -49971,7 +49971,7 @@ static const short stageobj13_records[156] = {
   4376, 112, 0, 10, 4472, 112, 0, 10, 4712, 136, 1, 5, 4800, 64,
   1, 5, 4928, 136, 1, 5, 5072, 104, 1, 5, 5408, 168, 2, 17,
   5448, 176, 3, 16, 5568, 24, 2, 18, 5920, 168, 2, 17, 5960, 176,
-  3, 16,
+  3, 16, 232, 136, 1, 5,
 };
 
 static const unsigned short stageobj13_pal[16] = {
@@ -50221,7 +50221,7 @@ const StageObjectData g_stage_objects[19] = {
   {stageobj10_words,stageobj10_shapes,stageobj10_pal,stageobj10_records,128,1,18},
   {stageobj11_words,stageobj11_shapes,stageobj11_pal,stageobj11_records,1536,4,12},
   {stageobj12_words,stageobj12_shapes,stageobj12_pal,stageobj12_records,1792,6,38},
-  {stageobj13_words,stageobj13_shapes,stageobj13_pal,stageobj13_records,640,5,39},
+  {stageobj13_words,stageobj13_shapes,stageobj13_pal,stageobj13_records,640,5,40},
   {0,0,0,0,0,0,0},
   {stageobj15_words,stageobj15_shapes,stageobj15_pal,stageobj15_records,384,2,3},
   {0,0,0,0,0,0,0},
