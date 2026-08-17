@@ -4280,6 +4280,15 @@ static int boss_shot_to_crate(int i,int extra)
     return 0;
 }
 
+/* The room's own bomb object, $FF7404: a released bomb, carried or not. */
+static int boss13_room_bomb(void)
+{
+    int i;
+    for(i=0;i<MAX_CRATES;++i)
+        if(g_crates[i].active&&g_crates[i].extra==3)return 1;
+    return 0;
+}
+
 static void boss13_release_bomb(int i)
 {
     /* $91D0 announces it with $2E0 as it lands in the room. */
@@ -4700,7 +4709,13 @@ static void update_boss_motion(void)
             break;
         case 16: /* $9132: lob a bomb along the $9262 arc */
             if(!g_boss_phase){
-                if(boss_shot_of_kind(BOSS_SHOT_BOMB)>=0){g_boss_init=0;break;}
+                /* $9132 opens on "cmpi.w #0,$FF7404 / bne", and $FF7404 is
+                   the room's own bomb object, the one $91C6 fills in when
+                   the throw lands.  So the boss will not lob another while
+                   the last one is still lying in the room, whether or not it
+                   is still in the air.  Testing only the airborne one let the
+                   arena silt up with bombs. */
+                if(boss_shot_of_kind(BOSS_SHOT_BOMB)>=0||boss13_room_bomb()){g_boss_init=0;break;}
                 g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=6;
                 boss_spawn_shot(BOSS_SHOT_BOMB,ox+(dir?32:-56),oy-32,0,0);
             }else{
@@ -4987,7 +5002,13 @@ static void update_boss_actor(void)
     if(g_boss_invuln==0&&hitw>0&&hith>0){
         for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
         for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT)+bowser_room_object_y_offset();if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
-        if(!g_boss_defeated&&g_invuln==0){
+        /* $15C90 and $162F2 both abandon the test the moment the driver
+           holds cel 3, which $1633A sets as the box lands.  The projectile
+           loops above can set that this very frame, so the contact test has
+           to see it too: without the re-read a box that connects also hurts
+           the player, because the body it just hit is still standing in the
+           same place for the rest of the frame. */
+        if(!g_boss_defeated&&g_invuln==0&&g_boss_invuln==0){
             /* $15C0E measures the player from its own sprite corner as
                (x+4,y+8) by 28x40 and shrinks the boss body by four on every
                side; only the projectile path at $162A0 uses the full body.
