@@ -1167,6 +1167,10 @@ STAGE_OBJECT_KINDS={
     9: 14,  # $FC1E: carries 133px right over 133 frames, then reappears home
     10:15,  # $FDAC: the same to the left
     11:10,  # $FF3A: 48-frame diamond orbit, +1/+1 +1/-1 -1/-1 -1/+1
+    # The one launcher in the game, and the only way up the shafts of slots 14
+    # and 15: it winds up under whoever stands on it and throws them 252
+    # pixels straight up.  Dropping it left both stages' shafts unclimbable.
+    12:19,  # $102B6: spring; extends over 37 frames, then walks the $10464 rise
     # The last three entries of the table, and slot 13's alone: three shaft
     # lifts and the levers that release them.  Dropping all eight records left
     # that stage's three vertical shafts with nothing in them to climb.
@@ -1299,6 +1303,13 @@ def make_stage_objects(r,routes,initdata):
             if rec[5]==17 and rec[4]+1 not in ids:
                 ids.append(rec[4]+1)
                 assert ids.index(rec[4])+2==len(ids), 'lever art must follow its record shape'
+            # $102B6 does the same with two poses instead of one: the record
+            # names the 32x32 spring at rest ($9C) and the handler writes the
+            # 32x56 half-wound ($9D) and 32x64 fully wound ($9E) shapes over
+            # it.  Both are banked behind the record's own, in that order.
+            if rec[5]==12 and rec[4]+1 not in ids:
+                ids.extend((rec[4]+1,rec[4]+2))
+                assert ids.index(rec[4])+3==len(ids), 'spring art must follow its record shape'
         for _wx,_wy,ms,_handler in placed:
             if ms not in ids: ids.append(ms)
         line=STAGE_OBJECT_PAL_LINE.get(slot,2)

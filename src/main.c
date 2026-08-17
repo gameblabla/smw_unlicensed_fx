@@ -151,6 +151,7 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_LEVER    16   /* handler 17: $10836 */
 #define PLATFORM_KIND_RISER    17   /* handler 18: $10892 */
 #define PLATFORM_KIND_RETURN   18   /* handler 19: $1097C */
+#define PLATFORM_KIND_SPRING   19   /* handler 12: $102B6 */
 #define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
 /* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
    climbing one from 0x64 back to 0x17C, in the object space the records store,
@@ -165,6 +166,11 @@ extern void pcfx_tetsu_wait_frame(void);
 #define STAGE_LIFT_TOP    (0x98 - 128)
 #define STAGE_LIFT_BOTTOM (0x128 - 128)
 #define STAGE_LIFT_HOME   (0x94 - 128)
+/* $102B6 winds up for $25 frames, then walks the byte table at $10464 -- 69
+   entries falling 8,7,6,5,4,3,2,1 -- one entry a frame.  They add up to 252
+   pixels, which is the height of the shaft each of the two springs sits at the
+   foot of. */
+#define SPRING_WIND_FRAMES 0x25
 /* $B086's boulder falls 8px a frame from 0x64 until it reaches 0x128, bounces
    through the arc at $B1A6, and recycles at 0x190 back to 0x64 and 23px right,
    in the same object space. */
@@ -2087,6 +2093,17 @@ static short g_boss13_lift_prev[2];
    lift ($10892) clears it again at the end of its round trip. */
 static unsigned char g_stage_switch;
 
+/* $10464, the rise the spring throws its rider through, one byte a frame. */
+static const unsigned char g_spring_rise[69]={
+    8,8,8,8,7,7,7,7,7,6,6,6,6,6,6,6,6,6,6,5,5,5,5,5,4,4,4,4,4,4,4,4,
+    3,3,3,3,3,3,3,3,3,3,3,2,2,2,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,
+    1,1,1,1,1
+};
+/* $FF00AE names the object in flight; while it does, $18028 skips that
+   object's gravity and $145E2 scrolls the room instead.  Zero when nobody is
+   airborne on a spring, otherwise one past the step taken last frame. */
+static unsigned char g_spring_flight;
+
 static void init_moving_platforms(void)
 {
     MovingPlatform *p;
@@ -2100,6 +2117,7 @@ static void init_moving_platforms(void)
     g_moving_platform_count=0;
     g_on_moving_platform=-1;
     g_stage_switch=0;
+    g_spring_flight=0;
     g_drop_platform_timer=0;
     if (g_in_boss) {
         /* The $8CEC room owns two live carriers. They are not decoration:
@@ -2168,6 +2186,9 @@ static void init_moving_platforms(void)
             /* A lever keeps its record's pressed pose here so it can swap
                back and forth with the raised one banked next to it. */
             if (rec[3]==PLATFORM_KIND_LEVER) p->step=(unsigned char)rec[2];
+            /* A spring keeps its record's resting pose the same way, so it can
+               reach the two wound ones banked behind it. */
+            if (rec[3]==PLATFORM_KIND_SPRING) p->step=(unsigned char)rec[2];
             /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
             p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
             p->min_y=(short)ry;p->max_y=(short)(ry+32);
@@ -2354,6 +2375,47 @@ static void update_stage_object(MovingPlatform *p, int index)
                makes the end of the climb depend on who is aboard.  The test
                is anchored to the lift, so it stops where 0x94 says. */
             if ((int)(p->y>>FIX_SHIFT)<=base+STAGE_LIFT_HOME) p->state=PLATFORM_STATE_IDLE;
+        }
+        break;
+    case PLATFORM_KIND_SPRING:       /* $102B6 */
+        switch (p->state) {
+        case PLATFORM_STATE_IDLE:
+            /* One player is all $102B6 needs: the run of tests it makes past
+               the rider is the two-player gate at $FF0098, and with that flag
+               clear the very first branch takes the launch. */
+            if (g_on_moving_platform!=index) break;
+            /* Each wound pose is taller than the last by exactly the amount
+               its Y drops, so the spring grows out of a fixed foot.  The
+               source nudges the rider 32 pixels along with it; the port's
+               player anchor is not the source's, so centre him on the coil
+               instead, which is what that nudge amounts to. */
+            p->shape=(unsigned char)(p->step+1);
+            p->y-=0x18*FIX_ONE;
+            g_player_x=(s32)(platform_draw_x(p)+platform_width(p)/2
+                             -PLAYER_BODY_XOFF-PLAYER_BODY_W/2)<<FIX_SHIFT;
+            p->state=1; p->timer=0;
+            break;
+        case 1:
+            if (++p->timer<SPRING_WIND_FRAMES) break;
+            p->shape=(unsigned char)(p->step+2);
+            p->y-=8*FIX_ONE;
+            p->state=2; p->timer=0;
+            break;
+        case 2:
+            /* Fully wound, and it holds there until someone is aboard: a
+               rider who walks off during the wind-up leaves it cocked. */
+            if (g_on_moving_platform!=index) break;
+            g_spring_flight=1;
+            g_on_moving_platform=-1; g_grounded=0;
+            g_jump_active=0; g_bounce_active=0; g_vy=0;
+            /* $103E0 throws the object down to 0x168 and $10456 clears its
+               slot outright once the rise is walked, so the spring is spent
+               after the one launch. */
+            p->hidden=1;
+            p->state=3;
+            break;
+        default:
+            break;
         }
         break;
     case PLATFORM_KIND_DIAMOND:      /* $FF3A */
@@ -5285,7 +5347,18 @@ static void update_play(u16 btn, u16 pressed)
         else if (px>(chi+1)*256-24) { g_player_x=(s32)((chi+1)*256-24)<<FIX_SHIFT; if(g_vx>0)g_vx=0; }
     }
 
-    if (g_bounce_active) {
+    if (g_spring_flight) {
+        /* The source never moves the launched player at all: $18028 withholds
+           his gravity and $145E2 scrolls the room up by the table step under
+           him.  Here the camera follows the player rather than the other way
+           round, so raising him by that same step puts him the same distance
+           up the shaft on the same frame.  Nothing on the way is tested for
+           either -- the source is scrolling, not moving -- so the rise runs
+           through the shaft's mouth instead of stopping under it. */
+        g_player_y-=(s32)g_spring_rise[g_spring_flight-1]<<FIX_SHIFT;
+        g_vy=0; g_grounded=0;
+        if (++g_spring_flight>(unsigned char)sizeof(g_spring_rise)) g_spring_flight=0;
+    } else if (g_bounce_active) {
         int dy=(int)g_stomp_bounce_dy[g_bounce_index++];
         g_vy=(s32)dy*FIX_ONE;
         resolve_player_vertical(g_player_y+g_vy);
