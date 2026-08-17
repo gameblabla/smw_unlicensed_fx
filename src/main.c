@@ -1608,7 +1608,14 @@ static unsigned char collision_at(int x,int y)
     int tx,ty,screen,seg,lx;
     if(g_in_boss){
         int ci=(g_boss_class<0||g_boss_class>5)?0:g_boss_class;
-        if(x<0||x>=256)return 1;if(y<0)return 0;if(y>=256)return 1;
+        if(x<0||x>=256)return 1;if(y<0)return 0;
+        /* Slot 13's grid is the two storeys and nothing else: $718D8 marks
+           rows 8 and 20 across x 64..191 and leaves every other cell clear,
+           so the shafts the carriers run in are open all the way down and a
+           miss is fatal.  The other arenas have no floor in their own grid
+           either and lean on the room's bottom edge for one, so only this
+           room opens out. */
+        if(y>=256)return (g_boss_class==3)?0:1;
         /* Slot 13's two gold carriers are live objects $7B5C creates and
            walks, not room geometry: the ROM's own grid for the room is solid
            only across x 64..191 on rows 8 and 20, and the shafts the carriers
@@ -3474,6 +3481,69 @@ static void draw_game_sprites(void)
        a front-plane scenery layer; the HUD above never is. */
     int hud_entries=n;
 
+    /* The boss body leads the world content so it cannot lose cells to a
+       full SATB and so nothing in the room draws over it.  On the Mega
+       Drive the sprite order is the object pool's own: the player is slot
+       0 and the boss slot 12, so Mario passes in front of it there, but
+       both the carriers (slots 38/39) and the room's boxes are behind it,
+       which is what the old order got wrong.  */
+    if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<58){
+        /* Hurt includes an impact puff four pixels above the body, so its
+           capture origin needs +4 relative to the old value to keep Bowser's
+           feet aligned with the neighboring walk poses. */
+        int bx=(int)(g_boss_x>>FIX_SHIFT),cx,cy;
+        int by=(int)(g_boss_y>>FIX_SHIFT)+bowser_room_object_y_offset();
+        unsigned long long mask;
+        u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
+        if(g_boss_class>0){
+            const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];
+            int frame=later_boss_frame(v);
+            /* $9B52 blanks the mage's metasprite for the middle of its
+               teleport and then blinks it back in. */
+            if(g_boss_hidden)frame=-1;
+            if(frame>=0&&g_boss_class==3){
+                /* $8CEC's boss is two objects: the vehicle at the actor
+                   point, whose tread cel $8D72 alternates every eighth
+                   frame, and the driver on top of it.  Emitting them
+                   separately is what keeps the two welded together whatever
+                   pose the driver takes, and it is why the treads move. */
+                if(!boss13_frame_is_whole(frame))
+                    n=emit_boss_cells(satb,n,v,BOSS13_FRAME_TREAD+((g_state_frame>>3)&1),bx,by,0);
+                n=emit_boss_cells(satb,n,v,frame,
+                                  bx+((g_boss_face<0&&!boss13_frame_is_whole(frame))?boss13_driver_flip_dx(frame):0),
+                                  by,(g_boss_face<0&&!boss13_frame_is_whole(frame)));
+            }else if(frame>=0){
+                n=emit_boss_cells(satb,n,v,frame,bx,by,g_boss_face<0);
+            }
+        }else{
+        /* The Genesis animation table at $71D2 selects two run frames at
+           seven ticks each, two fire frames at seven ticks each, and the
+           three teleport frames at three ticks each. Fire loops while its
+           projectile state is active; teleport is a single 9-tick sequence. */
+        int special,t=g_boss_action_timer;
+        int action=g_bowser_action_script[g_boss_action];
+        if(g_boss_invuln>0){
+            special=BOWSER_SPECIAL_HURT;
+        }else if(action==5){
+            if(t<1)t=1;
+            special=BOWSER_SPECIAL_FIRE+(((t-1)/BOWSER_FIRE_FRAME_TICKS)&1);
+        }else if(action==6&&t>=1&&t<9){
+            special=BOWSER_SPECIAL_TELEPORT+(t-1)/BOWSER_TELEPORT_FRAME_TICKS;
+            if(special>BOWSER_SPECIAL_TELEPORT+2)special=BOWSER_SPECIAL_TELEPORT+2;
+        }else if(action==3||action==4){
+            if(t<1)t=1;
+            special=BOWSER_SPECIAL_RUN+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
+        }else{
+            if(t<1)t=1;
+            special=BOWSER_SPECIAL_NORMAL+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
+        }
+        by-=15;
+        mask=g_bowser_special_masks[special];
+        for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        }
+    }
+
+
     /* SATB entries with lower indices win sprite/sprite overlap.  A carried
        crate is the one exception to the normal object ordering: it must cover
        Mario's hands/body, while every world crate remains behind Mario. */
@@ -3783,62 +3853,6 @@ static void draw_game_sprites(void)
             int cell=cy*grid_cols+cx,dx;
             if(!(mask&(1u<<cell)))continue;dx=flip?(cols-1-cx)*16:cx*16;
             set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
-        }
-    }
-
-    if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<58){
-        /* Hurt includes an impact puff four pixels above the body, so its
-           capture origin needs +4 relative to the old value to keep Bowser's
-           feet aligned with the neighboring walk poses. */
-        int bx=(int)(g_boss_x>>FIX_SHIFT),cx,cy;
-        int by=(int)(g_boss_y>>FIX_SHIFT)+bowser_room_object_y_offset();
-        unsigned long long mask;
-        u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
-        if(g_boss_class>0){
-            const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];
-            int frame=later_boss_frame(v);
-            /* $9B52 blanks the mage's metasprite for the middle of its
-               teleport and then blinks it back in. */
-            if(g_boss_hidden)frame=-1;
-            if(frame>=0&&g_boss_class==3){
-                /* $8CEC's boss is two objects: the vehicle at the actor
-                   point, whose tread cel $8D72 alternates every eighth
-                   frame, and the driver on top of it.  Emitting them
-                   separately is what keeps the two welded together whatever
-                   pose the driver takes, and it is why the treads move. */
-                if(!boss13_frame_is_whole(frame))
-                    n=emit_boss_cells(satb,n,v,BOSS13_FRAME_TREAD+((g_state_frame>>3)&1),bx,by,0);
-                n=emit_boss_cells(satb,n,v,frame,
-                                  bx+((g_boss_face<0&&!boss13_frame_is_whole(frame))?boss13_driver_flip_dx(frame):0),
-                                  by,(g_boss_face<0&&!boss13_frame_is_whole(frame)));
-            }else if(frame>=0){
-                n=emit_boss_cells(satb,n,v,frame,bx,by,g_boss_face<0);
-            }
-        }else{
-        /* The Genesis animation table at $71D2 selects two run frames at
-           seven ticks each, two fire frames at seven ticks each, and the
-           three teleport frames at three ticks each. Fire loops while its
-           projectile state is active; teleport is a single 9-tick sequence. */
-        int special,t=g_boss_action_timer;
-        int action=g_bowser_action_script[g_boss_action];
-        if(g_boss_invuln>0){
-            special=BOWSER_SPECIAL_HURT;
-        }else if(action==5){
-            if(t<1)t=1;
-            special=BOWSER_SPECIAL_FIRE+(((t-1)/BOWSER_FIRE_FRAME_TICKS)&1);
-        }else if(action==6&&t>=1&&t<9){
-            special=BOWSER_SPECIAL_TELEPORT+(t-1)/BOWSER_TELEPORT_FRAME_TICKS;
-            if(special>BOWSER_SPECIAL_TELEPORT+2)special=BOWSER_SPECIAL_TELEPORT+2;
-        }else if(action==3||action==4){
-            if(t<1)t=1;
-            special=BOWSER_SPECIAL_RUN+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
-        }else{
-            if(t<1)t=1;
-            special=BOWSER_SPECIAL_NORMAL+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
-        }
-        by-=15;
-        mask=g_bowser_special_masks[special];
-        for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
         }
     }
 
