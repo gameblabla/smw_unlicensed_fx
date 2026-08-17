@@ -2061,6 +2061,10 @@ static int platform_draw_y(const MovingPlatform *p)
     return (int)(p->y>>FIX_SHIFT)+(sh?(short)sh[4]:0);
 }
 
+/* Each slot 13 carrier's Y from before this frame's step, which is what the
+   boss handler tests; see boss13_lift_y(). */
+static short g_boss13_lift_prev[2];
+
 static void init_moving_platforms(void)
 {
     MovingPlatform *p;
@@ -2086,6 +2090,7 @@ static void init_moving_platforms(void)
            before it wraps rather than vanishing in view. */
         if(g_boss_class==3){
             p=&g_moving_platforms[g_moving_platform_count++];
+            g_boss13_lift_prev[0]=BOSS13_LIFT_TOP;g_boss13_lift_prev[1]=BOSS13_LIFT_BOTTOM;
             p->x=(s32)0<<FIX_SHIFT;p->y=(s32)BOSS13_LIFT_TOP<<FIX_SHIFT;
             p->min_y=BOSS13_LIFT_TOP;p->max_y=BOSS13_LIFT_EXIT;p->dir=1;p->speed=1;
             p=&g_moving_platforms[g_moving_platform_count++];
@@ -2312,6 +2317,7 @@ static void update_moving_platforms(void)
             /* $7B5C returns without touching either carrier while the
                driver holds cel 3, the pose $1633A selects for a hit, so the
                shafts stop with the boss. */
+            if (i<2) g_boss13_lift_prev[i]=(short)(p->y>>FIX_SHIFT);
             if (half && g_boss_invuln==0) {
                 p->y+=(s32)p->dir*FIX_ONE;
                 if (p->dir>0 && (int)(p->y>>FIX_SHIFT)>=p->max_y) {
@@ -4199,11 +4205,16 @@ static void boss_set_origin(int ox,int oy)
     g_boss_y=(s32)(oy-g_boss_origin_dy[g_boss_class-3])<<FIX_SHIFT;
 }
 
-/* The two lifts $7B5C runs.  Their Y is what $8DD4 and $8E88 wait on. */
+/* The two carriers $7B5C runs.  Their Y is what $8DD4 and $8E88 wait on, and
+   the source runs the boss handler ($7454) before the carrier routine
+   ($74DA), so the value the boss tests is the one from before this frame's
+   step.  The port updates platforms first, so read the remembered value; the
+   two waits are exact comparisons and a frame of skew would move where the
+   boss meets its carrier by a whole pixel. */
 static int boss13_lift_y(int which)
 {
     if(which>=g_moving_platform_count)return 0;
-    return (int)(g_moving_platforms[which].y>>FIX_SHIFT);
+    return g_boss13_lift_prev[which];
 }
 
 static int boss_shot_of_kind(int kind)
@@ -4613,8 +4624,14 @@ static void update_boss_motion(void)
         case 1: /* $8DAA */
             --ox;if(ox<=80){ox=80;g_boss_init=0;}
             break;
-        case 2: /* $8DCA: leave only once the left lift has come down to $B3 */
-            if(!g_boss_phase){if(boss13_lift_y(0)>=51)g_boss_phase=1;break;}
+        case 2: /* $8DCA: leave only once the left carrier is exactly at $B3 */
+            /* $8DD4 is a cmpi/bne pair: the carrier has to be *at* room 51,
+               not past it.  Testing for "past" let the boss set off whenever
+               the carrier happened to be anywhere below that, so it walked
+               into the shaft and descended through empty air.  The carrier
+               moves a pixel at a time and holds each value for two frames,
+               so the equality is always seen. */
+            if(!g_boss_phase){if(boss13_lift_y(0)==51)g_boss_phase=1;break;}
             ox-=2;if(ox<=32){ox=32;g_boss_init=0;g_boss_phase=0;}
             break;
         case 3: /* $8E10: half-speed descent */
@@ -4631,8 +4648,10 @@ static void update_boss_motion(void)
         case 5: /* $8E5E */
             ++ox;if(ox>=160){ox=160;g_boss_init=0;}
             break;
-        case 6: /* $8E7E: wait for the right lift to reach $130 */
-            if(!g_boss_phase){if(boss13_lift_y(1)<=176)g_boss_phase=1;break;}
+        case 6: /* $8E7E: wait for the right carrier to be exactly at $130 */
+            /* $8E94 sets the flag and falls straight into $8E9A's move, so
+               unlike state 2 this one steps on the frame the carrier arrives. */
+            if(!g_boss_phase){if(boss13_lift_y(1)!=176)break;g_boss_phase=1;}
             ox+=2;if(ox>=224){ox=224;g_boss_init=0;g_boss_phase=0;}
             break;
         case 7: /* $8EC0: half-speed climb */
