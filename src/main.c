@@ -152,6 +152,12 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_RISER    17   /* handler 18: $10892 */
 #define PLATFORM_KIND_RETURN   18   /* handler 19: $1097C */
 #define PLATFORM_KIND_SPRING   19   /* handler 12: $102B6 */
+/* Slot 15's shaft ledges alone: a stationary platform that just cycles
+   through four metasprites, never checking for a rider.  Dropping it left
+   the shafts of level 14 with no platforms at all -- just a spring and a
+   few static ledges, none of the objects the source actually paints in
+   between them. */
+#define PLATFORM_KIND_PULSE    20   /* handler 13: $104AA */
 #define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
 /* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
    climbing one from 0x64 back to 0x17C, in the object space the records store,
@@ -2209,6 +2215,9 @@ static void init_moving_platforms(void)
             /* A spring keeps its record's resting pose the same way, so it can
                reach the two wound ones banked behind it. */
             if (rec[3]==PLATFORM_KIND_SPRING) p->step=(unsigned char)rec[2];
+            /* A pulse keeps its record's first pose here so its cycle can
+               step forward through the three banked past it. */
+            if (rec[3]==PLATFORM_KIND_PULSE) p->step=(unsigned char)rec[2];
             /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
             p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
             p->min_y=(short)ry;p->max_y=(short)(ry+32);
@@ -2443,6 +2452,23 @@ static void update_stage_object(MovingPlatform *p, int index)
         p->y+=(p->state==0||p->state==3)?FIX_ONE:-FIX_ONE;
         if (++p->timer>=48) { p->timer=0; p->state=(unsigned char)((p->state+1)&3); }
         break;
+    case PLATFORM_KIND_PULSE: {       /* $104AA */
+        /* $105CC's pose table walks 2,3,4,5,3,2,1 before repeating; $105B8
+           holds one jump-table entry per pose, each waiting 10, 10, 10, 20
+           or 32 frames (poses 1-5) before the state advances.  Every pose
+           but 5 also writes the metasprite one further past the record's
+           own for each step up from it -- shape+0..+3 for poses 1..4 -- and
+           5 just idles on shape+3 before the sequence runs back down. */
+        static const unsigned char seq[7]={2,3,4,5,3,2,1};
+        static const unsigned char delay[6]={0,10,10,10,20,32};
+        unsigned char pose=seq[p->state%7];
+        if (++p->timer>=delay[pose]) {
+            p->timer=0;
+            if (pose!=5) p->shape=(unsigned char)(p->step+(pose-1));
+            p->state=(unsigned char)((p->state+1)%7);
+        }
+        break;
+    }
     default:
         break;
     }

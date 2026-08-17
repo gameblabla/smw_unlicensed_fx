@@ -1167,6 +1167,10 @@ STAGE_OBJECT_KINDS={
     9: 14,  # $FC1E: carries 133px right over 133 frames, then reappears home
     10:15,  # $FDAC: the same to the left
     11:10,  # $FF3A: 48-frame diamond orbit, +1/+1 +1/-1 -1/-1 -1/+1
+    # Slot 15's shaft ledges alone: a stationary four-pose animation with no
+    # rider check at all.  Dropping its six records left the shafts of level
+    # 14 with nothing to stand on but a spring and a couple of static ledges.
+    13:20,  # $104AA: pulses through four metasprites, never moves
     # The one launcher in the game, and the only way up the shafts of slots 14
     # and 15: it winds up under whoever stands on it and throws them 252
     # pixels straight up.  Dropping it left both stages' shafts unclimbable.
@@ -1310,6 +1314,11 @@ def make_stage_objects(r,routes,initdata):
             if rec[5]==12 and rec[4]+1 not in ids:
                 ids.extend((rec[4]+1,rec[4]+2))
                 assert ids.index(rec[4])+3==len(ids), 'spring art must follow its record shape'
+            # $104AA cycles through three more metasprites past the record's
+            # own as it pulses, all banked behind it in ascending order.
+            if rec[5]==13 and rec[4]+1 not in ids:
+                ids.extend((rec[4]+1,rec[4]+2,rec[4]+3))
+                assert ids.index(rec[4])+4==len(ids), 'pulse art must follow its record shape'
         for _wx,_wy,ms,_handler in placed:
             if ms not in ids: ids.append(ms)
         line=STAGE_OBJECT_PAL_LINE.get(slot,2)
