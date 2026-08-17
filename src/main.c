@@ -377,6 +377,15 @@ static int g_jump_index;
 static int g_bounce_active;
 static int g_bounce_index;
 static int g_player_mode;
+/* Pixels a spring launch moved the picture this frame.  $146BC scrolls the
+   room by the table step and leaves the player object alone, so the launched
+   player holds one screen position for the whole rise while the room slides
+   past him.  The port raises the player instead, so the camera has to take the
+   identical step in the same frame or the two come apart -- which is what the
+   storey camera does on its own: it seeks the live room's home row at 8 pixels
+   a frame, and only once the player has already crossed into the room above.
+   Set by the launch, consumed and cleared by update_camera(). */
+static unsigned char g_spring_camera_step;
 static int g_death_timer;
 static int g_game_fade_level;
 static s32 g_menu_mario_x;
@@ -1984,7 +1993,16 @@ static void update_camera(void)
         int home=(int)g_screen_row[g_room]*LEVEL_SCREEN_H;
         if(home<min_camera_y)home=min_camera_y;
         if(home>max_camera_y)home=max_camera_y;
-        if(target_y<home){target_y+=8; if(target_y>home)target_y=home;}
+        /* A spring launch is the one climb that does not wait on the room
+           hand-over: $102B6 drives the scroll itself, a table step a frame,
+           so the picture leaves with the player on the frame he is thrown and
+           he keeps his screen position the whole way up. */
+        if(g_spring_camera_step){
+            target_y-=(int)g_spring_camera_step;
+            if(target_y<min_camera_y)target_y=min_camera_y;
+            if(target_y>max_camera_y)target_y=max_camera_y;
+        }
+        else if(target_y<home){target_y+=8; if(target_y>home)target_y=home;}
         else if(target_y>home){target_y-=8; if(target_y<home)target_y=home;}
         new_row=target_y>>3;
         while(g_camera_row<new_row){++g_camera_row;stream_level_row(g_camera_row+30);}
@@ -2002,6 +2020,7 @@ static void update_camera(void)
         stream_level_column(g_camera_tile,1);
     }
     g_camera_target_x=target;
+    g_spring_camera_step=0;
 }
 
 static void commit_stage_camera(void)
@@ -2118,6 +2137,7 @@ static void init_moving_platforms(void)
     g_on_moving_platform=-1;
     g_stage_switch=0;
     g_spring_flight=0;
+    g_spring_camera_step=0;
     g_drop_platform_timer=0;
     if (g_in_boss) {
         /* The $8CEC room owns two live carriers. They are not decoration:
@@ -5349,13 +5369,16 @@ static void update_play(u16 btn, u16 pressed)
 
     if (g_spring_flight) {
         /* The source never moves the launched player at all: $18028 withholds
-           his gravity and $145E2 scrolls the room up by the table step under
-           him.  Here the camera follows the player rather than the other way
-           round, so raising him by that same step puts him the same distance
-           up the shaft on the same frame.  Nothing on the way is tested for
-           either -- the source is scrolling, not moving -- so the rise runs
-           through the shaft's mouth instead of stopping under it. */
-        g_player_y-=(s32)g_spring_rise[g_spring_flight-1]<<FIX_SHIFT;
+           his gravity while $FF00AE names him, and $146BC scrolls the room up
+           by the table step instead, leaving him where he is.  Here the world
+           is fixed and the camera moves, so the player takes the step and the
+           camera takes it with him -- see g_spring_camera_step.  Nothing on
+           the way is tested for either, the source being a scroll and not a
+           move, so the rise runs through the shaft's mouth rather than
+           stopping under it. */
+        int step=(int)g_spring_rise[g_spring_flight-1];
+        g_player_y-=(s32)step<<FIX_SHIFT;
+        g_spring_camera_step=(unsigned char)step;
         g_vy=0; g_grounded=0;
         if (++g_spring_flight>(unsigned char)sizeof(g_spring_rise)) g_spring_flight=0;
     } else if (g_bounce_active) {
