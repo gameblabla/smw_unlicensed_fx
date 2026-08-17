@@ -63,17 +63,26 @@ BANKS = [
     ('MENU_MARIO_BASE_WORD',        FRONT, 0x8400, 1536,   (MENU,), 'menu walk Mario'),
     ('MENU_LUIGI_BASE_WORD',        FRONT, 0x8A00, 384,    (MENU,), 'menu walk Luigi'),
     ('MONKEY_SPECIAL_BASE_WORD',    FRONT, 0x9800, 1152,   (PLAY,), 'monkey throw poses (levels with monkeys)'),
-    ('CRATE_MIMIC_WALK_BASE_WORD',  FRONT, 0x9C80, 1152,   (PLAY,), 'walking crate poses (levels with mimics)'),
+    # Level 11's walk banks reach 0x9E00 now that its duck carries a 3x3
+    # throwing pose, so the mimic's own bank moved out of their way.
+    ('CRATE_MIMIC_WALK_BASE_WORD',  FRONT, 0xE500, 1152,   (PLAY,), 'walking crate poses (levels with mimics)'),
     ('CONTINUE_DIGIT_BASE_WORD',    FRONT, 0xA000, 2560,   (CONT,), 'continue countdown digits'),
     ('STRIKE_SNAKE_BASE_WORD',      FRONT, 0xA100, 3072,   (PLAY,), 'snake strike, three 64x40 poses'),
     ('CONTINUE_PLAYER_BASE_WORD',   FRONT, 0xB300, 1536,   (PLAY, BOSS, CONT), 'continue/crouch Mario (768) + Luigi (768)'),
     ('LEVEL8_WEDGE_R_BASE_WORD',    FRONT, 0xB900, 768,    (PLAY,), 'level 8 down-right wedge, 48x64', 128),
     ('LEVEL8_WEDGE_L_BASE_WORD',    FRONT, 0xBC00, 384,    (PLAY,), 'level 8 down-left wedge, 32x48', 128),
-    ('ENEMY_ALT_BASE_WORD',         FRONT, 0xBD80, 2304,   (PLAY,), 'extra live cels: pterodactyl/floor-attacker third pose plus every variant attack pose'),
-    ('ENEMY_HIT_BASE_WORD',         FRONT, 0xC800, 'sized:enemy_hit', (PLAY,), 'per-variant hit frame'),
+    # 2880 = the five distinct extra cels levels 17..19 need at once: the
+    # spearman's two, the duck's two and the hopper's one.  The hit bank moved
+    # up by one cell's worth to make room for the fifth.
+    ('ENEMY_ALT_BASE_WORD',         FRONT, 0xBD80, 2880,   (PLAY,), 'extra live cels: pterodactyl/floor-attacker third pose plus every variant attack pose'),
+    ('ENEMY_HIT_BASE_WORD',         FRONT, 0xC900, 'sized:enemy_hit', (PLAY,), 'per-variant hit frame'),
     ('FRONT_TILE_BASE_WORD',        BACK,  0xD000, 'sized:menu_combo', (TITLE, MENU), 'menu/transition tile set on VDC0'),
-    ('ENEMY_BANANA_BASE_WORD',      FRONT, 0xDA00, 64,     (PLAY,), 'thrown banana (levels with monkeys)'),
-    ('ENEMY_SHOT_BASE_WORD',        FRONT, 0xDA40, 256,    (PLAY,), 'thrown rock/spear for the $C0C6 and $BAD6 throwers'),
+    # These two sat at 0xDA00/0xDA40, inside the run the hit banks of the
+    # bigger casts (levels 11 and 15..17) grow into, so the level that owned a
+    # projectile had its art overwritten by a later variant's death pose.  The
+    # gap above the pot is clear of every play-scene bank.
+    ('ENEMY_SHOT_BASE_WORD',        FRONT, 0xE300, 256,    (PLAY,), 'thrown rock/spear/spark for the $C0C6, $BAD6 and $BCC8 throwers'),
+    ('ENEMY_BANANA_BASE_WORD',      FRONT, 0xE400, 64,     (PLAY,), 'thrown banana (levels with monkeys)'),
     ('BOWSER_FLAME_BASE_WORD',      FRONT, 0xDD00, 384,    (BOSS,), 'Bowser flame'),
     ('BOSS_AUX_BASE_WORD',          FRONT, 0xE000, 2304,   (BOSS,), 'ring/hammer/pot/bell/bomb/crate4/platform'),
     ('BOSS_POT_BASE_WORD',          FRONT, 0xE200, 256,    (PLAY,), 'pot object, also uploaded by every normal stage',
@@ -121,18 +130,28 @@ def measure():
     # Enemy variants are packed, not strided: each one owns cols x rows cells.
     vrows = re.search(r'const EnemyVariantData g_enemy_variants\[\] = \{(.*?)\n\};', levels_src, re.S).group(1)
     variant_words = []
+    variant_hit = []
     for row in re.findall(r'\{(.*?)\}', vrows, re.S):
         f = [x.strip() for x in row.split(',')]
-        variant_words.append(int(f[-3]) * int(f[-2]) * 64)
+        # ...,width,height,cols,rows,has_hit_frame,shot_cols,baseline.  The
+        # bank is cols x rows cells; reading the last two fields instead --
+        # which is what this did before the record grew a shot and a baseline
+        # -- measured every level's enemy banks as a few hundred words and let
+        # the hit run overwrite whatever the map had parked above it.
+        variant_words.append(int(f[-5]) * int(f[-4]) * 64)
+        variant_hit.append(int(f[-3]))
 
     rows = re.search(r'const GameLevelData g_game_levels\[19\] = \{(.*?)\n\};', levels_src, re.S).group(1)
     levels = []
     for row in re.findall(r'\{(.*?)\}', rows, re.S):
         f = [x.strip() for x in row.split(',')]
         ids = re.search(r'\b' + f[-1] + r'\[\d+\] = \{(.*?)\};', levels_src, re.S)
-        words = [variant_words[int(v)] for v in re.findall(r'\d+', ids.group(1))] if ids else []
+        vids = [int(v) for v in re.findall(r'\d+', ids.group(1))] if ids else []
+        words = [variant_words[v] for v in vids]
+        # Only variants with a real death pose take room in the hit bank.
+        hit = [variant_words[v] for v in vids if variant_hit[v]]
         levels.append({'set': int(f[0]), 'enemies': f[-3], 'variants': int(f[-2]),
-                       'enemy_words': sum(words) * 2, 'enemy_hit_words': sum(words)})
+                       'enemy_words': sum(words) * 2, 'enemy_hit_words': sum(hit)})
 
     sets = re.search(r'const StageSetData g_stage_sets\[12\] = \{(.*?)\n\};', levels_src, re.S).group(1)
     set_tiles = [int(row.split(',')[-2]) for row in re.findall(r'\{(.*?)\}', sets, re.S)]
@@ -295,11 +314,13 @@ def report(resolved, data):
         if prev_end < VRAM_WORDS:
             out.append(f'  0x{prev_end:04X}..0x{VRAM_WORDS:04X}  {VRAM_WORDS-prev_end:6d} words free')
     out.append('')
+    bases = dict((e[0], e[2]) for e in BANKS)
+    walk_base, hit_base = bases['ENEMY_BASE_WORD'], bases['ENEMY_HIT_BASE_WORD']
     out.append('Per-level enemy bank usage (front/play):')
     for idx, lv in enumerate(data['levels'], 1):
         out.append(f'  level {idx:2d}: {lv["variants"]:2d} variants -> '
-                   f'0x7400..0x{0x7400+lv["variants"]*ENEMY_VARIANT_WORDS:04X}, '
-                   f'hit 0xC800..0x{0xC800+lv["variants"]*ENEMY_FRAME_WORDS:04X}')
+                   f'0x{walk_base:04X}..0x{walk_base+lv["enemy_words"]:04X}, '
+                   f'hit 0x{hit_base:04X}..0x{hit_base+lv["enemy_hit_words"]:04X}')
     return '\n'.join(out)
 
 

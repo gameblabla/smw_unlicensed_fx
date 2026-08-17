@@ -391,8 +391,11 @@ static u16 g_enemy_atk_vram[16],g_enemy_atk2_vram[16],g_enemy_shot_vram[16];
 /* $D244/$D3F8 cel durations: 15 ticks of wind-up, then 7 on the release cel. */
 #define THROWER_WINDUP_TICKS  15
 #define THROWER_RELEASE_TICKS  7
+/* $BD54 subtracts $3C from the duck's X before comparing it with the player,
+   so it spits as soon as they are within sixty pixels of reaching it. */
+#define SPARK_TRIGGER_DX 60
 /* Size of the ENEMY_ALT and ENEMY_SHOT banks in tools/vram_map.py. */
-#define ENEMY_ALT_WORDS 2304
+#define ENEMY_ALT_WORDS 2880
 #define ENEMY_SHOT_WORDS 256
 #define enemy_frame_words(v) ((int)(v)->cols*(int)(v)->rows*64)
 static int g_in_boss=0;
@@ -413,6 +416,22 @@ static s32 g_boss_shot_x,g_boss_shot_y,g_boss_shot_vx,g_boss_shot_vy;
 static int g_boss_shot_active;
 static unsigned g_boss_drop_rng;
 static int g_boss_random_drop_timer;
+/* The later handlers keep more of the source object than the earlier two.
+   +$1E is the "a move is running" bit, +$1C the group/cel cursor, +$B the
+   pose the handler last selected and +$14 the teleport blank. */
+static int g_boss_init,g_boss_group,g_boss_cel,g_boss_anim_step,g_boss_anim_div;
+static int g_boss_hidden;
+/* Bosses 6 and 7 both put three or four objects in the air at once, which
+   the port's single g_boss_shot_* slot could not represent. */
+#define MAX_BOSS_SHOTS 4
+#define BOSS_SHOT_RING   1   /* $1A1 volley and $1A7 shockwave */
+#define BOSS_SHOT_HAMMER 2   /* $1A3, spouted then dropped as a throwable */
+#define BOSS_SHOT_BOMB   3   /* $1A8 on the $9262 arc */
+#define BOSS_SHOT_BELL   4   /* $B4 lowered by $9CE6 */
+typedef struct { s32 x,y,vx,vy; short timer; unsigned char active,kind,phase; } BossShot;
+static BossShot g_boss_shots[MAX_BOSS_SHOTS];
+/* $9596 jolts the plane when the elephant lands. */
+static int g_screen_shake;
 
 /* Boss 3's handler at MD $806A is a byte-pair action script.  The first byte
    selects the movement state and the second is the source direction flag.
@@ -487,10 +506,120 @@ static const unsigned char g_boss10_pot[31]={
     0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x03,0x88
 };
 
+/* --- Bosses 5, 6 and 7 -------------------------------------------------
+   The three handlers after the ostrich were the last placeholders in the
+   port: a sinusoid between two lifts, a random sweep and a flat patrol.  All
+   three are recovered here from the 68000 the same way $806A and $8764 were.
+
+   They share one coordinate convention.  Source object coordinates are the
+   room's plus $80 on both axes, and the drawn corner is the metasprite's
+   bbox origin away from that.  $1D22A ($28C, the frog's dragon, 72x64 at
+   -32/-64), $1C75A ($25C, the mage, 104x96 at -56/-88) and $1CB42 ($270, the
+   elephant, 104x96 at -48/-96) supply those offsets; folding the port's own
+   canvas padding in gives the two tables below, so a handler can work in the
+   source's actor space and the renderer keeps its top-left anchor. */
+#define BOSS_ROOM_BIAS 128
+/* $7B74/$7BE0 spawn the two carriers at $68 and run them to $15E. */
+#define BOSS13_LIFT_TOP    (0x68-BOSS_ROOM_BIAS)
+/* The space matters: "0x15E-" is a single pp-number to the preprocessor. */
+#define BOSS13_LIFT_BOTTOM (0x15E - BOSS_ROOM_BIAS)
+/* $7BC0 retires the descending carrier at $15E, which is room 222.  The port
+   draws boss-room objects seven lines up, so that still leaves the carrier's
+   23 rows on screen at 215..237 and it blinks out in full view.  Run it on to
+   the first row where the whole sprite has left the 240-line window instead:
+   room 247 puts its top edge at screen 240.  The rising carrier needs no such
+   extension - it retires at room -24, already clear of the top edge. */
+#define BOSS13_ROOM_DY     (-7)
+#define BOSS13_LIFT_EXIT   (240 - BOSS13_ROOM_DY)
+/* $940E's own storey: the elephant's actor origin while it is not mid-hop. */
+#define BOSS19_FLOOR_Y (0x120-BOSS_ROOM_BIAS)
+/* Slot 13's actor point is the tank's, not the driver's: $8D72 drives the
+   vehicle with metasprites $1A5/$1A6, 80x32 anchored at -40/-32..39/-1, so
+   the actor X is 40 pixels into the tank and the actor Y is the tread line
+   the storey surfaces are quoted against ($C0 on top, $120 below).  The port
+   packs driver and tank into one 112x96 pose with the tank pinned at canvas
+   x=16, y=64..95, which puts the actor at (56,96) inside that canvas. */
+static const short g_boss_origin_dx[3]={56,56,56};
+static const short g_boss_origin_dy[3]={96,88,144};
+
+/* $92F8, walked two bytes at a time by $8CFC: the movement state and the
+   source direction flag.  $93CE names sixteen handlers for it. */
+static const unsigned char g_boss13_script[]={
+    16,0,  1,0,  2,0,  3,1,  4,1, 16,1,  5,1, 12,1, 15,0, 11,0,
+     6,1,  7,0,  8,0, 16,0,  1,0, 11,0,  5,1, 12,1,  1,0, 15,0,
+    15,0, 11,0,  5,1, 12,1,  1,0, 15,0, 15,0,  2,0,  3,1,  4,1,
+    15,1, 15,1,  5,1, 15,1, 15,1, 12,1,  1,0, 11,0,  5,1, 12,1,
+    15,0, 11,0, 15,0,  6,1,  7,0,  8,0, 14,0, 14,0, 16,0,  1,0,
+    11,0,  5,1, 12,1, 15,0,  1,0, 15,0,  2,0,  3,1,  4,1, 15,1,
+    15,1, 13,1, 15,1, 15,1,  5,1, 12,1, 16,0,  1,0, 14,0, 15,0,
+    15,0, 11,0,  5,1,  6,1,  7,0,  8,0,  1,0,  2,0,  3,1,  4,1,
+    15,1,  5,1,  6,1,  7,0,  8,0, 16,0,  1,0, 11,0, 16,1, 16,1,
+    12,1,  2,0,  3,1,  4,1, 15,1, 13,1, 15,1,  5,1, 12,1, 16,0,
+    16,0, 11,0, 15,1,  6,1,  7,0,  8,0, 0x88
+};
+/* $922A/$9235/$9240/$9251: states 11-14 are pure cel scripts, one entry
+   every third frame, each entry a (pose, direction) pair. */
+static const unsigned char g_boss13_anim11[]={1,0, 2,1, 2,0, 1,1, 1,1, 0x88};
+static const unsigned char g_boss13_anim12[]={1,1, 5,1, 5,0, 1,0, 1,0, 0x88};
+static const unsigned char g_boss13_anim13[]={1,1, 2,0, 2,1, 1,0, 5,0, 5,1, 1,1, 1,1, 0x88};
+static const unsigned char g_boss13_anim14[]={1,0, 2,1, 2,0, 1,1, 5,1, 5,0, 1,0, 1,0, 0x88};
+/* $9262: the bomb's flight, one (dy,dx) word pair a frame.  dx is applied on
+   the side the throw was aimed at; dy is signed and always downward-positive
+   in room space.  The 0x8888 terminator hands the object to the room. */
+static const signed char g_boss13_bomb_arc[]={
+    -4,2, -4,2, -3,2, -3,2, -3,2, -2,2, -2,2, -1,1, -1,1,  1,1,
+     1,1,  1,2,  2,2,  2,2,  2,3,  2,2,  3,2,  3,2,  3,2,  4,2,
+     4,2,  4,2, -3,1, -3,1, -2,1, -2,1, -2,1, -1,1, -1,1,  0,0,
+     1,1,  1,1,  2,1,  2,1,  2,1,  3,1,  3,1, -128
+};
+
+/* $99BE picks its next move from the VDP counter instead of a fixed script.
+   $9E20 is the modulus for the group it is currently in and $9E38 points at
+   that group's records: (state, next group, direction).  The group is also
+   the corner $9E28 teleports it to, which is why the four of them are the
+   arena's four quadrants. */
+static const unsigned char g_boss16_group_len[4]={11,11,9,9};
+static const unsigned char g_boss16_groups[4][11][3]={
+  {{1,1,0},{3,2,0},{7,3,0},{5,1,1},{5,2,1},{5,3,0},{6,0,0},{6,0,0},{1,1,0},{3,2,0},{7,3,0}},
+  {{1,0,1},{7,2,1},{4,3,1},{5,0,1},{5,2,1},{5,3,0},{6,1,1},{6,1,1},{1,0,1},{7,2,1},{4,3,1}},
+  {{3,0,1},{2,1,1},{5,0,0},{5,1,1},{5,3,0},{6,2,1},{6,2,1},{3,0,1},{2,1,1},{0,0,0},{0,0,0}},
+  {{2,0,0},{4,1,0},{5,0,0},{5,1,0},{5,2,1},{6,3,0},{6,3,0},{2,0,0},{4,1,0},{0,0,0},{0,0,0}},
+};
+/* $9E28, in source object coordinates. */
+static const short g_boss16_tele[4][2]={{320,224},{192,224},{192,320},{320,320}};
+
+/* $940E is the same machine with six groups and its own X anchors. */
+static const unsigned char g_boss19_group_len[6]={7,7,6,7,7,6};
+static const unsigned char g_boss19_groups[6][7][3]={
+  {{1,1,0},{3,4,0},{5,0,0},{2,5,0},{4,3,0},{6,0,0},{6,0,0}},
+  {{1,0,1},{1,2,0},{3,3,0},{5,1,0},{2,4,0},{6,1,0},{6,1,1}},
+  {{1,1,1},{2,3,0},{5,2,0},{5,2,1},{6,2,0},{6,2,1},{0,0,0}},
+  {{4,0,1},{3,1,1},{2,2,1},{1,4,1},{5,3,1},{6,3,1},{6,3,1}},
+  {{1,3,0},{1,5,1},{3,0,1},{5,4,1},{2,1,1},{6,4,0},{6,4,1}},
+  {{2,0,1},{1,4,0},{5,5,0},{5,5,1},{6,5,0},{6,5,1},{0,0,0}},
+};
+/* $9830: state 5 snaps to its group's X before it leaps. */
+static const short g_boss19_anchor_x[6]={320,272,224,192,240,288};
+/* $983C/$9855/$9876/$988B/$98B4.  Each hop is read one byte a frame: the
+   rise subtracts the entry from Y, then $9540 turns the table around and the
+   fall adds it, so one table is a complete arc. */
+static const unsigned char g_boss19_hop1[]={8,8,8,8,8,7,7,7,7,6,6,6,6,5,5,5,5,4,4,4,4,3,2,1,0x88};
+static const unsigned char g_boss19_hop2[]={9,9,9,8,8,8,8,8,8,7,7,7,7,7,7,6,6,6,6,5,5,5,5,4,4,4,4,3,3,2,2,1,0x88};
+static const unsigned char g_boss19_hop3[]={9,9,9,9,8,8,8,8,8,8,7,7,7,7,7,7,7,7,7,6,0x88};
+static const unsigned char g_boss19_hop4[]={8,8,8,8,8,7,7,7,7,7,7,7,6,6,6,6,6,6,6,5,5,5,5,5,4,4,4,4,4,4,3,3,3,3,3,2,2,2,1,1,0x88};
+static const unsigned char g_boss19_hop5[]={9,9,9,9,9,8,8,8,8,8,7,7,7,7,7,6,6,6,6,5,5,4,4,3,3,0x88};
+/* $98CE: the rise half of each spouted hammer's flight. */
+static const unsigned char g_boss19_hammer_arc[]={9,9,9,8,8,8,8,7,7,7,7,6,6,6,6,5,5,5,4,4,4,3,2,1,0x88};
+
 /* $B844's three bounce arcs, read one signed word a frame while the rock
    rolls two pixels right.  The first is the same 45-step table $17948 gives
    the player's jump; the port's copy of that one carries a deliberate change
-   for Mario's clearance, so the rock keeps its own. */
+   for Mario's clearance, so the rock keeps its own.
+
+   $BA7A is also the hop of the state-14 walker, which reads it a word a frame
+   until the $8888 that follows its forty-fourth entry -- hence the separate
+   step count below rather than the whole array. */
+#define HOPPER_JUMP_STEPS 44
 static const signed char g_boulder_bounce1[45]={
     -6,-6,-5,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,
     -2,-2,-2,-2,-2,-2,-2,0,0,0,2,2,2,2,2,2,2,
@@ -1480,10 +1609,11 @@ static unsigned char collision_at(int x,int y)
     if(g_in_boss){
         int ci=(g_boss_class<0||g_boss_class>5)?0:g_boss_class;
         if(x<0||x>=256)return 1;if(y<0)return 0;if(y>=256)return 1;
-        /* Slot 13's three gold carriers are separate source objects rather
-           than entries in the room grid. Their captured positions remain
-           one-way surfaces in the PC-FX reconstruction. */
-        if(ci==3&&((x<64&&y>=64&&y<72)||(x>=160&&x<224&&y>=88&&y<96)||(x>=192&&y>=176&&y<184)))return 2;
+        /* Slot 13's two gold carriers are live objects $7B5C creates and
+           walks, not room geometry: the ROM's own grid for the room is solid
+           only across x 64..191 on rows 8 and 20, and the shafts the carriers
+           run in are open air.  Nailing the carriers' captured positions into
+           the grid walled both shafts off permanently, so ride the objects. */
         /* Exact 32x32 collision grids selected by ROM table $7038C. */
         return g_boss_collision[ci*1024+(y>>3)*32+(x>>3)];
     }
@@ -1541,9 +1671,20 @@ static int player_body_y(void) { return (int)(g_player_y >> FIX_SHIFT) + PLAYER_
 /* The first two arenas retain the six-pixel raster lead from their captured
    Mega Drive room plane.  Bowser's extracted poses include that lead, whereas
    Mario and the generic crate metasprites do not. */
+/* Every boss arena is a capture of the Mega Drive screen, and a capture does
+   not necessarily sit where the room's own collision grid says it does.  The
+   Bowser rooms are six lines out; slot 13's is seven - its ledges are drawn
+   at y=57 and y=153 where the ROM's 32x32 grid for the room (rows 8 and 20)
+   puts their surfaces at 64 and 160.  Collision, the boss script and the
+   carriers all stay in the ROM's room space; only the drawing of the things
+   that live in it is nudged onto the picture, so they keep their alignment
+   with each other as well as with the arena. */
 static int bowser_room_object_y_offset(void)
 {
-    return (g_in_boss && g_boss_class == 0) ? -6 : 0;
+    if (!g_in_boss) return 0;
+    if (g_boss_class == 0) return -6;
+    if (g_boss_class == 3) return BOSS13_ROOM_DY;
+    return 0;
 }
 
 static int crate_at_side(int bx, int by, int moving_right)
@@ -1707,17 +1848,18 @@ static void resolve_player_vertical(s32 next_y)
 }
 
 /* ROM $17948: signed per-frame displacement for the original normal jump.
- * Full hold rises 83 pixels; releasing I during the rising half mirrors into
- * the falling half, reproducing the original short-jump behaviour.
+ * Releasing I during the rising half mirrors into the falling half,
+ * reproducing the original short-jump behaviour.
  *
- * The four entries marked below are -2 in the Mega Drive table.  Carrying the
- * -4 run through them adds half a tile of clearance, which the port needs
- * because its terrain lands the level 8 ledges an 8px row above the original
- * and the 75px arc stops just short of the second one.  The apex and the
- * descent are untouched, so the mirrored short jump still behaves. */
+ * The rising half is not the Mega Drive's.  Its 75-pixel arc stops short of
+ * ledges the port's terrain lands an 8px row above the original, and it reads
+ * as too low here besides, so the twenty-one rising steps have been steepened
+ * to carry Mario 100 pixels instead.  The three apex zeroes and the whole
+ * descent are untouched, which is what keeps the mirrored short jump and the
+ * landing speed behaving as they did. */
 static const signed char g_md_jump_dy[45]={
-    -6,-6,-5,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,-4,
-    -4,-4,-4,-4,-2,-2,-2,0,0,0,2,2,2,2,2,2,2,
+    -7,-7,-6,-5,-5,-5,-5,-5,-5,-5,-5,-5,-5,-5,
+    -5,-5,-4,-4,-3,-2,-2,0,0,0,2,2,2,2,2,2,2,
     4,4,4,4,4,4,4,4,4,4,4,5,6,6
 };
 
@@ -1751,10 +1893,18 @@ static void update_camera(void)
     if(g_in_boss){
         g_camera_x=0;g_camera_target_x=0;g_camera_tile=0;
         g_camera_y=0;g_camera_target_y=0;g_camera_row=0;
-        vdc_set_scroll(FRONT_CHIP,0,0);
-        /* Handler $940E continuously advances the final room's wall plane;
-           its collision/platform plane remains fixed. */
-        vdc_set_scroll(BACK_CHIP,0,(g_boss_class==5)?(u16)((g_boss_timer>>2)%224):0);
+        /* $9596 sets the jolt flag when the elephant comes back down; the
+           source shakes both planes for a few frames after the landing. */
+        {
+            /* Shake sideways rather than vertically: both BATs are 32 columns
+               for a 256-pixel room, so an X offset wraps exactly, while a Y
+               offset runs off the end of the populated rows and shows VDC
+               scratch. */
+            int jolt=(g_screen_shake>0)?((g_screen_shake&1)?2:-2):0;
+            int wall=(g_boss_class==5)?(int)((g_boss_timer>>2)%224):0;
+            vdc_set_scroll(FRONT_CHIP,(u16)((jolt+256)&255),0);
+            vdc_set_scroll(BACK_CHIP,(u16)((jolt+256)&255),(u16)wall);
+        }
         return;
     }
     int px=(int)(g_player_x>>FIX_SHIFT);
@@ -1806,7 +1956,7 @@ static void update_camera(void)
        completed a whole screen, so the view comes to rest on a storey and
        never sits astride two of them.  Reproduce that: the camera belongs to
        the live room, and it travels -- one screen, at a rate that outruns the
-       83-pixel jump so Mario cannot climb out of the top of the picture --
+       jump's seven-pixel first step so Mario cannot climb out of the top --
        only while a hand-over is in progress. */
     if(g_level_rows>1){
         int home=(int)g_screen_row[g_room]*LEVEL_SCREEN_H;
@@ -1891,6 +2041,9 @@ static int platform_height(const MovingPlatform *p)
     if (sh) return sh[6];
     if (p->kind==PLATFORM_KIND_WEDGE_R) return 64;
     if (p->kind==PLATFORM_KIND_WEDGE_L) return 48;
+    /* Metasprite $1A9, the slot 13 carrier, is 64x24 anchored at its own
+       top-left corner, so its surface is exactly the object's Y. */
+    if (g_in_boss && g_boss_class==3) return 24;
     return MOVING_PLATFORM_H;
 }
 
@@ -1924,11 +2077,20 @@ static void init_moving_platforms(void)
     if (g_in_boss) {
         /* The $8CEC room owns two live carriers. They are not decoration:
            both Mario and the frog use their current Y while waiting/jumping. */
+        /* $7B5C creates them at ($80,$68) and ($140,$15E) with metasprite
+           $1A9, walks each one pixel a frame in opposite directions and
+           destroys it at the far end, where the next frame makes it again.
+           They travel the whole shaft, not the short stroke the placeholder
+           used, and they never turn around.  The descending one runs past
+           the source's own $15E to BOSS13_LIFT_EXIT so it leaves the screen
+           before it wraps rather than vanishing in view. */
         if(g_boss_class==3){
             p=&g_moving_platforms[g_moving_platform_count++];
-            p->x=(s32)16<<FIX_SHIFT;p->y=(s32)48<<FIX_SHIFT;p->min_y=48;p->max_y=120;p->dir=1;p->speed=1;
+            p->x=(s32)0<<FIX_SHIFT;p->y=(s32)BOSS13_LIFT_TOP<<FIX_SHIFT;
+            p->min_y=BOSS13_LIFT_TOP;p->max_y=BOSS13_LIFT_EXIT;p->dir=1;p->speed=1;
             p=&g_moving_platforms[g_moving_platform_count++];
-            p->x=(s32)192<<FIX_SHIFT;p->y=(s32)152<<FIX_SHIFT;p->min_y=80;p->max_y=152;p->dir=-1;p->speed=1;
+            p->x=(s32)192<<FIX_SHIFT;p->y=(s32)BOSS13_LIFT_BOTTOM<<FIX_SHIFT;
+            p->min_y=BOSS13_LIFT_TOP;p->max_y=BOSS13_LIFT_BOTTOM;p->dir=-1;p->speed=1;
         }
         return;
     }
@@ -2138,6 +2300,28 @@ static void update_moving_platforms(void)
         s32 old_y=p->y,old_x=p->x;
         if (PLATFORM_KIND_IS_STAGE_OBJECT(p->kind)) {
             update_stage_object(p,i);
+        } else if (p->kind==PLATFORM_KIND_LIFT && g_in_boss && g_boss_class==3) {
+            /* $7828/$7C2C destroy the carrier at the end of its run and the
+               next frame recreates it at the other end, so it loops instead
+               of shuttling.  $7B14 gates the whole routine on bit 0 of the
+               frame counter, so a carrier crosses its shaft at one pixel
+               every other frame -- the same cadence $8E10/$8EC0 give the
+               boss's own descent and climb.  Running it at a pixel a frame
+               made the boss and the carrier it is supposed to ride down
+               drift apart by half the shaft. */
+            /* $7B5C returns without touching either carrier while the
+               driver holds cel 3, the pose $1633A selects for a hit, so the
+               shafts stop with the boss. */
+            if (half && g_boss_invuln==0) {
+                p->y+=(s32)p->dir*FIX_ONE;
+                if (p->dir>0 && (int)(p->y>>FIX_SHIFT)>=p->max_y) {
+                    if (g_on_moving_platform==i) { g_on_moving_platform=-1; g_grounded=0; }
+                    p->y=(s32)p->min_y<<FIX_SHIFT;
+                } else if (p->dir<0 && (int)(p->y>>FIX_SHIFT)<=p->min_y) {
+                    if (g_on_moving_platform==i) { g_on_moving_platform=-1; g_grounded=0; }
+                    p->y=(s32)p->max_y<<FIX_SHIFT;
+                }
+            }
         } else if (p->kind==PLATFORM_KIND_LIFT) {
             p->y+=(s32)p->dir*(s32)p->speed*FIX_ONE;
             if ((int)(p->y>>FIX_SHIFT)<=p->min_y) {
@@ -2772,6 +2956,69 @@ static void update_enemies(void)
                     }
                 }else if(++e->behavior_timer>=48){e->behavior_phase=0;e->behavior_timer=0;}
                 y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->kind==ENEMY_KIND_SPARKER){
+                /* State 11, ROM $BCC8.  The duck holds its ground and does
+                   nothing at all until $BD54 finds the player at or past its
+                   own X minus $3C; then it turns to face them, switches to
+                   animation state 3 and $BE26 puts a spark in its child slot
+                   eighteen pixels below its origin.  $BDDA/$BDE2 crawl that
+                   spark two pixels a frame in the direction it is facing and
+                   $130C6 retires it off the edge of the view, which is what
+                   returns the duck to its idle phase.  The port used to hand
+                   this record to the generic solver, so the duck walked off
+                   like a Goomba and never spat anything. */
+                e->vx=e->vy=0;
+                if(e->behavior_phase==0){
+                    if(px>=x-SPARK_TRIGGER_DX){
+                        e->behavior_phase=1;e->behavior_timer=0;
+                        e->face_right=(unsigned char)(px>=x);
+                        e->shot_slot=(unsigned char)(throw_enemy_shot(e,24,0,2,SHOT_MODE_SPEAR)+1);
+                    }
+                }else{
+                    if(e->behavior_timer<255)++e->behavior_timer;
+                    if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
+                        e->shot_slot=0;e->behavior_phase=0;e->behavior_timer=0;
+                    }
+                }
+                y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
+            }else if(e->kind==ENEMY_KIND_HOPPER){
+                /* State 14, ROM $B98C.  It walks a pixel a frame for $3F
+                   frames, then spends the whole of $BA7A hopping -- still
+                   moving that pixel a frame sideways, and with no terrain
+                   probe of any kind -- and finally stands for another $3F on
+                   animation state 1 before walking again.  Only the walking
+                   third of that was ported, which is why it never left the
+                   ground.
+
+                   The source picks a fresh random direction for each leg out
+                   of $C00008; here the leg keeps whichever way the terrain
+                   solver has the walk pointed, so a hop cannot launch the
+                   bird into the wall it just turned away from. */
+                if(e->behavior_phase==1){
+                    e->y+=(s32)g_boulder_bounce1[e->behavior_timer]*FIX_ONE;
+                    e->x+=e->face_right?FIX_ONE:-FIX_ONE;
+                    if(++e->behavior_timer>=HOPPER_JUMP_STEPS){
+                        e->behavior_phase=2;e->behavior_timer=0;
+                    }
+                    e->vx=e->vy=0;
+                    x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
+                    goto enemy_attack_checks;
+                }
+                if(e->behavior_phase==0){
+                    e->face_right=(unsigned char)(e->vx>0);
+                    if(++e->behavior_timer>=63){
+                        e->behavior_phase=1;e->behavior_timer=0;
+                    }
+                }else{
+                    e->vx=0;
+                    if(++e->behavior_timer>=63){
+                        e->behavior_phase=0;e->behavior_timer=0;
+                        e->vx=e->face_right?FIX_ONE:-FIX_ONE;
+                    }
+                }
+                /* Phases 0 and 2 deliberately fall through to the generic
+                   solver so the walk still lands on terrain and turns at
+                   walls the way every other ground enemy in the port does. */
             }else if(e->kind==ENEMY_KIND_SPEARMAN){
                 /* State 13, ROM $BAD6.  Unlike the thrower this one really
                    does patrol, so it keeps the generic terrain solver below
@@ -3049,6 +3296,62 @@ static int current_player_frame(void)
     return 3;
 }
 
+/* Slot 13's bank, in the order tools/build_full_game.py renders it.  Frames
+   0..3 are the driver alone, facing left, with $7124's direction-0 offset
+   from the vehicle already baked in; the renderer mirrors them to face right.
+   The rearing and hit metasprites ($28E/$294 and $290/$296) draw the vehicle
+   themselves and the vehicle never mirrors, so those keep one stored pose per
+   direction.  Frames 8/9 are the vehicle's two tread cels. */
+#define BOSS13_FRAME_REST  0
+#define BOSS13_FRAME_LEAN  1
+#define BOSS13_FRAME_BOW   2
+#define BOSS13_FRAME_HOLD  3
+#define BOSS13_FRAME_FIRE  4   /* +1 facing right */
+#define BOSS13_FRAME_HIT   6   /* +1 facing right */
+#define BOSS13_FRAME_TREAD 8   /* +1 on the alternate tread cel */
+
+/* True while the stored pose already carries the vehicle and its direction,
+   so the renderer must neither mirror it nor draw the vehicle underneath. */
+static int boss13_frame_is_whole(int frame)
+{
+    return frame>=BOSS13_FRAME_FIRE && frame<BOSS13_FRAME_TREAD;
+}
+
+/* The driver's cel: $8D3C parks it at 0 for every movement state, the $922A
+   cel scripts step it through 1/2/5 while the boss turns, both attacks set 6
+   at $90D0 and $9184, and $1633A/$163C0 select 3 and 4 for hit and death. */
+static int boss13_driver_frame(void)
+{
+    int right=(g_boss_face<0)?1:0;
+    if(g_boss_invuln>0||g_boss_defeated)return BOSS13_FRAME_HIT+right;
+    if(g_boss_cel==6)return BOSS13_FRAME_FIRE+right;
+    if(g_boss_cel==1)return BOSS13_FRAME_LEAN;
+    if(g_boss_cel==2)return BOSS13_FRAME_BOW;
+    if(g_boss_cel==5)return BOSS13_FRAME_HOLD;
+    return BOSS13_FRAME_REST;
+}
+
+/* $7124, indexed by graphics bank then direction: where $6F3A puts the driver
+   relative to the vehicle.  Frames 0..3 are banks 1..4 in that order. */
+static const signed char g_boss13_driver_dx[2][4]={{-16,-24,8,-16},{16,24,16,24}};
+
+/* The driver's X offset from the vehicle for the pose being drawn.  $7040 and
+   $705C anchor the rearing and hit poses on the vehicle itself instead. */
+static int boss13_driver_dx(void)
+{
+    int frame=boss13_driver_frame();
+    if(frame>=BOSS13_FRAME_FIRE)return 0;
+    return g_boss13_driver_dx[(g_boss_face<0)?1:0][frame];
+}
+
+/* The two directions are not mirror images for the bowing and holding poses.
+   Mirroring a pose stored at its direction-0 offset lands it at the negated
+   offset, so facing right needs the sum of the two as a correction. */
+static int boss13_driver_flip_dx(int frame)
+{
+    return (frame<4)?(g_boss13_driver_dx[0][frame]+g_boss13_driver_dx[1][frame]):0;
+}
+
 static int later_boss_frame(const BossVisualData *v)
 {
     int frame,t=g_boss_timer;
@@ -3072,11 +3375,48 @@ static int later_boss_frame(const BossVisualData *v)
        bottom-aligned in the shared canvas, so the extra height grows upward
        and the feet stay put. */
     case 2: frame=(g_boss_invuln>0)?2:((t/6)&1);break;        /* ostrich */
-    case 3: frame=g_boss_shot_active?3+(t/8)%7:(t/8)%3;break; /* tank */
-    case 4: frame=g_boss_shot_active?3+(t/8)%2:(t/8)%3;break; /* mage */
-    default:frame=g_boss_shot_active?2+(t/8)%3:(t/8)%2;break; /* elephant */
+    /* The three later handlers choose their own pose: $8D3C and its
+       neighbours write the source object's +$B every time an action starts
+       or a cel script steps, and only the idle cycle is left to the timer.
+       Zero is the resting pose for all three, so a non-zero cel is a real
+       selection and is used as the frame directly. */
+    case 3: /* tank: the driver's pose is the object's cel byte, resolved
+               through the per-level cel table at $716E. */
+        frame=boss13_driver_frame();
+        break;
+    case 4: /* mage */
+        if(g_boss_invuln>0)frame=v->frame_count-1;
+        else if(g_boss_cel)frame=g_boss_cel;
+        else frame=(t/8)%3;
+        break;
+    default: /* elephant */
+        if(g_boss_invuln>0)frame=v->frame_count-1;
+        else if(g_boss_cel)frame=g_boss_cel;
+        else frame=(t/8)%2;
+        break;
     }
+    if(frame<0)frame=0;
     return frame%v->frame_count;
+}
+
+/* Emit one boss pose's occupied cells, optionally mirrored about the pose's
+   own centre, and return the new SATB cursor. */
+static int emit_boss_cells(u16 *satb,int n,const BossVisualData *v,int frame,
+                           int bx,int by,int mirror)
+{
+    unsigned long long mask=v->sprite_masks[frame];
+    int frame_words=v->cols*v->rows*64,cx,cy;
+    for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
+        int cell=cy*v->cols+cx,dx,palette;
+        if(!(mask&(1ULL<<cell)))continue;
+        dx=mirror?(v->cols-1-cx)*16:cx*16;
+        palette=v->sprite_cell_palettes[frame*v->cols*v->rows+cell];
+        set_sprite_entry(satb,n++,bx+dx,by+cy*16,
+            (u16)(BOSS_BASE_WORD+frame*frame_words+cell*64),
+            (u16)(VDC_SPR_PRIO_SP|(palette?BOSS_SPR_PAL_AUX:BOSS_SPR_PAL)|
+                  (mirror?VDC_SPR_X_INVERT:0)));
+    }
+    return n;
 }
 
 static void draw_game_sprites(void)
@@ -3248,7 +3588,7 @@ static void draw_game_sprites(void)
         int sx,sy;
         if (mp->hidden) continue;   /* metasprite 0: parked out of the cycle */
         sx=platform_draw_x(mp)-g_camera_x;
-        sy=platform_draw_y(mp)-g_camera_y;
+        sy=platform_draw_y(mp)-g_camera_y+bowser_room_object_y_offset();
         if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
         if(PLATFORM_KIND_IS_STAGE_OBJECT(mp->kind)){
             /* Cells are stored row-major with an even pitch, so each pair is
@@ -3361,6 +3701,17 @@ static void draw_game_sprites(void)
             else if(e->kind==ENEMY_KIND_THROWER)
                 anim=(e->behavior_phase==0)?0:
                      (e->behavior_phase==2&&e->behavior_timer<THROWER_RELEASE_TICKS)?4:3;
+            /* $BCC8 writes 3 into the animation-state word for the whole of
+               the spit and $B98C writes 1 for the whole of the recovery it
+               spends standing after a hop; both of those poses land in the
+               port's attack bank, which is selector 3 here. */
+            /* $D372 is two cels of seven ticks each, so the spit alternates
+               them for as long as the spark is in the air. */
+            else if(e->kind==ENEMY_KIND_SPARKER)
+                anim=e->behavior_phase?(((e->behavior_timer/7)&1)?4:3):
+                     (int)((g_state_frame/8)&1);
+            else if(e->kind==ENEMY_KIND_HOPPER)
+                anim=(e->behavior_phase==2)?3:(int)((g_state_frame/8)&1);
             else if(e->kind==ENEMY_KIND_SPEARMAN)
                 anim=e->behavior_phase?
                      ((e->behavior_timer>=THROWER_RELEASE_TICKS&&
@@ -3373,7 +3724,11 @@ static void draw_game_sprites(void)
 #ifdef FORCE_SNAKE_FRAME
         if(e->kind==ENEMY_KIND_STRIKE_SNAKE)anim=FORCE_SNAKE_FRAME;
 #endif
-        special_snake=(e->kind==ENEMY_KIND_STRIKE_SNAKE);
+        /* Only the three live poses live in the 64x40 bank.  A dead snake has
+           a real death cel in its variant's hit bank like every other enemy,
+           so it has to leave the special path -- drawing selector 2 of the
+           strike bank there is how the corpse ended up mid-lunge. */
+        special_snake=(e->kind==ENEMY_KIND_STRIKE_SNAKE&&!use_hit_frame);
         special_monkey=(e->kind==ENEMY_KIND_MONKEY&&(e->defeated||e->behavior_phase==3));
         special_crate=(e->kind==ENEMY_KIND_CRATE_MIMIC&&e->behavior_phase==2&&!e->defeated);
         special_frame=e->defeated?1:0;
@@ -3416,6 +3771,7 @@ static void draw_game_sprites(void)
         else if(use_hit_frame)base=g_enemy_hit_vram[li];
         else base=(u16)(g_enemy_vram[li]+(anim?enemy_frame_words(v):0));
         flip=((e->kind==ENEMY_KIND_PTERODACTYL||e->kind==ENEMY_KIND_THROWER||
+               e->kind==ENEMY_KIND_SPARKER||e->kind==ENEMY_KIND_HOPPER||
                (e->kind==ENEMY_KIND_SPEARMAN&&e->behavior_phase))?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
         for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
             int cell=cy*grid_cols+cx,dx;
@@ -3428,21 +3784,29 @@ static void draw_game_sprites(void)
         /* Hurt includes an impact puff four pixels above the body, so its
            capture origin needs +4 relative to the old value to keep Bowser's
            feet aligned with the neighboring walk poses. */
-        int bx=(int)(g_boss_x>>FIX_SHIFT),by=(int)(g_boss_y>>FIX_SHIFT),cx,cy;
+        int bx=(int)(g_boss_x>>FIX_SHIFT),cx,cy;
+        int by=(int)(g_boss_y>>FIX_SHIFT)+bowser_room_object_y_offset();
         unsigned long long mask;
         u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
             const BossVisualData *v=&g_later_boss_visuals[g_boss_class-1];
-            int frame=later_boss_frame(v),frame_words=v->cols*v->rows*64;
-            if(frame>=0){
-                mask=v->sprite_masks[frame];
-                for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
-                    int cell=cy*v->cols+cx,dx,dy=by+cy*16,palette;if(!(mask&(1ULL<<cell)))continue;
-                    dx=(g_boss_face<0)?(v->cols-1-cx)*16:cx*16;
-                    palette=v->sprite_cell_palettes[frame*v->cols*v->rows+cell];
-                    set_sprite_entry(satb,n++,bx+dx,dy,(u16)(BOSS_BASE_WORD+frame*frame_words+cell*64),
-                        (u16)(VDC_SPR_PRIO_SP|(palette?BOSS_SPR_PAL_AUX:BOSS_SPR_PAL)|flip));
-                }
+            int frame=later_boss_frame(v);
+            /* $9B52 blanks the mage's metasprite for the middle of its
+               teleport and then blinks it back in. */
+            if(g_boss_hidden)frame=-1;
+            if(frame>=0&&g_boss_class==3){
+                /* $8CEC's boss is two objects: the vehicle at the actor
+                   point, whose tread cel $8D72 alternates every eighth
+                   frame, and the driver on top of it.  Emitting them
+                   separately is what keeps the two welded together whatever
+                   pose the driver takes, and it is why the treads move. */
+                if(!boss13_frame_is_whole(frame))
+                    n=emit_boss_cells(satb,n,v,BOSS13_FRAME_TREAD+((g_state_frame>>3)&1),bx,by,0);
+                n=emit_boss_cells(satb,n,v,frame,
+                                  bx+((g_boss_face<0&&!boss13_frame_is_whole(frame))?boss13_driver_flip_dx(frame):0),
+                                  by,(g_boss_face<0&&!boss13_frame_is_whole(frame)));
+            }else if(frame>=0){
+                n=emit_boss_cells(satb,n,v,frame,bx,by,g_boss_face<0);
             }
         }else{
         /* The Genesis animation table at $71D2 selects two run frames at
@@ -3472,7 +3836,27 @@ static void draw_game_sprites(void)
         }
     }
 
-    if(g_in_boss && g_boss_shot_active && n<63){
+    /* The frog's shockwaves and bomb, the mage's ring volley and bell, and
+       the elephant's four hammers all live in the same array. */
+    if(g_in_boss && g_boss_class>=3){
+        for(i=0;i<MAX_BOSS_SHOTS && n<63;++i){
+            const BossShot *s=&g_boss_shots[i];
+            int sx,sy;
+            u16 addr,pal,ctrl;
+            if(!s->active)continue;
+            sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT)+bowser_room_object_y_offset();
+            if(sx<-32||sx>255||sy<-32||sy>239)continue;
+            if(s->kind==BOSS_SHOT_HAMMER){addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}
+            else if(s->kind==BOSS_SHOT_BOMB){addr=(u16)(BOSS_BOMB_BASE_WORD+((g_state_frame>>3)&1)*256);pal=BOSS_ITEM_SPR_PAL;}
+            else if(s->kind==BOSS_SHOT_BELL){addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;}
+            else{addr=BOSS_RING_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}
+            ctrl=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|pal);
+            if(s->vx<0)ctrl|=VDC_SPR_X_INVERT;
+            set_sprite_entry(satb,n++,sx,sy,addr,ctrl);
+        }
+    }
+
+    if(g_in_boss && g_boss_shot_active && g_boss_class<3 && n<63){
         int sx=(int)(g_boss_shot_x>>FIX_SHIFT),sy=(int)(g_boss_shot_y>>FIX_SHIFT),cx,cy;
         u16 flip=(g_boss_shot_vx<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
@@ -3637,6 +4021,12 @@ static void start_boss(int fade_in)
     y=(int)g_boss_alt_spawn[g_current_level*2+1]-128;
     if(x<-32||x>240)x=24;
     if(y<-32||y>208)y=144;
+#ifdef FORCE_PLAYER_X
+    x=FORCE_PLAYER_X;
+#endif
+#ifdef FORCE_PLAYER_Y
+    y=FORCE_PLAYER_Y;
+#endif
     g_player_x=(s32)x<<FIX_SHIFT;g_player_y=(s32)y<<FIX_SHIFT;
     g_vx=g_vy=0;g_grounded=(y>=144);g_facing=1;
     g_player_anim_clock=0;g_jump_active=0;g_bounce_active=0;g_camera_x=0;g_camera_tile=0;g_camera_hold=0;
@@ -3658,10 +4048,22 @@ static void start_boss(int fade_in)
        (bbox x0 = -32).  Fold that into the actor so motion, art and hitbox
        all share one coordinate. */
     if(g_boss_class==1){x-=32;y-=32;}
+    /* $6D54 places the frog's dragon itself rather than taking the loader's
+       record, and the mage and the elephant start on the corner their group
+       machine also teleports back to.  All three are actor origins, so they
+       go through the same conversion the handlers use. */
+    if(g_boss_class>=3){
+        static const short origin[3][2]={{288,192},{320,224},{320,288}};
+        x=origin[g_boss_class-3][0]-BOSS_ROOM_BIAS-g_boss_origin_dx[g_boss_class-3];
+        y=origin[g_boss_class-3][1]-BOSS_ROOM_BIAS-g_boss_origin_dy[g_boss_class-3];
+    }
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
+    g_boss_init=0;g_boss_group=0;g_boss_cel=0;g_boss_anim_step=0;g_boss_anim_div=0;
+    g_boss_hidden=0;g_screen_shake=0;
+    for(i=0;i<MAX_BOSS_SHOTS;++i)g_boss_shots[i].active=0;
     g_boss10_floor_y=y;
     g_boss8_crate=-1;
 
@@ -3669,7 +4071,7 @@ static void start_boss(int fade_in)
        $6D94 is also exported for the later two-player implementation. */
     g_boss_hp=(int)g_boss_hp_1p[g_current_level];
     if(g_boss_hp<=0)g_boss_hp=8;
-    g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_boss_drop_rng=0x51F15EEDu;g_boss_random_drop_timer=72;g_after_boss=0;
+    g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_boss_drop_rng=0xF2A74DE4u;g_boss_random_drop_timer=72;g_after_boss=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);
     music_start_at_black();
     draw_game_sprites();
@@ -3684,50 +4086,18 @@ static void boss_take_hit(void)
     else g_boss_invuln=BOSS_HURT_FRAMES;
 }
 
-static void boss_fire_at_player(int speed)
-{
-    if(g_boss_shot_active)return;
-    g_boss_shot_active=1;
-    g_boss_shot_x=g_boss_x+(s32)32*FIX_ONE;
-    g_boss_shot_y=g_boss_y+(s32)36*FIX_ONE;
-    g_boss_shot_vx=((g_player_x<g_boss_x)?-speed:speed)*FIX_ONE;
-    g_boss_shot_vy=0;
-}
-
 static unsigned boss_random(void)
 {
-    /* The MD handler samples the hardware RNG while selecting boss actions.
-       Keep a deterministic per-room stream so recordings are reproducible
-       while the bomb drops still vary instead of arriving on a fixed crate
-       cadence. */
+    /* $99DC and $942C read the VDP's HV counter and take the remainder
+       against the current group's length; the port keeps a deterministic
+       per-room stream instead so recordings stay reproducible.  The seed is
+       not arbitrary: with the old one the mage and the elephant both opened
+       with a long run of plain walks before their first attack, because the
+       stream now chooses actions and no longer only spaces out bomb drops. */
     g_boss_drop_rng^=g_boss_drop_rng<<13;
     g_boss_drop_rng^=g_boss_drop_rng>>17;
     g_boss_drop_rng^=g_boss_drop_rng<<5;
     return g_boss_drop_rng;
-}
-
-static int boss_bomb_active(void)
-{
-    int i;
-    for(i=0;i<MAX_CRATES;++i)
-        if(g_crates[i].active&&g_crates[i].extra==3)return 1;
-    return 0;
-}
-
-static void boss_drop_bomb(void)
-{
-    int i,bx,by,x;
-    if(boss_bomb_active())return;
-    bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
-    x=bx+8+(int)(boss_random()%49)-24;
-    if(x<8)x=8;if(x>224)x=224;
-    for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
-        Crate *c=&g_crates[i];
-        c->active=1;c->carried=0;c->thrown=0;c->extra=3;c->flight_timer=0;
-        c->x=(s32)x<<FIX_SHIFT;c->y=(s32)(by+40)<<FIX_SHIFT;
-        c->vx=0;c->vy=FIX_ONE;
-        return;
-    }
 }
 
 /* --- Boss 3 ($806A) crate and water-drop objects ------------------------ */
@@ -3809,9 +4179,158 @@ static void boss8_common_tail(void)
     }
 }
 
+/* --- Bosses 5-7: actor space and the objects their handlers create ------ */
+
+/* g_boss_x/g_boss_y are the art's top-left corner because that is what the
+   renderer wants.  The handlers work in the source's actor space instead. */
+static int boss_origin_x(void)
+{
+    return (int)(g_boss_x>>FIX_SHIFT)+g_boss_origin_dx[g_boss_class-3];
+}
+
+static int boss_origin_y(void)
+{
+    return (int)(g_boss_y>>FIX_SHIFT)+g_boss_origin_dy[g_boss_class-3];
+}
+
+static void boss_set_origin(int ox,int oy)
+{
+    g_boss_x=(s32)(ox-g_boss_origin_dx[g_boss_class-3])<<FIX_SHIFT;
+    g_boss_y=(s32)(oy-g_boss_origin_dy[g_boss_class-3])<<FIX_SHIFT;
+}
+
+/* The two lifts $7B5C runs.  Their Y is what $8DD4 and $8E88 wait on. */
+static int boss13_lift_y(int which)
+{
+    if(which>=g_moving_platform_count)return 0;
+    return (int)(g_moving_platforms[which].y>>FIX_SHIFT);
+}
+
+static int boss_shot_of_kind(int kind)
+{
+    int i;
+    for(i=0;i<MAX_BOSS_SHOTS;++i)
+        if(g_boss_shots[i].active&&g_boss_shots[i].kind==kind)return i;
+    return -1;
+}
+
+static int boss_shots_airborne(int kind)
+{
+    return boss_shot_of_kind(kind)>=0;
+}
+
+static void boss_clear_shots(int kind)
+{
+    int i;
+    for(i=0;i<MAX_BOSS_SHOTS;++i)
+        if(g_boss_shots[i].kind==kind)g_boss_shots[i].active=0;
+}
+
+static void boss_spawn_shot(int kind,int x,int y,s32 vx,s32 vy)
+{
+    int i;
+    for(i=0;i<MAX_BOSS_SHOTS;++i)if(!g_boss_shots[i].active){
+        BossShot *s=&g_boss_shots[i];
+        s->active=1;s->kind=(unsigned char)kind;s->phase=0;s->timer=0;
+        s->x=(s32)x<<FIX_SHIFT;s->y=(s32)y<<FIX_SHIFT;s->vx=vx;s->vy=vy;
+        return;
+    }
+}
+
+/* $91B2 and $9D2E both end the same way: the flying object is copied into the
+   room's own slot, where it stops being the boss's and becomes ammunition. */
+static int boss_shot_to_crate(int i,int extra)
+{
+    int k;
+    BossShot *s=&g_boss_shots[i];
+    for(k=0;k<MAX_CRATES;++k)if(!g_crates[k].active){
+        Crate *c=&g_crates[k];
+        c->active=1;c->carried=0;c->thrown=0;c->flight_timer=0;
+        c->extra=(unsigned char)extra;
+        c->x=s->x;c->y=s->y;c->vx=0;c->vy=0;
+        s->active=0;
+        return 1;
+    }
+    s->active=0;
+    return 0;
+}
+
+static void boss13_release_bomb(int i)
+{
+    /* $91D0 announces it with $2E0 as it lands in the room. */
+    boss_shot_to_crate(i,3);
+    Play_Sound_Sample(SFX_BOSS_HIT,0,0);
+}
+
+static void boss16_release_bell(int i)
+{
+    boss_shot_to_crate(i,4);
+    Play_Sound_Sample(SFX_BOSS_HIT,0,0);
+}
+
+/* Everything the three handlers put in the air moves here.  Only the frog's
+   bomb is walked by its own handler, because $9132 owns the arc table. */
+static void update_boss_shots(void)
+{
+    int i;
+    for(i=0;i<MAX_BOSS_SHOTS;++i){
+        BossShot *s=&g_boss_shots[i];
+        int sx,sy,py;
+        if(!s->active)continue;
+        if(s->kind==BOSS_SHOT_HAMMER){
+            /* $96CE: two pixels sideways a frame while $98CE lifts it, then
+               $971A drops it a pixel a frame and jitters it left or right. */
+            s->x+=s->vx;
+            if(!s->phase){
+                if(g_boss19_hammer_arc[s->timer]==0x88){s->phase=1;s->timer=0;}
+                else{
+                    s->y-=(s32)g_boss19_hammer_arc[s->timer]*FIX_ONE;++s->timer;
+                    /* $98CE throws them 144 pixels up, which the source's
+                       taller plane still shows.  Hold them at the ceiling of
+                       this arena instead of letting the spout spend four
+                       seconds out of sight; the arc's timing is unchanged. */
+                    if((int)(s->y>>FIX_SHIFT)<8)s->y=(s32)8<<FIX_SHIFT;
+                }
+            }else{
+                s->y+=FIX_ONE;
+                s->x+=(boss_random()&1)?2*FIX_ONE:-2*FIX_ONE;
+            }
+        }else if(s->kind!=BOSS_SHOT_BOMB){
+            s->x+=s->vx;s->y+=s->vy;
+        }
+        sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT);
+        /* $9742 waits for the first hammer to pass $15E before it hands them
+           all to the room.  That threshold is below this arena's floor -- the
+           source's plane is taller than the port's fixed 240-line room -- so
+           release them at the storey the elephant itself stands on and let
+           the ordinary crate physics settle them on the catwalk. */
+        if(s->kind==BOSS_SHOT_HAMMER&&s->phase&&sy>=BOSS19_FLOOR_Y){boss_shot_to_crate(i,5);continue;}
+        /* The spout arc carries the hammers a good way above the viewport, so
+           only the sides and the bottom retire an object. */
+        if(sx<-48||sx>288||sy>248){s->active=0;continue;}
+        py=player_body_y()+bowser_room_object_y_offset();
+        {   /* $15C9C reads the thrower's box out of $18BAC for the object's
+               own metasprite and shrinks it eight pixels; the frog's bomb is
+               $1A8/$1AB, 32x24, so it tests as 24x16.  The player side is
+               $15C0E's 28x40 from its sprite corner. */
+            int hit;
+            if(g_boss_class==3&&s->kind==BOSS_SHOT_BOMB)
+                hit=aabb((int)(g_player_x>>FIX_SHIFT)+4,
+                         (int)(g_player_y>>FIX_SHIFT)+bowser_room_object_y_offset()+8,28,40,
+                         sx+4,sy+4,24,16);
+            else
+                hit=aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx+4,sy+4,20,20);
+            if(g_invuln==0&&hit){
+                hurt_player();
+                if(s->kind!=BOSS_SHOT_BELL)s->active=0;
+            }
+        }
+    }
+}
+
 static void update_boss_motion(void)
 {
-    int bx=(int)(g_boss_x>>FIX_SHIFT),by=(int)(g_boss_y>>FIX_SHIFT);
+    int bx=(int)(g_boss_x>>FIX_SHIFT);
     int t=g_boss_timer;
     /* These six motion classes mirror the six 68000 handlers rather than
        forcing all seven encounters through one patrol. Constants are taken
@@ -4071,49 +4590,254 @@ static void update_boss_motion(void)
         }else g_boss_action_timer=-1;   /* 9/10 are the death and win states */
         break;
     }
-    case 3: { /* level 13/$8CEC: wait on either carrier, then cross by arc */
-        int q=t%160,from=(t/160)&1,to=from^1,step;
-        int fx=(int)(g_moving_platforms[from].x>>FIX_SHIFT),fy=(int)(g_moving_platforms[from].y>>FIX_SHIFT)-64;
-        int tx=(int)(g_moving_platforms[to].x>>FIX_SHIFT),ty=(int)(g_moving_platforms[to].y>>FIX_SHIFT)-64;
-        if(q<48){bx=fx;by=fy;}
-        else if(q<112){step=q-48;bx=fx+(tx-fx)*step/64;by=fy+(ty-fy)*step/64-(64-(iabs_i(step-32)*2));}
-        else{bx=tx;by=ty;if(q==120)boss_drop_bomb();}
-        g_boss_x=(s32)bx<<FIX_SHIFT;g_boss_y=(s32)by<<FIX_SHIFT;
-        g_boss_face=(g_player_x<g_boss_x)?-1:1;
+    case 3: { /* level 13/$8CEC, transcribed from the 68000 handler */
+        int ox=boss_origin_x(),oy=boss_origin_y(),state,dir;
+        const unsigned char *p;
+        g_boss_vx=0;g_boss_vy=0;
+        /* $8CEC: with no move running, take the next script pair.  The source
+           returns for that frame without moving, so the previous pose is held
+           for one frame exactly as it is by the pig and the ostrich. */
+        if(!g_boss_init){
+            p=&g_boss13_script[g_boss_script_index*2];
+            if(p[0]==0x88){g_boss_script_index=0;p=g_boss13_script;}
+            g_boss_action=p[0];g_boss_action_dir=p[1];++g_boss_script_index;
+            g_boss_init=1;g_boss_action_timer=0;g_boss_phase=0;
+            g_boss_anim_step=0;g_boss_anim_div=0;g_boss_cel=0;
+            /* The cleaned tank strip is drawn facing left, which is the
+               source's direction 0. */
+            g_boss_face=g_boss_action_dir?-1:1;
+            break;
+        }
+        state=g_boss_action;dir=g_boss_action_dir;
+        switch(state){
+        case 1: /* $8DAA */
+            --ox;if(ox<=80){ox=80;g_boss_init=0;}
+            break;
+        case 2: /* $8DCA: leave only once the left lift has come down to $B3 */
+            if(!g_boss_phase){if(boss13_lift_y(0)>=51)g_boss_phase=1;break;}
+            ox-=2;if(ox<=32){ox=32;g_boss_init=0;g_boss_phase=0;}
+            break;
+        case 3: /* $8E10: half-speed descent */
+            /* $8E10 and $8EC0 test the same frame counter bit $7B14 gates
+               the carriers on, so the tank tracks the carrier it rides down
+               exactly.  Using the boss's own timer here let the two run on
+               different parities. */
+            if(g_state_frame&1)break;
+            ++oy;if(oy>=160){oy=160;g_boss_init=0;}
+            break;
+        case 4: /* $8E3E */
+            ox+=2;if(ox>=80){ox=80;g_boss_init=0;}
+            break;
+        case 5: /* $8E5E */
+            ++ox;if(ox>=160){ox=160;g_boss_init=0;}
+            break;
+        case 6: /* $8E7E: wait for the right lift to reach $130 */
+            if(!g_boss_phase){if(boss13_lift_y(1)<=176)g_boss_phase=1;break;}
+            ox+=2;if(ox>=224){ox=224;g_boss_init=0;g_boss_phase=0;}
+            break;
+        case 7: /* $8EC0: half-speed climb */
+            if(g_state_frame&1)break;
+            --oy;if(oy<=64){oy=64;g_boss_init=0;}
+            break;
+        case 8: /* $8EEE */
+            ox-=2;if(ox<=160){ox=160;g_boss_init=0;}
+            break;
+        case 11: case 12: case 13: case 14: { /* $8FCA..$9060: cel scripts */
+            static const unsigned char *const anims[4]={
+                g_boss13_anim11,g_boss13_anim12,g_boss13_anim13,g_boss13_anim14};
+            const unsigned char *a=anims[state-11];
+            if(++g_boss_anim_div<3)break;
+            g_boss_anim_div=0;
+            if(a[g_boss_anim_step*2]==0x88){g_boss_anim_step=0;g_boss_init=0;break;}
+            g_boss_cel=a[g_boss_anim_step*2];
+            g_boss_action_dir=a[g_boss_anim_step*2+1];
+            g_boss_face=g_boss_action_dir?-1:1;
+            ++g_boss_anim_step;
+            break;
+        }
+        case 15: /* $907E: two shockwaves spread out of the body for 30 frames */
+            if(!g_boss_phase){
+                g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=6;
+                boss_spawn_shot(BOSS_SHOT_RING,ox-40,oy-32,-4*FIX_ONE,0);
+                boss_spawn_shot(BOSS_SHOT_RING,ox+32,oy-32, 4*FIX_ONE,0);
+            }else if(++g_boss_action_timer>=30){
+                boss_clear_shots(BOSS_SHOT_RING);
+                g_boss_init=0;g_boss_phase=0;g_boss_cel=0;
+            }
+            break;
+        case 16: /* $9132: lob a bomb along the $9262 arc */
+            if(!g_boss_phase){
+                if(boss_shot_of_kind(BOSS_SHOT_BOMB)>=0){g_boss_init=0;break;}
+                g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=6;
+                boss_spawn_shot(BOSS_SHOT_BOMB,ox+(dir?32:-56),oy-32,0,0);
+            }else{
+                int i=boss_shot_of_kind(BOSS_SHOT_BOMB);
+                const signed char *arc;
+                if(i<0){g_boss_init=0;g_boss_phase=0;g_boss_cel=0;break;}
+                arc=&g_boss13_bomb_arc[g_boss_action_timer*2];
+                if(arc[0]==-128){
+                    /* $91B2 copies it into the room's own object slot: from
+                       here it is an ordinary box Mario can pick up. */
+                    boss13_release_bomb(i);
+                    g_boss_init=0;g_boss_phase=0;g_boss_cel=0;
+                }else{
+                    g_boss_shots[i].y+=(s32)arc[0]*FIX_ONE;
+                    g_boss_shots[i].x+=(s32)(dir?arc[1]:-arc[1])*FIX_ONE;
+                    ++g_boss_action_timer;
+                }
+            }
+            break;
+        default: g_boss_init=0; break;  /* 9/10 are the death and win states */
+        }
+        /* $8D64 flips the tread cel every eighth frame while a move runs. */
+        if(state<11&&!g_boss_cel)g_boss_anim_step=(t>>3)&1;
+        boss_set_origin(ox,oy);
         break;
     }
-    case 4: /* level 16/$99BE: random 64/48-frame sweeps and falling bells */
-        if((t%64)==0){g_boss_phase=(g_boss_phase+1)%5;
-            if(g_boss_phase==0){
-                static const short tele_x[4]={16,120,48,176};
-                static const short tele_y[4]={24,72,112,40};int ti=(t/64)&3;
-                g_boss_x=(s32)tele_x[ti]<<FIX_SHIFT;g_boss_y=(s32)tele_y[ti]<<FIX_SHIFT;
-                g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
+    case 4: { /* level 16/$99BE, transcribed from the 68000 handler */
+        int ox=boss_origin_x(),oy=boss_origin_y(),state,dir;
+        g_boss_vx=0;g_boss_vy=0;
+        /* $99C8: a move is chosen every 23rd idle frame.  The source divides
+           the VDP counter by the current group's length; the port's own
+           reproducible stream stands in for that counter. */
+        if(!g_boss_init){
+            if(++g_boss_script_index<0x17)break;
+            g_boss_script_index=0;
+            {
+                const unsigned char *rec=g_boss16_groups[g_boss_group]
+                    [boss_random()%g_boss16_group_len[g_boss_group]];
+                g_boss_action=rec[0];g_boss_group=rec[1];g_boss_action_dir=rec[2];
             }
-            else if(g_boss_phase==1){g_boss_vx=3*FIX_ONE;g_boss_vy=2*FIX_ONE;}
-            else if(g_boss_phase==2){g_boss_vx=-3*FIX_ONE;g_boss_vy=-2*FIX_ONE;}
-            else {g_boss_vx=0;g_boss_vy=0;}
-            if(g_boss_phase==3&&!g_boss_shot_active){g_boss_shot_active=1;g_boss_shot_x=g_player_x;g_boss_shot_y=-16*FIX_ONE;g_boss_shot_vx=0;g_boss_shot_vy=3*FIX_ONE;}
-            if(g_boss_phase==4)boss_fire_at_player(5);
+            g_boss_init=1;g_boss_action_timer=0;g_boss_phase=0;g_boss_cel=0;
+            g_boss_face=g_boss_action_dir?-1:1;
+            break;
         }
-        g_boss_x+=g_boss_vx;g_boss_y+=g_boss_vy;bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
-        if(bx<8){g_boss_x=(s32)8<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;}if(bx>136){g_boss_x=(s32)136<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}
-        if(by<8){g_boss_y=(s32)8<<FIX_SHIFT;g_boss_vy=2*FIX_ONE;}if(by>112){g_boss_y=(s32)112<<FIX_SHIFT;g_boss_vy=-2*FIX_ONE;}
-        g_boss_face=(g_player_x<g_boss_x)?-1:1;
-        break;
-    case 5: /* level 19/$940E: grounded elephant patrol/trunk attack */
-        if((t%56)==0){g_boss_phase=(g_boss_phase+1)%5;
-            if(g_boss_phase==0)g_boss_vx=-2*FIX_ONE;
-            else if(g_boss_phase==2)g_boss_vx=2*FIX_ONE;
-            else g_boss_vx=0;
-            if(g_boss_phase==1||g_boss_phase==4)boss_fire_at_player(4);
+        state=g_boss_action;dir=g_boss_action_dir;
+        switch(state){
+        case 1: /* $9A88 */
+            ox+=dir?2:-2;
+            if(++g_boss_action_timer>=0x40){g_boss_action_timer=0;g_boss_init=0;}
+            break;
+        case 2: /* $9ABC */
+            oy-=2;if(oy<=96){oy=96;g_boss_action_timer=0;g_boss_init=0;}
+            break;
+        case 3: /* $9ADA */
+            if(dir){oy-=2;ox+=3;}else{ox-=3;oy+=2;}
+            if(++g_boss_action_timer>=0x30){g_boss_action_timer=0;g_boss_init=0;}
+            break;
+        case 4: /* $9B16 */
+            if(dir){oy+=2;ox+=3;}else{ox-=3;oy-=2;}
+            if(++g_boss_action_timer>=0x30){g_boss_action_timer=0;g_boss_init=0;}
+            break;
+        case 5: /* $9B52: vanish, reappear in this group's corner, flicker in */
+            ++g_boss_action_timer;
+            if(g_boss_action_timer==0x40){
+                ox=g_boss16_tele[g_boss_group][0]-BOSS_ROOM_BIAS;
+                oy=g_boss16_tele[g_boss_group][1]-BOSS_ROOM_BIAS;
+            }
+            /* $9B88: blank until $70, then alternate the metasprite against
+               zero every frame until $A0 - the source's materialise blink. */
+            if(g_boss_action_timer>=0x40&&g_boss_action_timer<0x70)g_boss_hidden=1;
+            else if(g_boss_action_timer<0xA0)g_boss_hidden=g_boss_action_timer&1;
+            else{g_boss_hidden=0;g_boss_action_timer=0;g_boss_init=0;}
+            break;
+        case 6: /* $9BE6: three rings leave together and fan apart */
+            if(!g_boss_phase){
+                int sx=ox+(dir?40:-56),sy=oy-48;
+                g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=6;
+                boss_spawn_shot(BOSS_SHOT_RING,sx,sy,(s32)(dir?2:-2)*FIX_ONE,-2*FIX_ONE);
+                boss_spawn_shot(BOSS_SHOT_RING,sx,sy,(s32)(dir?2:-2)*FIX_ONE,0);
+                boss_spawn_shot(BOSS_SHOT_RING,sx,sy,(s32)(dir?2:-2)*FIX_ONE, 2*FIX_ONE);
+            }else if(++g_boss_action_timer>=0x64){
+                boss_clear_shots(BOSS_SHOT_RING);
+                g_boss_action_timer=0;g_boss_init=0;g_boss_phase=0;g_boss_cel=0;
+            }
+            break;
+        case 7: /* $9CC8 */
+            oy+=2;if(oy>=192){oy=192;g_boss_action_timer=0;g_boss_init=0;}
+            break;
+        case 8: /* $9CE6: lower a bell until it reaches the floor and let go */
+            if(!g_boss_phase){
+                if(boss_shot_of_kind(BOSS_SHOT_BELL)>=0){g_boss_init=0;break;}
+                g_boss_phase=1;
+                boss_spawn_shot(BOSS_SHOT_BELL,ox,oy-32,0,2*FIX_ONE);
+            }else{
+                int i=boss_shot_of_kind(BOSS_SHOT_BELL);
+                if(i<0||(int)(g_boss_shots[i].y>>FIX_SHIFT)>=160){
+                    if(i>=0)boss16_release_bell(i);
+                    g_boss_init=0;g_boss_phase=0;
+                }
+            }
+            break;
+        default: g_boss_init=0; break;
         }
-        g_boss_x+=g_boss_vx;bx=(int)(g_boss_x>>FIX_SHIFT);
-        if(bx<8){g_boss_x=(s32)8<<FIX_SHIFT;g_boss_vx=2*FIX_ONE;}if(bx>136){g_boss_x=(s32)136<<FIX_SHIFT;g_boss_vx=-2*FIX_ONE;}
-        /* The elephant art has a 144px canvas; its feet sit on the room's
-           platform at y=16, not at the old 49px source-anchor position. */
-        g_boss_y=(s32)16<<FIX_SHIFT;g_boss_face=(g_player_x<g_boss_x)?-1:1;
+        boss_set_origin(ox,oy);
         break;
+    }
+    case 5: { /* level 19/$940E, transcribed from the 68000 handler */
+        int ox=boss_origin_x(),oy=boss_origin_y(),state;
+        const unsigned char *hop;
+        g_boss_vx=0;g_boss_vy=0;
+        /* $9418: the same group machine as the mage, on a 48-frame idle. */
+        if(!g_boss_init){
+            if(++g_boss_script_index<0x30)break;
+            g_boss_script_index=0;
+            {
+                const unsigned char *rec=g_boss19_groups[g_boss_group]
+                    [boss_random()%g_boss19_group_len[g_boss_group]];
+                g_boss_action=rec[0];g_boss_group=rec[1];g_boss_action_dir=rec[2];
+            }
+            g_boss_init=1;g_boss_action_timer=0;g_boss_phase=0;
+            g_boss_face=g_boss_action_dir?-1:1;
+            /* $94BC: every move but the spout crouches first, and all of them
+               lift the actor a storey before the arc is walked. */
+            g_boss_cel=(g_boss_action<=5)?1:5;
+            oy-=32;boss_set_origin(ox,oy);
+            break;
+        }
+        state=g_boss_action;
+        switch(state){
+        case 1: case 2: case 3: case 4: case 5: {
+            static const unsigned char *const hops[5]={
+                g_boss19_hop1,g_boss19_hop2,g_boss19_hop3,g_boss19_hop4,g_boss19_hop5};
+            int step=(state==1)?1:2;
+            hop=hops[state-1];
+            /* $963C: state 5 leaps from its group's own anchor. */
+            if(state==5&&!g_boss_phase&&!g_boss_action_timer)
+                ox=g_boss19_anchor_x[g_boss_group]-BOSS_ROOM_BIAS;
+            /* $95CE runs at half speed; the rest move every frame. */
+            if(state!=2||!(t&1))ox+=g_boss_action_dir?step:-step;
+            if(hop[g_boss_action_timer]==0x88){
+                if(!g_boss_phase){
+                    /* $9540: turn the arc around and come back down. */
+                    g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=2;oy+=32;
+                }else{
+                    g_boss_phase=0;g_boss_action_timer=0;g_boss_cel=0;g_boss_init=0;
+                    /* $9596 shakes the room on the landing. */
+                    g_screen_shake=8;
+                }
+            }else{
+                oy+=g_boss_phase?hop[g_boss_action_timer]:-hop[g_boss_action_timer];
+                ++g_boss_action_timer;
+            }
+            break;
+        }
+        case 6: /* $965E: spout four hammers, then let them rain down */
+            if(!g_boss_phase){
+                int k,sx=ox+(g_boss_action_dir?42:-66),sy=oy-64;
+                g_boss_phase=1;g_boss_cel=0;oy+=32;
+                for(k=0;k<MAX_BOSS_SHOTS;++k)
+                    boss_spawn_shot(BOSS_SHOT_HAMMER,sx+k*8,sy,
+                        (s32)(g_boss_action_dir?2:-2)*FIX_ONE,0);
+            }else if(!boss_shots_airborne(BOSS_SHOT_HAMMER)){
+                g_boss_init=0;g_boss_phase=0;
+            }
+            break;
+        default: g_boss_init=0; break;
+        }
+        boss_set_origin(ox,oy);
+        break;
+    }
     }
 }
 
@@ -4135,15 +4859,8 @@ static void update_boss_actor(void)
 #endif
         if(g_boss_invuln==0)update_boss_motion();
     }
-    /* Boss 5's $907E object path creates a bomb during its action cycle and
-       the handler also samples the source RNG for additional drops. */
-    if(g_boss_class==3&&g_boss_invuln==0){
-        if(g_boss_random_drop_timer>0)--g_boss_random_drop_timer;
-        if(g_boss_random_drop_timer<=0){
-            boss_drop_bomb();
-            g_boss_random_drop_timer=72+(int)(boss_random()&95);
-        }
-    }
+    if(g_boss_class>=3)update_boss_shots();
+    if(g_screen_shake>0)--g_screen_shake;
     /* The source dispenser ($7958) waits while its previous crate object is
        live.  Do the same so unused ammunition cannot carpet the catwalk.
        Bosses whose own handler supplies the throwable are excluded: the pig
@@ -4151,7 +4868,10 @@ static void update_boss_actor(void)
        pot out of move 11.  Leaving the generic dispenser on for those parks
        a box in the room permanently, and their handlers then skip their own
        drop for ever because the source's occupancy check sees it. */
-    if(g_boss_class!=3&&g_boss_class!=1&&g_boss_class!=2&&g_boss_invuln==0&&(g_boss_timer%120)==1){
+    /* Bosses 5, 6 and 7 now put their own bombs, bells and hammers into the
+       room from their handlers, so the generic dispenser is off for every
+       later boss and only Bowser still needs it. */
+    if(g_boss_class==0&&g_boss_invuln==0&&(g_boss_timer%120)==1){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
         if(!any_crate)for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
@@ -4177,7 +4897,9 @@ static void update_boss_actor(void)
             else if(g_invuln==0&&aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx+4,sy+4,24,24)){hurt_player();g_boss_shot_active=0;}
         }
     }
-    bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT);
+    /* The player and crate sides of this test are quoted in the arena's drawn
+       space, so the body has to be too. */
+    bx=(int)(g_boss_x>>FIX_SHIFT);by=(int)(g_boss_y>>FIX_SHIFT)+bowser_room_object_y_offset();
     /* $15D20 is used by the source boss collision path. Values vary sharply by
        boss class, so use them to tune the broad collision body rather than the
        old universal 56x68 rectangle. */
@@ -4188,6 +4910,20 @@ static void update_boss_actor(void)
         static const unsigned char hit_w[5]={48,64,80,112,96};
         static const unsigned char hit_h[5]={64,80,56,64,80};
         hitx=bx+8;hity=by+8;hitw=hit_w[g_boss_class-1];hith=hit_h[g_boss_class-1];
+        /* Slot 13's body is not a guess: $15C9C and $162FE both read the box
+           straight out of $18BAC for the driver's current metasprite, which
+           is 56x88 for every one of $28C/$28E/$290 and their mirrors, and
+           place it at the driver object minus $15D20's (32,56) for the slot.
+           The driver object is the vehicle's own point less $20 in Y for the
+           poses $6F3A offsets ($7000), and the vehicle's point exactly for
+           the rearing and hit poses ($7040/$705C).  In canvas terms that is
+           x 24+$7124 wide 56, and rows 8..95 - so it takes in the tank, which
+           the old 80x56 driver-only box left untouchable and harmless. */
+        if(g_boss_class==3){
+            hitx=bx+24+boss13_driver_dx();
+            hity=by+40+((boss13_driver_frame()>=BOSS13_FRAME_FIRE)?0:-32);
+            hitw=56;hith=88;
+        }
         /* The ostrich art fills the canvas from y+12 down to its feet at
            y+108, so the generic box sat 36 pixels too high and poked through
            the one-way platform its arena hangs 72 pixels above the floor.
@@ -4218,7 +4954,21 @@ static void update_boss_actor(void)
     if(g_boss_invuln==0&&hitw>0&&hith>0){
         for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
         for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT)+bowser_room_object_y_offset();if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
-        if(!g_boss_defeated&&g_invuln==0&&aabb(player_body_x()+4,player_body_y()+bowser_room_object_y_offset()+5,8,PLAYER_BODY_H-10,hitx+4,hity+4,hitw-8,hith-8))hurt_player();
+        if(!g_boss_defeated&&g_invuln==0){
+            /* $15C0E measures the player from its own sprite corner as
+               (x+4,y+8) by 28x40 and shrinks the boss body by four on every
+               side; only the projectile path at $162A0 uses the full body.
+               The port's Mario occupies the same 32x48 sprite box, so those
+               numbers carry over directly.  The old test pitted an 8x22
+               sliver against an already shrunken body, which is why the tank
+               could drive through Mario without touching him. */
+            int px=(int)(g_player_x>>FIX_SHIFT),py=(int)(g_player_y>>FIX_SHIFT)+bowser_room_object_y_offset();
+            int hurt=(g_boss_class==3)
+                ?aabb(px+4,py+8,28,40,hitx+4,hity+4,hitw-8,hith-8)
+                :aabb(player_body_x()+4,player_body_y()+bowser_room_object_y_offset()+5,8,PLAYER_BODY_H-10,
+                      hitx+4,hity+4,hitw-8,hith-8);
+            if(hurt)hurt_player();
+        }
     }
 }
 

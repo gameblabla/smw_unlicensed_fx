@@ -153,23 +153,6 @@ def make_dumped_boss_planes(slot):
     for tile in tiles:tile_words.extend(ba.encode_bg_tile(tile))
     return dict(palette=palette,tile_words=tile_words,tile_count=len(tiles),maps=maps,tiles=tiles)
 
-def boss13_sprite_free_bat(bat):
-    """Remove the two carrier sprites captured into the level-13 arena map.
-
-    The level-13 reference was captured with the Mega Drive's two moving
-    carriers enabled.  They are rebuilt as live PC-FX sprites, so retaining
-    them in the background map creates two inert duplicates.  The arena's
-    teal wall texture repeats on the 8x8 tile grid; copy clean wall cells from
-    the same columns to restore the two 64x24 captured regions.  This occurs
-    after level defaults/overrides are applied, ensuring a saved default map
-    cannot restore the baked sprites.
-    """
-    out=list(bat)
-    for (dx,dy),(sx,sy) in (((0,8),(0,14)),((24,23),(24,15))):
-        for row in range(3):
-            out[(dy+row)*32+dx:(dy+row)*32+dx+8]=out[(sy+row)*32+sx:(sy+row)*32+sx+8]
-    return out
-
 def background_plane_halves(level_dir):
     """The level's two background maps, left half first.
 
@@ -362,10 +345,12 @@ def enemy_palette(r,gfx):
 
 # Metasprite each throwing handler creates for its projectile, and the cell
 # grid it needs.  $C31A (states 7 and 8) throws metasprite $1E3, $BC02 (state
-# 13) throws the $207 spear.  The tiles are not shared: each family loads its
-# own copy at the tail of graphics selector 3, so the monkey throws a banana,
-# the level 9 thrower a rock and the spearman a spear from the same records.
-ENEMY_SHOT_ART={7:(0x1E3,1,1), 12:(0x207,2,1)}
+# 13) throws the $207 spear, and $BE26 -- the second half of state 11's
+# handler $BCC8 -- throws the $1FB spark.  The tiles are not shared: each
+# family loads its own copy at the tail of graphics selector 3, so the monkey
+# throws a banana, the level 9 thrower a rock, the spearman a spear and the
+# level 11 duck its spark from the same records.
+ENEMY_SHOT_ART={7:(0x1E3,1,1), 10:(0x1FB,2,1,0), 12:(0x207,2,1)}
 
 def make_enemy_shot(r,gfx,mid,cols,rows,yoff=4):
     """Pack one family's projectile out of its own graphics selector 3."""
@@ -457,9 +442,12 @@ def anim_scripts(r,gfx):
     shape", which is only ever right by accident: for families 7 and 12 (the
     level 9 cast) selector 3 is an attack cel and its metasprite is a
     different size, so the pose decoded as debris.
+
+    State 3 is read as well: the state-11 duck of level 11 selects it -- not
+    state 1 -- when it spits its spark, so that is where its throwing pose is.
     """
     tbl=b32(r,0xCE7E+gfx*4); out=[]
-    for state in range(3):
+    for state in range(4):
         p=b32(r,tbl+state*4); frames=[]
         if 0<p<len(r)-10:
             while b16(r,p)!=0x8888 and len(frames)<16:
@@ -498,8 +486,17 @@ def build_enemy_variants(r,levels):
     # whose script alternates selectors 2 and 3 every seven frames.  Selector 3
     # already rides in the alt bank for this family, so capturing state 1's
     # first cel here is what completes the pair.
+    #
+    # State 11 ($BCC8, the spark-spitting duck) and state 14 ($B98C, the
+    # two-footed hopper) are the other two handlers that leave the walk cycle:
+    # the duck draws its throwing pose out of animation state *3* and the
+    # hopper holds animation state 1 through the whole recovery it spends
+    # standing after a hop.
     atk_keys={(e[2],e[3],e[4]) for lev in levels for e in lev['enemies']
-              if e[5] in (8,13) or (e[2]==3 and e[5]==4)}
+              if e[5] in (8,11,13,14) or (e[2]==3 and e[5]==4)}
+    # Which animation state each family's attack pose lives in.  Only the duck
+    # differs from the shared state 1.
+    atk_state={10:3}
     variants=[]
     for idx,(gfx,base,sub) in enumerate(keys):
         tbl=b32(r,0x7246C+gfx*4)
@@ -557,7 +554,8 @@ def build_enemy_variants(r,levels):
         # select by writing 1 to the object's animation-state word before they
         # throw.  Families whose second walk cel already *is* that pose (1 and
         # 4 above) do not need a second copy of it.
-        atk=scripts[1][0] if scripts[1] and gfx not in (1,4) and (gfx,base,sub) in atk_keys else None
+        astate=atk_state.get(gfx,1)
+        atk=scripts[astate][0] if scripts[astate] and gfx not in (1,4) and (gfx,base,sub) in atk_keys else None
         if atk and (atk==walk[0] or atk==walk[1]): atk=None
         # The attack scripts are not one still pose.  Family 7 runs
         # $E1 (15f) -> $F9 (7f) -> $E1 (31f) and family 12 runs
@@ -565,7 +563,10 @@ def build_enemy_variants(r,levels):
         # *second* attack cel -- the one drawn on the frame the rock or the
         # spear actually leaves the hand.  Only the first was captured before,
         # which is why the attack read as a single frame in game.
-        atk2=scripts[1][1] if atk and len(scripts[1])>1 else None
+        #
+        # The duck's state 3 is a two-cel script as well -- selectors 3 and 4,
+        # seven ticks each -- so it owns a second throwing pose the same way.
+        atk2=scripts[astate][1] if atk and len(scripts[astate])>1 else None
         if atk2 and atk2 in (atk,walk[0],walk[1],alt): atk2=None
 
         poses=[(sel,script_shape(allm,byid,ms,want_tile)) for sel,ms in walk]
@@ -640,6 +641,8 @@ def build_enemy_variants(r,levels):
         if state==8: return 8   # $C0C6: stationary thrower, never walks
         if state==13: return 9  # $BAD6: walks, then stops to throw its spear
         if state==16: return 10 # $B844: ceiling rock that drops and bounces
+        if state==11: return 11 # $BCC8: stands and spits a crawling spark
+        if state==14: return 12 # $B98C: walks, then hops the $BA7A arc
         return 0
 
     # Localize variants per level and rewrite enemy records as
@@ -803,6 +806,48 @@ def make_bowser_sprite():
     py += [ba.rgb_to_yuv(0,0,0)]*(16-len(py))
     return py[:16],flamewords,flamemask,specialwords,specialmasks
 
+def sheet_frame_bands(image, transparent, region=None):
+    """Return the (x0,x1) content bands of one sheet row, left to right.
+
+    A band is a maximal run of columns that is not entirely transparent, so a
+    band is exactly one pose and never carries a slice of its neighbour.
+    """
+    x0,y0,x1,y1=region or (0,0,image.width,image.height)
+    pixels=image.load()
+    bands=[];start=None
+    for x in range(x0,x1):
+        empty=all(pixels[x,y]==transparent for y in range(y0,y1))
+        if not empty and start is None:start=x
+        elif empty and start is not None:bands.append((start,x));start=None
+    if start is not None:bands.append((start,x1))
+    return bands
+
+def sheet_frames(image, transparent, count, size, region=None, fill=None):
+    """Cut one sheet row into `count` poses on the row's own cell pitch.
+
+    The rips lay a boss row out on a fixed pitch, but a pose's leftmost pixel
+    is wherever that drawing happens to begin, so neither the band starts nor
+    a hardcoded pitch reproduce the layout on their own: cutting on a pitch
+    that is a pixel or two off walks every later pose sideways, which is what
+    detached the tank from its driver and jittered the pig and the ostrich.
+    Recover the pitch that best explains the observed band starts, then keep
+    each band's own offset from its nominal cell origin.  Nothing is cut and
+    no neighbouring pose bleeds in, because a band is bounded by empty columns.
+    """
+    x0,y0,x1,y1=region or (0,0,image.width,image.height)
+    bands=sheet_frame_bands(image,transparent,(x0,y0,x1,y1))
+    if len(bands)!=count:
+        raise RuntimeError(f'Expected {count} poses in {region}, found {len(bands)}')
+    starts=[b[0] for b in bands]
+    candidates=sorted({starts[i+1]-starts[i] for i in range(count-1)}) or [0]
+    pitch=min(candidates,key=lambda p:sum(abs(s-(starts[0]+i*p)) for i,s in enumerate(starts)))
+    frames=[]
+    for i,(bx0,bx1) in enumerate(bands):
+        canvas=Image.new('RGB',size,fill if fill is not None else transparent)
+        canvas.paste(image.crop((bx0,y0,bx1,y1)),(bx0-(starts[0]+i*pitch),0))
+        frames.append(canvas)
+    return frames
+
 def make_later_boss_assets():
     """Pack the complete non-Bowser action banks from the Genesis sheet.
 
@@ -822,16 +867,97 @@ def make_later_boss_assets():
     if pig_strip.size!=(455,71):
         raise RuntimeError('pig_boss_boss3.png must be exactly 455x71')
     pig_transparent=pig_strip.getpixel((0,0))
-    pig_frames=[]
-    for i in range(7):
-        frame=Image.new('RGB',(80,80),pig_transparent)
-        frame.paste(pig_strip.crop((i*65,0,(i+1)*65,71)),(0,0))
-        pig_frames.append(frame)
+    pig_frames=sheet_frames(pig_strip,pig_transparent,7,(80,80))
     # The remaining boss sheets use their existing source regions. Slot 13
     # has ten poses; its own arena has no concurrent auxiliary bank, so all
     # ten fit in VRAM.
-    frame_regions={10:((0,0,3),),13:((0,192,5),(0,288,5)),
-                   16:((0,384,5),),19:((0,480,5),)}
+    frame_regions={10:((0,0,3),),16:((0,384,5),),19:((0,480,5),)}
+    def tank_frames():
+        """Slot 13's poses rebuilt from the ROM instead of cut out of a rip.
+
+        The room draws the boss as two objects, exactly as $8CEC and $6F3A do.
+        The vehicle is its own object at the actor point: $8D72 alternates
+        metasprites $1A5/$1A6 for it every eight frames, both 80x32 anchored
+        -40/-32..39/-1, so the actor Y is the tread line.  The driver rides
+        on top and its pose comes from the object's cel byte through the
+        per-level cel table at $716E: cel 0 is the resting pose the movement
+        states hold, 1/2/5 are the poses the $922A cel scripts step through
+        while it turns, 6 is the rearing pose both attacks take, and 3/4 are
+        the hit and death poses $1633A and $163C0 select.  Each cel names a
+        graphics bank and a metasprite; $7124 gives the driver's own X offset
+        from the vehicle per bank and direction, and $7148 adds six to the
+        metasprite ID when it faces right, which is the mirrored definition.
+
+        Cutting these poses out of a contact sheet is what kept detaching the
+        driver from its tank: the rip draws each pose wherever it liked, so
+        no single pitch reproduces the layout.  Rendering the metasprites
+        directly puts every part where the source puts it, once and for all.
+        """
+        rom=ROMPATH.read_bytes()
+        metas={m['id']:m for m in json.loads(
+            (KIT/'graphics/metasprites/all_metasprites.json').read_text())}
+        def be16(o): return int.from_bytes(rom[o:o+2],'big')
+        def be32(o): return int.from_bytes(rom[o:o+4],'big')
+        # $69FEE holds each level's sprite palette line; $6852 copies the
+        # sixteen words for the room.  Index 0 is the transparent entry.
+        pal_ptr=be32(0x69FEE+(13-1)*4)
+        def cram(word):
+            chan=lambda v: min(255,v*255//224)
+            return (chan((word&0xE)<<4),chan(((word>>4)&0xE)<<4),chan(((word>>8)&0xE)<<4))
+        palette=[cram(be16(pal_ptr+i*2)) for i in range(16)]
+        if len(set(palette))!=16:
+            raise RuntimeError('slot 13 sprite palette has duplicate entries')
+        # $81A50 names the driver's five banks; $68AC loads the room's own
+        # sprite art, which holds the vehicle, at VRAM tile 1136.
+        drv_table=be32(0x81A50+(13-1)*4)
+        DRIVER_BASE,ROOM_BASE=736,1136
+        room_bank=be32(0xA91B0+(13-1)*4)
+        def tile_rows(off):
+            return [[b>>4 if half==0 else b&15
+                     for b in rom[off+row*4:off+row*4+4] for half in (0,1)]
+                    for row in range(8)]
+        def draw(canvas,ms_id,gfx,ax,ay):
+            pixels=canvas.load()
+            for part in metas[ms_id]['parts']:
+                index=part['tile_index']
+                if index>=ROOM_BASE: bank,base=room_bank,ROOM_BASE
+                else: bank,base=be32(drv_table+(gfx-1)*4),DRIVER_BASE
+                wt,ht=part['width_tiles'],part['height_tiles']
+                for cx in range(wt):
+                    for cy in range(ht):
+                        rows=tile_rows(bank+(index-base+cx*ht+cy)*32)
+                        for ty in range(8):
+                            for tx in range(8):
+                                value=rows[ty][tx]
+                                if not value: continue
+                                px,py=cx*8+tx,cy*8+ty
+                                if part['hflip']: px=wt*8-1-px
+                                if part['vflip']: py=ht*8-1-py
+                                x=ax+part['x_offset']+px; y=ay+part['y_offset']+py
+                                if 0<=x<canvas.width and 0<=y<canvas.height:
+                                    pixels[x,y]=palette[value]
+        transparent=palette[0]
+        # Frame order, matching BOSS13_FRAME_* in src/main.c.  The four
+        # driver poses are stored facing left, which is the source's
+        # direction 0, and the renderer mirrors them; the rearing and hit
+        # metasprites carry the vehicle, whose art never mirrors, so those
+        # two keep a stored pose per direction.  $7124's driver offset for
+        # direction 0 is baked in here.
+        driver=((0x28C,1,-16),(0x28C,2,-24),(0x28C,3,8),(0x28C,4,-16))
+        frames=[]
+        for ms_id,gfx,dx in driver:
+            canvas=Image.new('RGB',(112,96),transparent)
+            draw(canvas,ms_id,gfx,56+dx,96-32)
+            frames.append(canvas)
+        for ms_id,gfx in ((0x28E,1),(0x294,1),(0x290,5),(0x296,5)):
+            canvas=Image.new('RGB',(112,96),transparent)
+            draw(canvas,ms_id,gfx,56,96)
+            frames.append(canvas)
+        for ms_id in (0x1A5,0x1A6):
+            canvas=Image.new('RGB',(112,96),transparent)
+            draw(canvas,ms_id,1,56,96)
+            frames.append(canvas)
+        return frames,transparent
     def elephant_frames():
         """Use the cleaned five-pose strip, preserving its shared baseline."""
         strip=Image.open(PROJECT/'elephant_strip.png').convert('RGB')
@@ -860,7 +986,8 @@ def make_later_boss_assets():
         bg=packed_with_transparent_zero(ba.pack_bg_rgb(Image.open(root/f'boss{slot}_arena.png').convert('RGB')))
         # Boss maps use a 32-row BAT so vertically scrolling rooms wrap on
         # complete source data.  Captured 240-line rooms have two blank rows;
-        # slot 19 is replaced below by the exact two VDP planes.
+        # slot 13 is a clean 256x256 arena and fills all of them, and slot 19
+        # is replaced below by the exact two VDP planes.
         bg['bat'] += [0]*(32*32-len(bg['bat']))
         fg=dict(tile_words=[0]*16,bat=[0]*(32*32),tile_count=1)
         if slot in (16,19):
@@ -877,7 +1004,6 @@ def make_later_boss_assets():
             source_bat=list(bg['bat'])
             bg['bat']=override_words(f'boss_{slot:02d}_background.json',bg['bat'],32*32)
             bg['bat']=canonicalize_packed_palettes(bg['bat'],source_bat)
-            if slot==13: bg['bat']=boss13_sprite_free_bat(bg['bat'])
             bg=apply_packed_tile_overrides(bg,f'boss_{slot:02d}_tiles.json')
             fg['bat']=override_words(f'boss_{slot:02d}_foreground.json',fg['bat'],32*32)
             # Foreground and background share a bank so a copied tile has the
@@ -892,21 +1018,23 @@ def make_later_boss_assets():
             if ostrich_strip.size!=(272,108):
                 raise RuntimeError('ostrich_boss_boss4.png must be exactly 272x108')
             ostrich_transparent=ostrich_strip.getpixel((0,0))
-            # The supplied strip is three 90/91-pixel source frames. Keep
-            # their native pixels and put each into the same 112x112 canvas
-            # so the action origin does not move between poses.
-            frames=[]
-            for x0,x1 in ((0,90),(90,181),(181,272)):
-                frame=Image.new('RGB',(112,112),ostrich_transparent)
-                frame.paste(ostrich_strip.crop((x0,0,x1,108)),(0,0))
-                frames.append(frame)
+            # The strip is three poses on an 88-pixel pitch; the old 90/91
+            # windows walked poses 2 and 3 two and three pixels left of pose 1,
+            # so the bird slid around on top of its own vehicle.
+            frames=sheet_frames(ostrich_strip,ostrich_transparent,3,(112,112))
             frame_transparent=ostrich_transparent
+        elif slot==13:
+            frames,frame_transparent=tank_frames()
         elif slot==19:
             frames=elephant_frames()
             frame_transparent=transparent
         else:
+            # The mage's five poses sit on a 112-pixel pitch that starts eight
+            # pixels into the sheet, so fixed (i*112) windows sliced up to nine
+            # columns off the trailing poses' robes.
             for x,y,count in frame_regions[slot]:
-                frames.extend(sheet.crop((x+i*112,y,x+(i+1)*112,y+96)) for i in range(count))
+                frames.extend(sheet_frames(sheet,transparent,count,(112,96),
+                                           (x,y,sheet.width,y+96)))
             frame_transparent=transparent
         cols=5 if slot==8 else 7
         rows=5 if slot==8 else (9 if slot==19 else (7 if slot==10 else 6))
@@ -994,20 +1122,22 @@ def make_boss13_platform_words():
     """User-approved 64x23 gold carrier used only by the level-13 boss."""
     im=Image.open(BOSSREF/'boss13_platform.png').convert('RGBA')
     if im.size!=(64,23): raise RuntimeError('boss13_platform.png must be exactly 64x23')
-    # Black in the reference is the transparent surround.  Keep every other
-    # source colour exact and place the 23 scanlines at the top of a 64x32
-    # two-sprite canvas.
+    # The alpha channel is the transparency, not the colour: only the 28
+    # pixels notched out of the sides are clear.  Black is metasprite $1A9's
+    # colour 1 and draws the carrier's whole outline - its top and bottom
+    # edges, its side rails and the ring around every rivet - so treating it
+    # as the surround punched all of that out and left a flat gold slab.
+    # Keep every source colour exact and place the 23 scanlines at the top of
+    # a 64x32 two-sprite canvas.
     colors=[]
     for rgba in im.getdata():
-        rgb=rgba[:3]
-        if rgba[3] and rgb!=(0,0,0) and rgb not in colors: colors.append(rgb)
+        if rgba[3] and rgba[:3] not in colors: colors.append(rgba[:3])
     if len(colors)>15: raise RuntimeError('boss13 platform exceeds one sprite palette')
     canvas=[[0]*64 for _ in range(32)]
     pix=im.load()
     for y in range(23):
         for x in range(64):
-            rgb=pix[x,y][:3]
-            if pix[x,y][3] and rgb!=(0,0,0): canvas[y][x]=colors.index(rgb)+1
+            if pix[x,y][3]: canvas[y][x]=colors.index(pix[x,y][:3])+1
     words=[]
     for half in range(2):
         for cy in range(2):
@@ -1357,7 +1487,7 @@ def main():
     # boss-1 bank and its detached flame metasprite.
     hs=h.read_text().replace('g_bowser_masks[5]','g_bowser_masks[9]').replace('BOWSER_FRAME_COUNT 5','BOWSER_FRAME_COUNT 9')
     hs=hs.replace('#define ENEMY_FRAME_WORDS 576',
-        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_KIND_THROWER 8\n#define ENEMY_KIND_SPEARMAN 9\n#define ENEMY_KIND_BOULDER 10\n#define ENEMY_FRAME_WORDS 576')
+        '#define ENEMY_RECORD_WORDS 8\n#define ENEMY_KIND_GENERIC 0\n#define ENEMY_KIND_MONKEY 1\n#define ENEMY_KIND_PTERODACTYL 2\n#define ENEMY_KIND_STRIKE_SNAKE 3\n#define ENEMY_KIND_CRATE_MIMIC 4\n#define ENEMY_KIND_FLOOR_SNAKE 5\n#define ENEMY_KIND_FLYING_KOOPA 6\n#define ENEMY_KIND_CHIP 7\n#define ENEMY_KIND_THROWER 8\n#define ENEMY_KIND_SPEARMAN 9\n#define ENEMY_KIND_BOULDER 10\n#define ENEMY_KIND_SPARKER 11\n#define ENEMY_KIND_HOPPER 12\n#define ENEMY_FRAME_WORDS 576')
     hs=hs.replace('const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1;',
                   'const unsigned short *words,*palette,*alt_words,*atk_words,*atk2_words,*shot_words; unsigned short mask0,mask1,mask2,alt_mask,atk_mask,atk2_mask;')
     hs=hs.replace('unsigned char width,height; } EnemyVariantData;',

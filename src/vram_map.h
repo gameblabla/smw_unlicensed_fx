@@ -44,7 +44,7 @@
 #define HUD_DIGIT_BASE_WORD 0x7040
 /* 0x7300..0x73C0 [play] level 2/6/8 carrier, 48x16 */
 #define PLATFORM_BASE_WORD 0x7300
-/* 0x7400..0x7880 [play] per-level enemy variant banks */
+/* 0x7400..0xA580 [play] per-level enemy variant banks */
 #define ENEMY_BASE_WORD 0x7400
 /* 0x7400..0xBD80 [boss] boss body poses (Bowser uses the ten-pose bank) */
 #define BOSS_BASE_WORD 0x7400
@@ -54,8 +54,6 @@
 #define MENU_LUIGI_BASE_WORD 0x8A00
 /* 0x9800..0x9C80 [play] monkey throw poses (levels with monkeys) */
 #define MONKEY_SPECIAL_BASE_WORD 0x9800
-/* 0x9C80..0xA100 [play] walking crate poses (levels with mimics) */
-#define CRATE_MIMIC_WALK_BASE_WORD 0x9C80
 /* 0xA000..0xAA00 [continue] continue countdown digits */
 #define CONTINUE_DIGIT_BASE_WORD 0xA000
 /* 0xA100..0xAD00 [play] snake strike, three 64x40 poses */
@@ -66,20 +64,22 @@
 #define LEVEL8_WEDGE_R_BASE_WORD 0xB900
 /* 0xBC00..0xBD80 [play] level 8 down-left wedge, 32x48 */
 #define LEVEL8_WEDGE_L_BASE_WORD 0xBC00
-/* 0xBD80..0xC680 [play] extra live cels: pterodactyl/floor-attacker third pose plus every variant attack pose */
+/* 0xBD80..0xC8C0 [play] extra live cels: pterodactyl/floor-attacker third pose plus every variant attack pose */
 #define ENEMY_ALT_BASE_WORD 0xBD80
-/* 0xC800..0xCA40 [play] per-variant hit frame */
-#define ENEMY_HIT_BASE_WORD 0xC800
-/* 0xDA00..0xDA40 [play] thrown banana (levels with monkeys) */
-#define ENEMY_BANANA_BASE_WORD 0xDA00
-/* 0xDA40..0xDB40 [play] thrown rock/spear for the $C0C6 and $BAD6 throwers */
-#define ENEMY_SHOT_BASE_WORD 0xDA40
+/* 0xC900..0xE1C0 [play] per-variant hit frame */
+#define ENEMY_HIT_BASE_WORD 0xC900
 /* 0xDD00..0xDE80 [boss] Bowser flame */
 #define BOWSER_FLAME_BASE_WORD 0xDD00
 /* 0xE000..0xE900 [boss] ring/hammer/pot/bell/bomb/crate4/platform */
 #define BOSS_AUX_BASE_WORD 0xE000
 /* 0xE200..0xE300 [play] pot object, also uploaded by every normal stage */
 #define BOSS_POT_BASE_WORD 0xE200
+/* 0xE300..0xE400 [play] thrown rock/spear/spark for the $C0C6, $BAD6 and $BCC8 throwers */
+#define ENEMY_SHOT_BASE_WORD 0xE300
+/* 0xE400..0xE440 [play] thrown banana (levels with monkeys) */
+#define ENEMY_BANANA_BASE_WORD 0xE400
+/* 0xE500..0xE980 [play] walking crate poses (levels with mimics) */
+#define CRATE_MIMIC_WALK_BASE_WORD 0xE500
 /* 0xE900..0xE940 [boss] boss 1 water */
 #define BOSS_WATER_BASE_WORD 0xE900
 /* 0xE980..0xEB00 [play,boss] crouch Mario */
