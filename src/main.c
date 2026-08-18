@@ -6261,20 +6261,30 @@ static void draw_menu_people(int walking)
 #define STAFF_ENEMY_TOP_WORD  0xE000
 #define STAFF_ENEMY_PAL0 4
 #define STAFF_ENEMY_PAL_COUNT 12
-#define STAFF_KIND_COUNT 13
+#define STAFF_CAST_MAX 20
 /* One text line every 16 lines, i.e. every second BAT row. */
 #define STAFF_LINE_PITCH 16
 #define STAFF_VISIBLE_COLS 32
 #define STAFF_TEXT_MAP_ROWS 32
-/* 8.8 pixels of scroll per frame.  The roll is 88 seconds at this rate, which
-   is the length of the staff cue on the disc. */
-#define STAFF_SCROLL_STEP 78
+/* 8.8 pixels of scroll per frame.  The roll runs 87 seconds at this rate,
+   which is the length of the staff cue on the disc; the cue loops rather than
+   falling silent, so overshooting it is untidy rather than broken. */
+#define STAFF_SCROLL_STEP 88
 #define STAFF_FADE_FRAMES 48
 
 static u16 g_staff_palette[256];
-static short g_staff_enemy_variant[STAFF_KIND_COUNT];
-static u16 g_staff_enemy_vram[STAFF_KIND_COUNT];
-static unsigned char g_staff_enemy_pal[STAFF_KIND_COUNT];
+/* Everything draw_staff_sprites() needs, resolved once at load time so the
+   scroll loop does not have to re-derive a pose's bank or geometry. */
+static u16 g_staff_cast_vram[STAFF_CAST_MAX];
+static u16 g_staff_cast_mask[STAFF_CAST_MAX][2];
+static u16 g_staff_cast_frame_words[STAFF_CAST_MAX];
+static unsigned char g_staff_cast_cols[STAFF_CAST_MAX];
+static unsigned char g_staff_cast_pal[STAFF_CAST_MAX];
+static unsigned char g_staff_cast_ready[STAFF_CAST_MAX];
+/* Cell-space bounding box of the two poses, so a member whose art is packed
+   into a corner of its grid is still centred on its own name. */
+static unsigned char g_staff_cast_x0[STAFF_CAST_MAX],g_staff_cast_x1[STAFF_CAST_MAX];
+static unsigned char g_staff_cast_y0[STAFF_CAST_MAX],g_staff_cast_y1[STAFF_CAST_MAX];
 static s32 g_staff_scroll;      /* 8.8 pixels */
 /* Scroll targets, published at frame wrap by commit_staff_scroll().  Writing
    either plane's registers from update_staff() lands after that frame's
@@ -6356,38 +6366,63 @@ static void staff_fill_star_bat(void)
     }
 }
 
-static int staff_find_variant(int kind)
+static void staff_cast_bounds(int c,int cols,int rows)
 {
-    int l,i;
-    /* The cast is drawn from the ordinary stages: a family's first appearance
-       carries the palette and pose the player actually met it with. */
-    for (l=0;l<19;++l) {
-        const GameLevelData *g=&g_game_levels[l];
-        if (g_boss_level_flags[l]) continue;
-        for (i=0;i<(int)g->enemy_count;++i) {
-            if (g->enemies[i*ENEMY_RECORD_WORDS+7]!=kind) continue;
-            {
-                int lv=g->enemies[i*ENEMY_RECORD_WORDS+2];
-                if (lv>=0 && lv<(int)g->variant_count) return g->variant_ids[lv];
-            }
-        }
+    int cx,cy,x0=cols,x1=-1,y0=rows,y1=-1;
+    unsigned mask=(unsigned)(g_staff_cast_mask[c][0]|g_staff_cast_mask[c][1]);
+    for (cy=0;cy<rows;++cy) for (cx=0;cx<cols;++cx) {
+        if (!(mask&(1u<<(cy*cols+cx)))) continue;
+        if (cx<x0) x0=cx;
+        if (cx>x1) x1=cx;
+        if (cy<y0) y0=cy;
+        if (cy>y1) y1=cy;
     }
-    return -1;
+    if (x1<0) { x0=0; x1=cols-1; y0=0; y1=rows-1; }
+    g_staff_cast_x0[c]=(unsigned char)x0; g_staff_cast_x1[c]=(unsigned char)x1;
+    g_staff_cast_y0[c]=(unsigned char)y0; g_staff_cast_y1[c]=(unsigned char)y1;
 }
 
 static void staff_upload_cast(void)
 {
-    int k,i,j,uniq=0,top=STAFF_ENEMY_BASE_WORD;
+    int c,i,j,uniq=0,top=STAFF_ENEMY_BASE_WORD;
     const unsigned short *seen[STAFF_ENEMY_PAL_COUNT];
-    for (k=0;k<STAFF_KIND_COUNT;++k) {
-        const EnemyVariantData *v; int gi,fw,line=-1;
-        g_staff_enemy_variant[k]=-1;
-        gi=staff_find_variant(k);
-        if (gi<0) continue;
-        v=&g_enemy_variants[gi];
-        fw=enemy_frame_words(v);
+    for (c=0;c<STAFF_CAST_MAX;++c) g_staff_cast_ready[c]=0;
+    for (c=0;c<(int)g_staff_cast_count && c<STAFF_CAST_MAX;++c) {
+        const StaffCast *sc=&g_staff_cast[c];
+        const EnemyVariantData *v;
+        const unsigned short *src0,*src1;
+        int fw,cols,rows,line=-1;
+        if (sc->variant>=g_enemy_variant_count) continue;
+        v=&g_enemy_variants[sc->variant];
+        cols=v->cols; rows=v->rows;
+        /* Resolve the pair of cels this member is presented on, and where each
+           of them lives, before anything is reserved for it. */
+        switch (sc->pose) {
+        case STAFF_POSE_FLY:
+            /* Walk cel 0 is the pterodactyl hanging from a ceiling; the two
+               flight cels are walk cel 1 and the alt bank. */
+            if (!v->alt_words) continue;
+            fw=enemy_frame_words(v);
+            src0=v->words+fw; src1=v->alt_words;
+            g_staff_cast_mask[c][0]=v->mask1; g_staff_cast_mask[c][1]=v->alt_mask;
+            break;
+        case STAFF_POSE_CRATE:
+            /* The mimic's own cels are the closed box and the lid coming off.
+               Walking is a separate 3x3 bank shared by every mimic. */
+            cols=rows=3;
+            fw=ENEMY_FRAME_WORDS;
+            src0=g_crate_walk_words; src1=g_crate_walk_words+ENEMY_FRAME_WORDS;
+            g_staff_cast_mask[c][0]=g_crate_walk_masks[0];
+            g_staff_cast_mask[c][1]=g_crate_walk_masks[1];
+            break;
+        default:
+            fw=enemy_frame_words(v);
+            src0=v->words; src1=v->words+fw;
+            g_staff_cast_mask[c][0]=v->mask0; g_staff_cast_mask[c][1]=v->mask1;
+            break;
+        }
         if (top+fw*2>STAFF_ENEMY_TOP_WORD) continue;
-        /* Families that share a source palette share a line here too: sixteen
+        /* Members that share a source palette share a line here too: sixteen
            lines have to cover the stars, three text colours and the whole
            cast at once. */
         for (j=0;j<uniq;++j)
@@ -6399,13 +6434,16 @@ static void staff_upload_cast(void)
             for (i=0;i<16;++i) g_staff_palette[line*16+i]=v->palette[i];
             ++uniq;
         }
-        g_staff_enemy_variant[k]=(short)gi;
-        g_staff_enemy_pal[k]=(unsigned char)line;
-        g_staff_enemy_vram[k]=(u16)top;
-        /* Both walk cels, so the cast animates while it scrolls past. */
+        g_staff_cast_pal[c]=(unsigned char)line;
+        g_staff_cast_vram[c]=(u16)top;
+        g_staff_cast_frame_words[c]=(u16)fw;
+        g_staff_cast_cols[c]=(unsigned char)cols;
         vdc_set_vram_write(FRONT_CHIP,(u16)top);
-        for (i=0;i<fw*2;++i) vdc_vram_write(FRONT_CHIP,v->words[i]);
+        for (i=0;i<fw;++i) vdc_vram_write(FRONT_CHIP,src0[i]);
+        for (i=0;i<fw;++i) vdc_vram_write(FRONT_CHIP,src1[i]);
         top+=fw*2;
+        staff_cast_bounds(c,cols,rows);
+        g_staff_cast_ready[c]=1;
     }
 }
 
@@ -6499,25 +6537,24 @@ static void draw_staff_sprites(void)
     for (i=0;i<64*4;++i) satb[i]=0;
     for (i=0;i<(int)g_staff_line_count && n<62;++i) {
         const StaffLine *sl=&g_staff_lines[i];
-        const EnemyVariantData *v;
-        int kind=sl->enemy_kind,cx,cy,cols,rows,sx,sy,frame; unsigned mask; u16 base;
-        if (kind<0 || kind>=STAFF_KIND_COUNT) continue;
-        if (g_staff_enemy_variant[kind]<0) continue;
-        v=&g_enemy_variants[g_staff_enemy_variant[kind]];
-        cols=v->cols; rows=v->rows;
-        /* Centre the metasprite on its own name row and right-align it against
-           the text column, so tall and short families share a baseline. */
-        sy=i*STAFF_LINE_PITCH+4-(rows*16)/2-scroll_px;
-        sx=104-cols*16;
-        if (sy<-64 || sy>240) continue;
+        int c=sl->cast,cx,cy,cols,x0,x1,y0,y1,sx,sy,frame; unsigned mask; u16 base;
+        if (c<0 || c>=STAFF_CAST_MAX || !g_staff_cast_ready[c]) continue;
+        cols=g_staff_cast_cols[c];
+        x0=g_staff_cast_x0[c]; x1=g_staff_cast_x1[c];
+        y0=g_staff_cast_y0[c]; y1=g_staff_cast_y1[c];
+        /* Centre the occupied cells on the name row and right-align them
+           against the text column, so tall and short members share a line. */
+        sy=i*STAFF_LINE_PITCH+4-((y1-y0+1)*16)/2-y0*16-scroll_px;
+        sx=104-(x1+1)*16;
+        if (sy+y0*16<-64 || sy+y0*16>240) continue;
         frame=(int)((g_state_frame/12)&1);
-        mask=frame?v->mask1:v->mask0;
-        base=(u16)(g_staff_enemy_vram[kind]+(frame?enemy_frame_words(v):0));
-        for (cy=0;cy<rows && n<62;++cy) for (cx=0;cx<cols && n<62;++cx) {
+        mask=g_staff_cast_mask[c][frame];
+        base=(u16)(g_staff_cast_vram[c]+frame*g_staff_cast_frame_words[c]);
+        for (cy=y0;cy<=y1 && n<62;++cy) for (cx=x0;cx<=x1 && n<62;++cx) {
             int cell=cy*cols+cx;
             if (!(mask&(1u<<cell))) continue;
             set_sprite_entry(satb,n++,sx+cx*16,sy+cy*16,(u16)(base+cell*64),
-                (u16)(VDC_SPR_PRIO_SP|g_staff_enemy_pal[kind]));
+                (u16)(VDC_SPR_PRIO_SP|g_staff_cast_pal[c]));
         }
     }
     submit_front_satb(satb);
