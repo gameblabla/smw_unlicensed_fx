@@ -426,6 +426,8 @@ static u16 g_enemy_atk_vram[16],g_enemy_atk2_vram[16],g_enemy_shot_vram[16];
 /* $BD54 subtracts $3C from the duck's X before comparing it with the player,
    so it spits as soon as they are within sixty pixels of reaching it. */
 #define SPARK_TRIGGER_DX 60
+/* $C9D8/$C9E0 carry the thrown ball two pixels a frame. */
+#define BALL_THROW_SPEED 2
 /* Size of the ENEMY_ALT and ENEMY_SHOT banks in tools/vram_map.py. */
 #define ENEMY_ALT_WORDS 2880
 #define ENEMY_SHOT_WORDS 256
@@ -453,6 +455,20 @@ static int g_boss_random_drop_timer;
    pose the handler last selected and +$14 the teleport blank. */
 static int g_boss_init,g_boss_group,g_boss_cel,g_boss_anim_step,g_boss_anim_div;
 static int g_boss_hidden;
+/* Set for the mage's whole $9B88 vanish-and-blink window ($40..$A0), not
+   just the frames $g_boss_hidden currently blanks the draw for.  The source
+   box test reads the box off the currently drawn metasprite, but a
+   flickering actor is still the one that vanished a moment ago and has not
+   properly landed yet -- treating only the blank half of the blink as safe
+   left the crate/fireball/player tests able to connect on every other
+   frame of the reappearance, which is the "still sometimes hits while
+   invisible" report. */
+static int g_boss_intangible;
+/* $9CE6's bell drop (action 8) never appears in any of $9E38's four group
+   tables, so the source's own move picker can never land on it; the mage
+   would otherwise never drop the crate its bell art exists for.  Force it
+   into rotation on a fixed cadence instead of leaving it dead code. */
+static int g_boss16_pick_count;
 /* Bosses 6 and 7 both put three or four objects in the air at once, which
    the port's single g_boss_shot_* slot could not represent. */
 #define MAX_BOSS_SHOTS 4
@@ -1304,26 +1320,45 @@ static void set_game_palette_fade(int level)
     g_game_fade_level=level;
 }
 
-/* The conveyor gears are drawn once and turned in CRAM.  $ABBC gives level
-   slots 17, 18 and 19 a palette task that steps a phase every seventh call and
-   rewrites the three words at CRAM $6E -- palette line 3's colours 7, 8 and 9,
-   the machine's three purples -- from the table at $AC44.  Each phase there is
-   the level's own three colours rotated one place, so the whole animation is a
-   rotation of entries 55..57 and needs no extra colour.  The source task runs
-   at half the frame rate, which puts a step every fourteen frames here. */
-#define GEAR_PAL_FIRST 55
-static unsigned char g_gear_shift;
+/* Scenery that is drawn once and animated in CRAM.  The source's palette task
+   chain has exactly two of these, and both work the same way: a counter is
+   stepped every call, and when it reaches the task's period three consecutive
+   CRAM words are rewritten from a nine-word table whose three phases are the
+   level's own three colours rotated one place.  So each is a rotation of three
+   palette entries and needs no colour the level does not already own.
+
+   $ABBC gives level slots 17, 18 and 19 the conveyor gears: period seven,
+   CRAM $6E (palette line 3's colours 7..9, the machine's three purples) from
+   the table at $AC44.
+
+   $AAA4 gives slots 11, 12 and 13 -- the waterfall stages -- two rotations at
+   once: period seven at CRAM $5A (line 2's colours 13..15) from $AC20, and
+   period $11 at CRAM $78 (line 3's colours 12..14) from $AC32.  Both are the
+   falling water, which is why it stood perfectly still without them.
+
+   Every source task runs at half the frame rate, so each period doubles. */
+typedef struct { unsigned char level_lo,level_hi,first,period; } PaletteCycle;
+static const PaletteCycle g_palette_cycles[3]={
+    {16,18,55,14},   /* $ABBC gears,     CRAM $6E, period 7  */
+    {10,12,45,14},   /* $AAA4 waterfall, CRAM $5A, period 7  */
+    {10,12,60,34},   /* $AAA4 waterfall, CRAM $78, period $11 */
+};
+#define PALETTE_CYCLE_COUNT 3
+static unsigned char g_palette_cycle_shift[PALETTE_CYCLE_COUNT];
 
 static void update_gear_palette(void)
 {
-    int i;
+    int c,i;
     if (g_in_boss||!g_level||g_game_fade_level!=16) return;
-    if (g_current_level<16||g_current_level>18) return;
-    if ((g_state_frame%14)!=0) return;
-    g_gear_shift=(unsigned char)((g_gear_shift+2)%3);
-    for (i=0;i<3;++i)
-        tetsu_set_palette((u16)(GEAR_PAL_FIRST+i),
-                          g_level->palette[GEAR_PAL_FIRST+(i+g_gear_shift)%3]);
+    for (c=0;c<PALETTE_CYCLE_COUNT;++c) {
+        const PaletteCycle *p=&g_palette_cycles[c];
+        if (g_current_level<p->level_lo||g_current_level>p->level_hi) continue;
+        if ((g_state_frame%p->period)!=0) continue;
+        g_palette_cycle_shift[c]=(unsigned char)((g_palette_cycle_shift[c]+2)%3);
+        for (i=0;i<3;++i)
+            tetsu_set_palette((u16)(p->first+i),
+                g_level->palette[p->first+(i+g_palette_cycle_shift[c])%3]);
+    }
 }
 
 static int level_stage_chip(void);
@@ -1964,6 +1999,19 @@ static const signed char g_flying_koopa_dy[58]={
      1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4,
      4, 4, 3, 3, 3, 3, 2, 2, 2, 2, 1, 1, 1, 0,-1,
     -1,-1,-2,-2,-2,-2,-3,-3,-3,-3,-4,-4,-4
+};
+
+/* Exact state-10 drift table at $BEEE, thirty-three signed (dx,dy) pairs.
+   Handler $BE6C is the graveyard ghost: it is not a ground enemy at all.  It
+   only updates on every eighth frame ($BE76 masks the global counter with 7),
+   walks this arc one pair at a time, and when the arc runs out $BEB4 nudges it
+   eight pixels toward Mario on each axis and starts over.  It never probes
+   terrain, so it drifts through the crypt walls at half a pixel a frame. */
+#define GHOST_PATH_STEPS 33
+static const signed char g_ghost_path[GHOST_PATH_STEPS*2]={
+    -1, 0,-4,-3,-4,-2,-4,-1,-4,-2,-4,-1,-4, 0,-4,-1,-4, 0,-4, 0,-4, 1,
+    -4, 0,-4, 1,-4, 2,-4, 1,-4, 2,-4, 3,-4, 2,-4, 4,-4, 4,-3, 4,-2, 4,
+    -1, 4,-1, 4,-1, 4, 0, 4, 1, 4, 1, 4, 1, 4, 2, 4, 3, 4, 4, 4, 4, 4
 };
 
 /* True once Mario has walked off the right of the route's final screen. */
@@ -3039,6 +3087,34 @@ static int enemy_crate_floor_top(const Enemy *e, int x, int old_bottom,
     return best;
 }
 
+/* Is there something to stand on directly under the span x0..x1?  Both stage
+   terrain and a resting crate count, so a walker will step onto a crate that
+   has been set down at the end of its ledge rather than turn away from it. */
+static int enemy_floor_under(int x0,int x1,int bottom)
+{
+    int i,foot=bottom+1;
+    if(solid_v(x0,foot)||solid_v(x1,foot))return 1;
+    for(i=0;i<MAX_CRATES;++i){
+        const Crate *c=&g_crates[i];
+        int cx,cy;
+        if(!c->active||c->carried||c->thrown)continue;
+        cx=(int)(c->x>>FIX_SHIFT);cy=(int)(c->y>>FIX_SHIFT);
+        if(x1<cx||x0>=cx+CRATE_W)continue;
+        if(foot>=cy&&foot<cy+CRATE_H)return 1;
+    }
+    return 0;
+}
+
+/* Which walkers refuse to step off the end of what they are standing on.  The
+   hopper is out because its $BA7A leap is exactly how it changes platform, and
+   the boulder is out because rolling off the edge is its whole behaviour --
+   both of those drive themselves and never reach the shared solver anyway, so
+   this only has to name the families that do. */
+static int enemy_turns_at_ledge(const Enemy *e)
+{
+    return e->kind!=ENEMY_KIND_HOPPER && e->kind!=ENEMY_KIND_BOULDER;
+}
+
 /* One step of the mimic's reveal.  $C8B2 and $C8F0 each subtract eight from
    the object's Y, and its metasprite grows by exactly those eight pixels --
    24 tall closed, 32 half open, 40 walking -- so all three poses stand on one
@@ -3104,6 +3180,62 @@ static void update_enemies(void)
            crate, and it still hurts on contact.  The defeated-drop above sits
            ahead of the source's FF00A6 test as well and keeps running. */
         if (g_enemy_freeze) goto enemy_attack_checks;
+
+        /* State 10, ROM $BE6C.  Two families share the fall-through kind, and
+           this is the one that has no business on the ground: the graveyard's
+           green ghost.  It was reaching the generic Goomba solver, which gave
+           it gravity and walls it does not have in the source and pinned it to
+           whatever ledge it was authored over.  Drive it from its own table
+           instead: one pair every eighth frame, then a nudge toward Mario. */
+        if(e->kind==ENEMY_KIND_GENERIC && e->state==10){
+            e->vx=e->vy=0;
+            if((g_state_frame&7)==0){
+                const signed char *p=&g_ghost_path[e->flight_phase*2];
+                e->x+=(s32)p[0]*FIX_ONE;
+                e->y+=(s32)p[1]*FIX_ONE;
+                e->face_right=(unsigned char)(p[0]>0);
+                if(++e->flight_phase>=GHOST_PATH_STEPS){
+                    /* $BEB4/$BECE close the distance eight pixels at a time so
+                       the drift always circles back onto the player. */
+                    e->flight_phase=0;
+                    x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
+                    e->x+=(s32)((x<px)?8:-8)*FIX_ONE;
+                    e->y+=(s32)((y<py)?8:-8)*FIX_ONE;
+                }
+            }
+            x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);
+            goto enemy_attack_checks;
+        }
+
+        /* State 3, ROM $C9B0.  The other family sharing the fall-through kind:
+           the ball thrower.  $CA72 walks it a pixel a frame and flips it every
+           $3F, and every $80th frame -- whenever it is standing at or below the
+           player -- $CAE8 stops it and $CA20 puts metasprite $1D1 in its child
+           slot eighteen pixels down, which $C9D8 then carries two pixels a
+           frame in the direction it faces until $130C6 retires it off the view.
+           The port ran the record through the plain Goomba solver, so it
+           patrolled and never threw anything at all. */
+        if(e->kind==ENEMY_KIND_GENERIC && e->state==3){
+            if(e->behavior_phase){
+                e->vx=0;
+                if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
+                    e->shot_slot=0;e->behavior_phase=0;
+                    e->vx=e->face_right?FIX_ONE:-FIX_ONE;
+                }
+                y=(int)(e->y>>FIX_SHIFT);
+                goto enemy_attack_checks;
+            }
+            e->face_right=(unsigned char)(e->vx>0);
+            if((g_state_frame&0x7F)==0 && y>=py){
+                e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
+                e->shot_slot=(unsigned char)
+                    (throw_enemy_shot(e,18,0,BALL_THROW_SPEED,SHOT_MODE_SPEAR)+1);
+                y=(int)(e->y>>FIX_SHIFT);
+                goto enemy_attack_checks;
+            }
+            /* Idle deliberately falls through to the shared solver so the walk
+               still lands on terrain and turns at walls and ledges. */
+        }
 
         if(e->kind!=ENEMY_KIND_GENERIC){
             int near=iabs_i(px-x);
@@ -3428,9 +3560,24 @@ static void update_enemies(void)
             s32 nx=e->x+e->vx;
             int nxi=(int)(nx>>FIX_SHIFT);
             int side=e->vx>0?nxi+e->width-1:nxi;
+            int lead=e->vx>0?nxi+e->width-4:nxi+3;
+            int bottom;
             y=(int)(e->y>>FIX_SHIFT);
+            bottom=y+h-1;
             if (solid_h(side,y+8)||solid_h(side,y+h-3) ||
                 enemy_crate_blocked(e,nx,y))
+                e->vx=-e->vx;
+            else if (enemy_turns_at_ledge(e) && e->vy==0 && e->vx &&
+                     enemy_floor_under(x+3,x+e->width-4,bottom) &&
+                     !enemy_floor_under(lead,lead,bottom))
+                /* A walker that is already standing on something will not step
+                   off the end of it.  The source keeps these enemies on their
+                   authored ledge by giving them fixed-length legs and no
+                   terrain probe at all; giving the port's solver a probe ahead
+                   of the leading edge reaches the same place without having to
+                   re-time every patrol.  The hopper is the deliberate
+                   exception -- its $BA7A leap crosses gaps, and it runs that
+                   leap outside this solver entirely. */
                 e->vx=-e->vx;
             else
                 e->x=nx;
@@ -3644,6 +3791,9 @@ static int boss13_driver_flip_dx(int frame)
     return (frame<4)?(g_boss13_driver_dx[0][frame]+g_boss13_driver_dx[1][frame]):0;
 }
 
+/* Slot 19's cel byte to strip pose, from the level's cel table at $7400. */
+static const unsigned char BOSS19_CEL_FRAME[6]={0,1,2,4,4,3};
+
 static int later_boss_frame(const BossVisualData *v)
 {
     int frame,t=g_boss_timer;
@@ -3677,13 +3827,28 @@ static int later_boss_frame(const BossVisualData *v)
         frame=boss13_driver_frame();
         break;
     case 4: /* mage */
-        if(g_boss_invuln>0)frame=v->frame_count-1;
+        /* $73B8's cel list is (1,$25C),(2,$25E),(3,$260),(4,$262),(4,$262):
+           cels 0..2 are the idle/cast cycle and both cel 3 (the hit pose
+           $1633A selects) and cel 4 (the death pose $163C0 selects) name the
+           same metasprite.  The supplied strip splits those two apart -- pose
+           3 is the recoil, pose 4 is the same recoil dissolving into sparks --
+           so being hit must stop at the recoil and only the death may take the
+           last pose.  Using frame_count-1 for both played the vanish every
+           time the mage was touched. */
+        if(g_boss_defeated)frame=v->frame_count-1;
+        else if(g_boss_invuln>0)frame=v->frame_count-2;
         else if(g_boss_cel)frame=g_boss_cel;
         else frame=(t/8)%3;
         break;
     default: /* elephant */
-        if(g_boss_invuln>0)frame=v->frame_count-1;
-        else if(g_boss_cel)frame=g_boss_cel;
+        /* $7400's cel list is not in strip order: cel 3 and cel 4 both name
+           metasprite $278 (trunk raised, spitting), cel 5 names $276 (reared
+           up), and only cels 0..2 line up with the strip.  Resolve it rather
+           than using the cel as an index, which showed the resting pose for
+           the whole of the $965E spout and the reared pose for being hit. */
+        if(g_boss_defeated)frame=BOSS19_CEL_FRAME[4];
+        else if(g_boss_invuln>0)frame=BOSS19_CEL_FRAME[3];
+        else if(g_boss_cel)frame=BOSS19_CEL_FRAME[g_boss_cel%6];
         else frame=(t/8)%2;
         break;
     }
@@ -4076,6 +4241,11 @@ static void draw_game_sprites(void)
                        e->behavior_timer<THROWER_RELEASE_TICKS*2)?4:3):
                      (int)((g_state_frame/8)&1);
         }
+        /* $CA20 writes 1 into the ball thrower's animation-state word and holds
+           it there for the whole throw.  Only two of this family's cels are
+           kept in VRAM, so that is selector 1 rather than the attack bank. */
+        else if(e->kind==ENEMY_KIND_GENERIC&&e->state==3&&e->behavior_phase)
+            anim=1;
 #ifdef FORCE_ENEMY_HURT
         if(v->has_hit_frame){use_hit_frame=1;anim=2;}
 #endif
@@ -4370,7 +4540,7 @@ static void start_boss(int fade_in)
     g_boss_phase=0;g_boss_face=-1;
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
     g_boss_init=0;g_boss_group=0;g_boss_cel=0;g_boss_anim_step=0;g_boss_anim_div=0;
-    g_boss_hidden=0;g_screen_shake=0;
+    g_boss_hidden=0;g_boss_intangible=0;g_screen_shake=0;g_boss16_pick_count=0;
     for(i=0;i<MAX_BOSS_SHOTS;++i)g_boss_shots[i].active=0;
     g_boss10_floor_y=y;
     g_boss8_crate=-1;
@@ -4532,6 +4702,14 @@ static int boss_shots_airborne(int kind)
     return boss_shot_of_kind(kind)>=0;
 }
 
+static int boss_shot_slots_used(int kind)
+{
+    int i,n=0;
+    for(i=0;i<MAX_BOSS_SHOTS;++i)
+        if(g_boss_shots[i].active&&g_boss_shots[i].kind==kind)++n;
+    return n;
+}
+
 static void boss_clear_shots(int kind)
 {
     int i;
@@ -4586,8 +4764,10 @@ static void boss13_release_bomb(int i)
 
 static void boss16_release_bell(int i)
 {
+    /* $9D4C-$9D50 spawns the room object once $ff74e4 counts the fall out;
+       unlike $91D0's bomb landing there is no sound-effect call in that
+       path, so the bell should land silently. */
     boss_shot_to_crate(i,4);
-    Play_Sound_Sample(SFX_BOSS_HIT,0,0);
 }
 
 /* Everything the three handlers put in the air moves here.  Only the frog's
@@ -4631,6 +4811,13 @@ static void update_boss_shots(void)
            only the sides and the bottom retire an object. */
         if(sx<-48||sx>288||sy>248){s->active=0;continue;}
         py=player_body_y()+bowser_room_object_y_offset();
+        /* $9CE6 lowers the bell on a rope to place it, the way $8564 lowers
+           the pig's crate -- it is cargo being set down, not a thrown
+           weapon, and the source never tests it against the player at all.
+           Falling into that shared hit test below (written for the frog's
+           thrown bomb) let a descending bell hurt Mario just for standing
+           under it, which is boss 5's own behaviour leaking onto boss 6. */
+        if(s->kind==BOSS_SHOT_BELL)continue;
         {   /* $15C9C reads the thrower's box out of $18BAC for the object's
                own metasprite and shrinks it eight pixels; the frog's bomb is
                $1A8/$1AB, 32x24, so it tests as 24x16.  The player side is
@@ -4644,7 +4831,7 @@ static void update_boss_shots(void)
                 hit=aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx+4,sy+4,20,20);
             if(g_invuln==0&&hit){
                 hurt_player();
-                if(s->kind!=BOSS_SHOT_BELL)s->active=0;
+                s->active=0;
             }
         }
     }
@@ -5039,7 +5226,10 @@ static void update_boss_motion(void)
         if(!g_boss_init){
             if(++g_boss_script_index<0x17)break;
             g_boss_script_index=0;
-            {
+            if(++g_boss16_pick_count>=4&&boss_shot_of_kind(BOSS_SHOT_BELL)<0){
+                g_boss16_pick_count=0;
+                g_boss_action=8;g_boss_action_dir=g_boss_face<0?1:0;
+            }else{
                 const unsigned char *rec=g_boss16_groups[g_boss_group]
                     [boss_random()%g_boss16_group_len[g_boss_group]];
                 g_boss_action=rec[0];g_boss_group=rec[1];g_boss_action_dir=rec[2];
@@ -5076,6 +5266,7 @@ static void update_boss_motion(void)
             if(g_boss_action_timer>=0x40&&g_boss_action_timer<0x70)g_boss_hidden=1;
             else if(g_boss_action_timer<0xA0)g_boss_hidden=g_boss_action_timer&1;
             else{g_boss_hidden=0;g_boss_action_timer=0;g_boss_init=0;}
+            g_boss_intangible=(g_boss_action_timer>=0x40&&g_boss_action_timer<0xA0)?1:0;
             break;
         case 6: /* $9BE6: three rings leave together and fan apart */
             if(!g_boss_phase){
@@ -5158,13 +5349,22 @@ static void update_boss_motion(void)
             }
             break;
         }
-        case 6: /* $965E: spout four hammers, then let them rain down */
+        case 6: /* $965E: spout the hammers one at a time, then let them rain */
             if(!g_boss_phase){
-                int k,sx=ox+(g_boss_action_dir?42:-66),sy=oy-64;
-                g_boss_phase=1;g_boss_cel=0;oy+=32;
-                for(k=0;k<MAX_BOSS_SHOTS;++k)
-                    boss_spawn_shot(BOSS_SHOT_HAMMER,sx+k*8,sy,
+                /* $9666 walks the four projectile slots and stops at the first
+                   empty one, so exactly one hammer leaves the trunk per frame,
+                   all four from the same point.  Only once the last slot has
+                   been filled does $96A8 drop the cel and lower the actor a
+                   storey.  Emitting the whole spread in a single frame -- and
+                   fanning it eight pixels a hammer -- turned one shot into a
+                   wall of crates the player could not get between. */
+                int sx=ox+(g_boss_action_dir?42:-66),sy=oy-64;
+                if(boss_shot_slots_used(BOSS_SHOT_HAMMER)<MAX_BOSS_SHOTS)
+                    boss_spawn_shot(BOSS_SHOT_HAMMER,sx,sy,
                         (s32)(g_boss_action_dir?2:-2)*FIX_ONE,0);
+                if(++g_boss_action_timer>=MAX_BOSS_SHOTS){
+                    g_boss_phase=1;g_boss_cel=0;oy+=32;
+                }
             }else if(!boss_shots_airborne(BOSS_SHOT_HAMMER)){
                 g_boss_init=0;g_boss_phase=0;
             }
@@ -5287,7 +5487,13 @@ static void update_boss_actor(void)
            the recovered body so a crate thrown on the platform above cannot
            hit him while he is below it.  Keep the bottom edge unchanged. */
         hity+=16;hith-=16;}
-    if(g_boss_invuln==0&&hitw>0&&hith>0){
+    /* $9B88's vanish-and-blink covers $40..$A0 of action 5: the actor is
+       fully blanked for the first half and flickers on and off for the
+       second.  $18BAC's box comes from the currently drawn metasprite, so
+       neither half has a real pose to read a box from -- checking only the
+       instantaneous g_boss_hidden state left every other flicker frame
+       hittable. Use g_boss_intangible, which covers the whole window. */
+    if(g_boss_invuln==0&&hitw>0&&hith>0&&!(g_boss_class==4&&g_boss_intangible)){
         for(i=0;i<MAX_FIREBALLS&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_fireballs[i].active){int fx=(int)(g_fireballs[i].x>>FIX_SHIFT),fy=(int)(g_fireballs[i].y>>FIX_SHIFT);if(aabb(fx+4,fy+4,16,16,hitx,hity,hitw,hith)){boss_take_hit();g_fireballs[i].active=0;}}
         for(i=0;i<MAX_CRATES&&g_boss_invuln==0&&!g_boss_defeated;++i)if(g_crates[i].active&&g_crates[i].thrown){int cx=(int)(g_crates[i].x>>FIX_SHIFT),cy=(int)(g_crates[i].y>>FIX_SHIFT)+bowser_room_object_y_offset();if(aabb(cx,cy,24,24,hitx,hity,hitw,hith)){boss_take_hit();g_crates[i].active=0;}}
         /* $15C90 and $162F2 both abandon the test the moment the driver
@@ -5359,7 +5565,7 @@ static void start_gameplay(int fade_in)
     g_throw_timer=0;
     g_death_timer=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;
-    g_gear_shift=0;
+    {int c;for(c=0;c<PALETTE_CYCLE_COUNT;++c)g_palette_cycle_shift[c]=0;}
     set_game_palette_fade(fade_in?0:16);
     /* Both VDC outputs are disabled above and all palettes are now black. */
     music_start_at_black();

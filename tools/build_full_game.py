@@ -350,7 +350,10 @@ def enemy_palette(r,gfx):
 # family loads its own copy at the tail of graphics selector 3, so the monkey
 # throws a banana, the level 9 thrower a rock, the spearman a spear and the
 # level 11 duck its spark from the same records.
-ENEMY_SHOT_ART={7:(0x1E3,1,1), 10:(0x1FB,2,1,0), 12:(0x207,2,1)}
+# $CA20 builds state 3's projectile from metasprite $1D1 plus the object's own
+# selector, which is the green ball graphics family 2 throws.  Without it the
+# thrower had no projectile art at all and fell back to the monkey's banana.
+ENEMY_SHOT_ART={2:(0x1D1,1,1), 7:(0x1E3,1,1), 10:(0x1FB,2,1,0), 12:(0x207,2,1)}
 
 def make_enemy_shot(r,gfx,mid,cols,rows,yoff=4):
     """Pack one family's projectile out of its own graphics selector 3."""
@@ -910,7 +913,7 @@ def make_later_boss_assets():
     # The remaining boss sheets use their existing source regions. Slot 13
     # has ten poses; its own arena has no concurrent auxiliary bank, so all
     # ten fit in VRAM.
-    frame_regions={10:((0,0,3),),16:((0,384,5),),19:((0,480,5),)}
+    frame_regions={10:((0,0,3),),19:((0,480,5),)}
     def tank_frames():
         """Slot 13's poses rebuilt from the ROM instead of cut out of a rip.
 
@@ -1064,13 +1067,22 @@ def make_later_boss_assets():
             frame_transparent=ostrich_transparent
         elif slot==13:
             frames,frame_transparent=tank_frames()
+        elif slot==16:
+            # The contact sheet's mage row sits directly above the elephant's
+            # trunk poses with no blank row between them, so a 96-row window
+            # cut from the shared sheet picked up stray elephant pixels along
+            # its bottom edge.  Use the cleaned five-pose strip instead, the
+            # same fix already applied to the pig and the ostrich.
+            mage_strip=Image.open(PROJECT/'boss6.png').convert('RGB')
+            if mage_strip.size!=(576,96):
+                raise RuntimeError('boss6.png must be exactly 576x96')
+            mage_transparent=mage_strip.getpixel((0,0))
+            frames=sheet_frames(mage_strip,mage_transparent,5,(112,96))
+            frame_transparent=mage_transparent
         elif slot==19:
             frames=elephant_frames()
             frame_transparent=transparent
         else:
-            # The mage's five poses sit on a 112-pixel pitch that starts eight
-            # pixels into the sheet, so fixed (i*112) windows sliced up to nine
-            # columns off the trailing poses' robes.
             for x,y,count in frame_regions[slot]:
                 frames.extend(sheet_frames(sheet,transparent,count,(112,96),
                                            (x,y,sheet.width,y+96)))
@@ -1244,7 +1256,13 @@ STAGE_OBJECT_SKIP_SLOTS={2,6,8}
 # happens to agree for some levels.  These are the lines that reproduce the
 # Mega Drive's own colours (level 9's ledges are brown, not green; level 19's
 # girder is gold, not green).  The port used to force line 2 everywhere.
-STAGE_OBJECT_PAL_LINE={9:3, 10:3, 11:2, 12:2, 13:2, 15:3, 17:2, 18:2, 19:2}
+#
+# Slots 17..19 are the machine world's girder, and it is green there, not the
+# gold of the shared platform art: line 2 is the gold the earlier stages use
+# and line 3 is the green these three draw it in.  Each of those three banks
+# holds that one shape, so moving the whole bank to line 3 recolours exactly
+# the girder and nothing else.
+STAGE_OBJECT_PAL_LINE={9:3, 10:3, 11:2, 12:2, 13:2, 15:3, 17:3, 18:3, 19:3}
 
 # Metasprites whose art is supplied as a PNG instead of being assembled from
 # the Mega Drive pattern block.  Level 9's pillar (metasprite 121) is authored
