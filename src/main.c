@@ -4145,7 +4145,12 @@ static void draw_game_sprites(void)
             if(t<1)t=1;
             special=BOWSER_SPECIAL_NORMAL+(((t-1)/BOWSER_RUN_FRAME_TICKS)&1);
         }
-        by-=15;
+        /* Bowser's supplied 112x96 canvases are authored nine pixels below
+           the actor anchor the Mega Drive object uses.  The room's own -6 has
+           already been applied above, along with every other object in the
+           arena; taking a further 15 here double-counted it and left his feet
+           six pixels clear of the catwalk Mario stands on. */
+        by-=9;
         mask=g_bowser_special_masks[special];
         for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
         }
