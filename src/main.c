@@ -2161,6 +2161,20 @@ static void update_camera(void)
         }
         else if(target_y<home){target_y+=8; if(target_y>home)target_y=home;}
         else if(target_y>home){target_y-=8; if(target_y<home)target_y=home;}
+        /* The hand-over above is the resting behaviour, but on its own it is a
+           snap: a fall crosses the storey boundary far faster than eight
+           pixels a frame and leaves Mario hanging below the bottom of the
+           240-line window until the drift catches up.  Bound the drift with a
+           follow band instead, so the picture is dragged with him the instant
+           he would leave it.  His sprite is 48 tall from g_player_y, and the
+           band keeps 24 px of headroom and 8 px under his feet -- wide enough
+           that an ordinary jump inside a storey never moves the camera, which
+           is what makes the storey the resting position rather than a target
+           the follow keeps fighting. */
+        if(target_y>py-24)target_y=py-24;
+        if(target_y<py+48-232)target_y=py+48-232;
+        if(target_y<min_camera_y)target_y=min_camera_y;
+        if(target_y>max_camera_y)target_y=max_camera_y;
         new_row=target_y>>3;
         while(g_camera_row<new_row){++g_camera_row;stream_level_row(g_camera_row+30);}
         while(g_camera_row>new_row){--g_camera_row;stream_level_row(g_camera_row-1);}
@@ -3053,6 +3067,19 @@ static void update_gems(void)
             Play_Sound_Sample(SFX_BLUE_CRYSTAL,0,0);
         }
     }
+}
+
+/* The Y past which there is no more stage under Mario.  A flat level ends at
+   its single storey; a stacked one ends at the bottom of whichever storey the
+   route joins to the live room -- room_window's rhi -- because that is the
+   lowest the camera is ever allowed to travel. */
+static int player_pit_floor(void)
+{
+    int clo,chi,rlo,rhi;
+    if(g_level_rows<=1||g_in_boss)return g_level_rows*LEVEL_SCREEN_H;
+    room_window(g_room,&clo,&chi,&rlo,&rhi);
+    (void)clo;(void)chi;(void)rlo;
+    return (rhi+1)*LEVEL_SCREEN_H;
 }
 
 static void begin_player_death(void)
@@ -6023,9 +6050,14 @@ static void update_play(u16 btn, u16 pressed)
 
     /* Falling through an open pit is fatal once Mario leaves the 224-line
        source playfield. The visual extension rows remain non-colliding.
-       In a stacked level only the bottom screen's floor is the pit: falling
-       out of an upper screen simply lands him on the one below. */
-    if ((int)(g_player_y>>FIX_SHIFT)>g_level_rows*LEVEL_SCREEN_H) {
+       In a stacked level the pit is the bottom of the room window rather than
+       the bottom of the whole tower: the route's own neighbour is the only
+       storey below that has been pasted, so dropping out of a shaft with
+       nothing under it has to end there.  Measuring against the tower instead
+       let the camera's follow band trail him down through storeys the route
+       never reached, which is the fall that stayed on screen long after it
+       should have been a death. */
+    if ((int)(g_player_y>>FIX_SHIFT)>player_pit_floor()) {
         if(g_debug_mode){
             g_player_y=(s32)(g_camera_y+96)<<FIX_SHIFT;g_vy=0;g_jump_active=0;g_bounce_active=0;
             draw_game_sprites();return;
