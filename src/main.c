@@ -485,13 +485,20 @@ static int g_boss16_pick_count;
    the port's single g_boss_shot_* slot could not represent. */
 #define MAX_BOSS_SHOTS 4
 #define BOSS_SHOT_RING   1   /* $1A1 volley and $1A7 shockwave */
-#define BOSS_SHOT_HAMMER 2   /* $1A3, spouted then dropped as a throwable */
+/* $1A3 is a 24x24 three-by-three of tile 1216 -- the same bubble art the
+   mage's $1A1 volley takes its top-left quarter from.  The mallet the final
+   room lies around as ammunition is $1A4 (tile 1225) and belongs to the
+   room's own dispenser, not to anything the elephant spouts. */
+#define BOSS_SHOT_BUBBLE 2   /* $1A3, spouted by $965E */
 #define BOSS_SHOT_BOMB   3   /* $1A8 on the $9262 arc */
 #define BOSS_SHOT_BELL   4   /* $B4 lowered by $9CE6 */
 typedef struct { s32 x,y,vx,vy; short timer; unsigned char active,kind,phase; } BossShot;
 static BossShot g_boss_shots[MAX_BOSS_SHOTS];
 /* $9596 jolts the plane when the elephant lands. */
 static int g_screen_shake;
+/* $7D04's own two bytes: the countdown to the next mallet and the drop column
+   it will use.  The final room hands the player one mallet at a time. */
+static int g_boss19_ammo_delay,g_boss19_ammo_slot;
 
 /* Boss 3's handler at MD $806A is a byte-pair action script.  The first byte
    selects the movement state and the second is the source direction flag.
@@ -593,6 +600,10 @@ static const unsigned char g_boss10_pot[31]={
 #define BOSS13_LIFT_EXIT   (240 - BOSS13_ROOM_DY)
 /* $940E's own storey: the elephant's actor origin while it is not mid-hop. */
 #define BOSS19_FLOOR_Y (0x120-BOSS_ROOM_BIAS)
+/* $9742's pop line for the spouted bubbles, and $7D04's own two constants:
+   the room's mallet is dropped from $68 and comes to rest at $108. */
+#define BOSS19_BUBBLE_END_Y (0x15E - BOSS_ROOM_BIAS)
+#define BOSS19_AMMO_TOP_Y   (0x68 - BOSS_ROOM_BIAS)
 /* Slot 13's actor point is the tank's, not the driver's: $8D72 drives the
    vehicle with metasprites $1A5/$1A6, 80x32 anchored at -40/-32..39/-1, so
    the actor X is 40 pixels into the tank and the actor Y is the tread line
@@ -668,8 +679,8 @@ static const unsigned char g_boss19_hop2[]={9,9,9,8,8,8,8,8,8,7,7,7,7,7,7,6,6,6,
 static const unsigned char g_boss19_hop3[]={9,9,9,9,8,8,8,8,8,8,7,7,7,7,7,7,7,7,7,6,0x88};
 static const unsigned char g_boss19_hop4[]={8,8,8,8,8,7,7,7,7,7,7,7,6,6,6,6,6,6,6,5,5,5,5,5,4,4,4,4,4,4,3,3,3,3,3,2,2,2,1,1,0x88};
 static const unsigned char g_boss19_hop5[]={9,9,9,9,9,8,8,8,8,8,7,7,7,7,7,6,6,6,6,5,5,4,4,3,3,0x88};
-/* $98CE: the rise half of each spouted hammer's flight. */
-static const unsigned char g_boss19_hammer_arc[]={9,9,9,8,8,8,8,7,7,7,7,6,6,6,6,5,5,5,4,4,4,3,2,1,0x88};
+/* $98CE: the rise half of each spouted bubble's flight. */
+static const unsigned char g_boss19_bubble_arc[]={9,9,9,8,8,8,8,7,7,7,7,6,6,6,6,5,5,5,4,4,4,3,2,1,0x88};
 
 /* $B844's three bounce arcs, read one signed word a frame while the rock
    rolls two pixels right.  The first is the same 45-step table $17948 gives
@@ -4412,7 +4423,10 @@ static void draw_game_sprites(void)
             if(!s->active)continue;
             sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT)+bowser_room_object_y_offset();
             if(sx<-32||sx>255||sy<-32||sy>239)continue;
-            if(s->kind==BOSS_SHOT_HAMMER){addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}
+            /* $1A3 names tile 1216 -- the bubble -- three tiles square.
+               1225 next door is the mallet, which is the room's ammunition
+               and is drawn by the crate loop instead. */
+            if(s->kind==BOSS_SHOT_BUBBLE){addr=BOSS_RING_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}
             else if(s->kind==BOSS_SHOT_BOMB){addr=(u16)(BOSS_BOMB_BASE_WORD+((g_state_frame>>3)&1)*256);pal=BOSS_ITEM_SPR_PAL;}
             else if(s->kind==BOSS_SHOT_BELL){addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;}
             else{addr=BOSS_RING_BASE_WORD;pal=BOSS_AUX_SPR_PAL;}
@@ -4556,16 +4570,22 @@ static void start_boss(int fade_in)
     /* The final wall scrolls through a 224-line (28-row) source. Populate two
        complete repetitions in the 64-row VDC0 BAT; a 240-line viewport can
        then cross the source seam without ever exposing VDP scratch rows. */
-    for(y=0;y<((g_boss_class==5)?64:32);++y){int sy=(g_boss_class==5)?(y%28):y;vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(BACK_CHIP,relocate_bat(bv?bv->bg_bat[sy*32+x]:br->bg_bat[sy*32+x],BOSS_BG_TILE_BASE_INDEX));}
+    /* Both boss BATs are 64 columns wide and the rooms are 256 pixels, so
+       the second half has to repeat the first: $9596's landing jolt is the one
+       thing that ever scrolls a boss room sideways, and a two-pixel jolt to
+       the left wraps the window onto columns 32..63.  Leaving those empty
+       turned the whole wall into VDC scratch on every other frame of the
+       elephant's landing. */
+    for(y=0;y<((g_boss_class==5)?64:32);++y){int sy=(g_boss_class==5)?(y%28):y;vdc_set_vram_write(BACK_CHIP,(u16)(y*BG_BAT_W));for(x=0;x<64;++x)vdc_vram_write(BACK_CHIP,relocate_bat(bv?bv->bg_bat[sy*32+(x&31)]:br->bg_bat[sy*32+(x&31)],BOSS_BG_TILE_BASE_INDEX));}
     if(bv){
         vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
         for(i=0;i<bv->fg_tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,bv->fg_tile_words[i]);
-        for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(bv->fg_bat[y*32+x],FG_TILE_BASE_INDEX));}
+        for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<64;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(bv->fg_bat[y*32+(x&31)],FG_TILE_BASE_INDEX));}
     }
     else{
         vdc_set_vram_write(FRONT_CHIP,FG_TILE_BASE_WORD);
         for(i=0;i<br->tile_count*TILE_WORDS;++i)vdc_vram_write(FRONT_CHIP,br->tile_words[i]);
-        for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<32;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(br->fg_bat[y*32+x],FG_TILE_BASE_INDEX));}
+        for(y=0;y<32;++y){vdc_set_vram_write(FRONT_CHIP,(u16)(y*FG_BAT_W));for(x=0;x<64;++x)vdc_vram_write(FRONT_CHIP,relocate_bat(br->fg_bat[y*32+(x&31)],FG_TILE_BASE_INDEX));}
     }
     upload_game_sprites();
     if(bv){
@@ -4629,6 +4649,7 @@ static void start_boss(int fade_in)
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
     g_boss_init=0;g_boss_group=0;g_boss_cel=0;g_boss_anim_step=0;g_boss_anim_div=0;
     g_boss_hidden=0;g_boss_intangible=0;g_screen_shake=0;g_boss16_pick_count=0;
+    g_boss19_ammo_delay=0;g_boss19_ammo_slot=2;
     for(i=0;i<MAX_BOSS_SHOTS;++i)g_boss_shots[i].active=0;
     g_boss10_floor_y=y;
     g_boss8_crate=-1;
@@ -4867,14 +4888,16 @@ static void update_boss_shots(void)
         BossShot *s=&g_boss_shots[i];
         int sx,sy,py;
         if(!s->active)continue;
-        if(s->kind==BOSS_SHOT_HAMMER){
-            /* $96CE: two pixels sideways a frame while $98CE lifts it, then
-               $971A drops it a pixel a frame and jitters it left or right. */
-            s->x+=s->vx;
+        if(s->kind==BOSS_SHOT_BUBBLE){
+            /* $96CE carries it two pixels sideways a frame while $98CE lifts
+               it.  $971A then drops it a pixel a frame and jitters it left or
+               right instead -- the aimed drift belongs to the rise alone, so
+               the fall must not keep adding it. */
             if(!s->phase){
-                if(g_boss19_hammer_arc[s->timer]==0x88){s->phase=1;s->timer=0;}
+                s->x+=s->vx;
+                if(g_boss19_bubble_arc[s->timer]==0x88){s->phase=1;s->timer=0;}
                 else{
-                    s->y-=(s32)g_boss19_hammer_arc[s->timer]*FIX_ONE;++s->timer;
+                    s->y-=(s32)g_boss19_bubble_arc[s->timer]*FIX_ONE;++s->timer;
                     /* $98CE throws them 144 pixels up, which the source's
                        taller plane still shows.  Hold them at the ceiling of
                        this arena instead of letting the spout spend four
@@ -4889,13 +4912,15 @@ static void update_boss_shots(void)
             s->x+=s->vx;s->y+=s->vy;
         }
         sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT);
-        /* $9742 waits for the first hammer to pass $15E before it hands them
-           all to the room.  That threshold is below this arena's floor -- the
-           source's plane is taller than the port's fixed 240-line room -- so
-           release them at the storey the elephant itself stands on and let
-           the ordinary crate physics settle them on the catwalk. */
-        if(s->kind==BOSS_SHOT_HAMMER&&s->phase&&sy>=BOSS19_FLOOR_Y){boss_shot_to_crate(i,5);continue;}
-        /* The spout arc carries the hammers a good way above the viewport, so
+        /* $9742 waits for the first bubble to fall past $15E and then calls
+           $1312A on all four slots, which zeroes them: the spout's bubbles
+           pop, they never become ammunition.  $15E is room 222, still inside
+           this arena's 240 lines, so the threshold carries over unchanged --
+           they drift down through the catwalk and burst near the bottom. */
+        if(s->kind==BOSS_SHOT_BUBBLE&&s->phase&&sy>=BOSS19_BUBBLE_END_Y){
+            boss_clear_shots(BOSS_SHOT_BUBBLE);break;
+        }
+        /* The spout arc carries the bubbles a good way above the viewport, so
            only the sides and the bottom retire an object. */
         if(sx<-48||sx>288||sy>248){s->active=0;continue;}
         py=player_body_y()+bowser_room_object_y_offset();
@@ -5404,10 +5429,16 @@ static void update_boss_motion(void)
             }
             g_boss_init=1;g_boss_action_timer=0;g_boss_phase=0;
             g_boss_face=g_boss_action_dir?-1:1;
-            /* $94BC: every move but the spout crouches first, and all of them
-               lift the actor a storey before the arc is walked. */
+            /* $94BC picks the wind-up pose: cel 1 for a leap, cel 5 for the
+               spout.  The `subi.w #$20` that goes with it is not motion --
+               $272 and $276 are both drawn a storey lower than $270 ($272 is
+               -96..+31 against $270's -96..-1), so lifting the actor 32 is
+               exactly what keeps the feet still while the pose changes.  The
+               port's five poses all share one bottom-aligned canvas, so that
+               compensation is already built in and re-applying it here popped
+               the elephant a storey up at every wind-up and a storey down at
+               every apex. */
             g_boss_cel=(g_boss_action<=5)?1:5;
-            oy-=32;boss_set_origin(ox,oy);
             break;
         }
         state=g_boss_action;
@@ -5415,17 +5446,23 @@ static void update_boss_motion(void)
         case 1: case 2: case 3: case 4: case 5: {
             static const unsigned char *const hops[5]={
                 g_boss19_hop1,g_boss19_hop2,g_boss19_hop3,g_boss19_hop4,g_boss19_hop5};
-            int step=(state==1)?1:2;
+            /* $9516 and $95CE step one pixel, $95FC and $961C two.  $963C
+               steps none at all: it re-writes X from its group's anchor on
+               every frame of the leap, so the boss goes straight up and comes
+               straight back down on that column.  Walking it sideways for the
+               eighty frames of $988B/$98B4 as well was what carried the
+               elephant out through the left wall. */
+            int step=(state<=2)?1:2;
             hop=hops[state-1];
-            /* $963C: state 5 leaps from its group's own anchor. */
-            if(state==5&&!g_boss_phase&&!g_boss_action_timer)
-                ox=g_boss19_anchor_x[g_boss_group]-BOSS_ROOM_BIAS;
+            if(state==5)ox=g_boss19_anchor_x[g_boss_group]-BOSS_ROOM_BIAS;
             /* $95CE runs at half speed; the rest move every frame. */
-            if(state!=2||!(t&1))ox+=g_boss_action_dir?step:-step;
+            else if(state!=2||!(t&1))ox+=g_boss_action_dir?step:-step;
             if(hop[g_boss_action_timer]==0x88){
                 if(!g_boss_phase){
-                    /* $9540: turn the arc around and come back down. */
-                    g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=2;oy+=32;
+                    /* $9540 turns the arc around and comes back down on cel 2.
+                       Its `addi.w #$20` undoes the wind-up pose's storey; see
+                       the note at $94BC. */
+                    g_boss_phase=1;g_boss_action_timer=0;g_boss_cel=2;
                 }else{
                     g_boss_phase=0;g_boss_action_timer=0;g_boss_cel=0;g_boss_init=0;
                     /* $9596 shakes the room on the landing. */
@@ -5446,14 +5483,18 @@ static void update_boss_motion(void)
                    storey.  Emitting the whole spread in a single frame -- and
                    fanning it eight pixels a hammer -- turned one shot into a
                    wall of crates the player could not get between. */
-                int sx=ox+(g_boss_action_dir?42:-66),sy=oy-64;
-                if(boss_shot_slots_used(BOSS_SHOT_HAMMER)<MAX_BOSS_SHOTS)
-                    boss_spawn_shot(BOSS_SHOT_HAMMER,sx,sy,
+                /* $9670 spawns at the actor plus $2A/-$42 and minus $40.
+                   The source actor is a storey up here from $94F4's pose
+                   compensation, which the port does not apply, so the trunk
+                   tip is 96 above this actor rather than 64. */
+                int sx=ox+(g_boss_action_dir?42:-66),sy=oy-96;
+                if(boss_shot_slots_used(BOSS_SHOT_BUBBLE)<MAX_BOSS_SHOTS)
+                    boss_spawn_shot(BOSS_SHOT_BUBBLE,sx,sy,
                         (s32)(g_boss_action_dir?2:-2)*FIX_ONE,0);
                 if(++g_boss_action_timer>=MAX_BOSS_SHOTS){
-                    g_boss_phase=1;g_boss_cel=0;oy+=32;
+                    g_boss_phase=1;g_boss_cel=0;
                 }
-            }else if(!boss_shots_airborne(BOSS_SHOT_HAMMER)){
+            }else if(!boss_shots_airborne(BOSS_SHOT_BUBBLE)){
                 g_boss_init=0;g_boss_phase=0;
             }
             break;
@@ -5495,6 +5536,31 @@ static void update_boss_actor(void)
     /* Bosses 5, 6 and 7 now put their own bombs, bells and hammers into the
        room from their handlers, so the generic dispenser is off for every
        later boss and only Bowser still needs it. */
+    /* $7D04 is level 19's own dispenser, and it is not the generic one.  It
+       refuses to act at all while $FF7404 still names a live room object, so
+       exactly one mallet is ever on the catwalk; once that one is gone it
+       counts down a fresh $40..$5F frames, walks its column counter to the
+       next of three, and lowers the next mallet from $68 two pixels a frame.
+       The elephant supplies no ammunition itself -- $9742 pops its bubbles --
+       so without this the final room had nothing to throw. */
+    if(g_boss_class==5&&g_boss_invuln==0&&!g_boss_defeated){
+        int any_crate=0;
+        for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
+        if(any_crate)g_boss19_ammo_delay=0;
+        else if(g_boss19_ammo_delay==0){
+            g_boss19_ammo_delay=(int)(boss_random()&0x1F)+0x40;
+            g_boss19_ammo_slot=(g_boss19_ammo_slot+1)%3;
+        }else if(--g_boss19_ammo_delay==0){
+            for(i=0;i<MAX_CRATES;++i)if(!g_crates[i].active){
+                g_crates[i].active=1;g_crates[i].carried=0;g_crates[i].thrown=0;
+                g_crates[i].flight_timer=0;g_crates[i].extra=5;
+                /* $7D70: $98 + column*$40, in the same +$80 room space. */
+                g_crates[i].x=(s32)(0x98-BOSS_ROOM_BIAS+g_boss19_ammo_slot*0x40)<<FIX_SHIFT;
+                g_crates[i].y=(s32)BOSS19_AMMO_TOP_Y<<FIX_SHIFT;
+                g_crates[i].vx=0;g_crates[i].vy=2*FIX_ONE;break;
+            }
+        }
+    }
     if(g_boss_class==0&&g_boss_invuln==0&&(g_boss_timer%120)==1){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
