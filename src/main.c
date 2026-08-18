@@ -492,7 +492,10 @@ static int g_boss16_pick_count;
 #define BOSS_SHOT_BUBBLE 2   /* $1A3, spouted by $965E */
 #define BOSS_SHOT_BOMB   3   /* $1A8 on the $9262 arc */
 #define BOSS_SHOT_BELL   4   /* $B4 lowered by $9CE6 */
-typedef struct { s32 x,y,vx,vy; short timer; unsigned char active,kind,phase; } BossShot;
+/* rx/ry are where the object is drawn: an object stepped on the source's
+   thirty-hertz pass would otherwise stand still for a field and jump two
+   steps on the next, which reads as a stutter on a sixty-hertz display. */
+typedef struct { s32 x,y,vx,vy,rx,ry; short timer; unsigned char active,kind,phase; } BossShot;
 static BossShot g_boss_shots[MAX_BOSS_SHOTS];
 /* $9596 jolts the plane when the elephant lands. */
 static int g_screen_shake;
@@ -512,6 +515,8 @@ static int g_boss19_ammo_delay,g_boss19_ammo_slot;
    g_boss19_tick stands in for $FF002A, which $95CE tests for its own
    half-speed walk and which counts passes, not fields. */
 static int g_boss19_field,g_boss19_tick;
+/* Where the boss body is drawn, for the same reason as BossShot's rx/ry. */
+static s32 g_boss_draw_x,g_boss_draw_y,g_boss_pass_x,g_boss_pass_y;
 
 /* Boss 3's handler at MD $806A is a byte-pair action script.  The first byte
    selects the movement state and the second is the source direction flag.
@@ -4009,6 +4014,34 @@ static int emit_boss_cells(u16 *satb,int n,const BossVisualData *v,int frame,
     return n;
 }
 
+/* One entry per loose crate, up to the caller's SATB ceiling. */
+static int emit_crate_sprites(u16 *satb,int n,int limit)
+{
+    int i;
+    for (i = 0; i < MAX_CRATES && n < limit; ++i) {
+        int sx, sy;
+        if (!g_crates[i].active || g_crates[i].carried) continue;
+        sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
+        sy = (int)(g_crates[i].y >> FIX_SHIFT) - g_camera_y + bowser_room_object_y_offset();
+        if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
+        {u16 addr=CRATE_BASE_WORD,pal=(u16)(g_in_boss?PLAYER_SPR_PAL:0); int width=2,height=2;
+        if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
+           (g_in_boss&&g_boss_class==1)){
+            addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
+        }else if(g_in_boss&&g_boss_class==2){
+            addr=BOSS_CRATE4_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;width=1;
+        }else if(g_in_boss&&g_boss_class==3){
+            addr=(u16)(BOSS_BOMB_BASE_WORD+((g_state_frame>>3)&1)*256);pal=BOSS_ITEM_SPR_PAL;
+        }else if(g_in_boss&&g_boss_class==4){
+            addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
+        }else if(g_in_boss&&g_boss_class>0){
+            addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;
+        }
+        set_sprite_entry(satb,n++,sx,sy,addr,(u16)(VDC_SPR_PRIO_SP | (width==2?VDC_SPR_X_WIDTH_2:0) | (height==2?VDC_SPR_Y_HEIGHT_2:0) | pal));}
+    }
+    return n;
+}
+
 static void draw_game_sprites(void)
 {
     static u16 satb[64 * 4];
@@ -4068,8 +4101,8 @@ static void draw_game_sprites(void)
         /* Hurt includes an impact puff four pixels above the body, so its
            capture origin needs +4 relative to the old value to keep Bowser's
            feet aligned with the neighboring walk poses. */
-        int bx=(int)(g_boss_x>>FIX_SHIFT),cx,cy;
-        int by=(int)(g_boss_y>>FIX_SHIFT)+bowser_room_object_y_offset();
+        int bx=(int)(g_boss_draw_x>>FIX_SHIFT),cx,cy;
+        int by=(int)(g_boss_draw_y>>FIX_SHIFT)+bowser_room_object_y_offset();
         unsigned long long mask;
         u16 flip=(g_boss_face<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
@@ -4212,27 +4245,16 @@ static void draw_game_sprites(void)
             (u16)(VDC_SPR_PRIO_SP|player_pal));
     }
 
-    for (i = 0; i < MAX_CRATES && n < 54; ++i) {
-        int sx, sy;
-        if (!g_crates[i].active || g_crates[i].carried) continue;
-        sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
-        sy = (int)(g_crates[i].y >> FIX_SHIFT) - g_camera_y + bowser_room_object_y_offset();
-        if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
-        {u16 addr=CRATE_BASE_WORD,pal=player_pal; int width=2,height=2;
-        if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
-           (g_in_boss&&g_boss_class==1)){
-            addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
-        }else if(g_in_boss&&g_boss_class==2){
-            addr=BOSS_CRATE4_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;width=1;
-        }else if(g_in_boss&&g_boss_class==3){
-            addr=(u16)(BOSS_BOMB_BASE_WORD+((g_state_frame>>3)&1)*256);pal=BOSS_ITEM_SPR_PAL;
-        }else if(g_in_boss&&g_boss_class==4){
-            addr=BOSS_BELL_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
-        }else if(g_in_boss&&g_boss_class>0){
-            addr=BOSS_HAMMER_BASE_WORD;pal=BOSS_AUX_SPR_PAL;
-        }
-        set_sprite_entry(satb,n++,sx,sy,addr,(u16)(VDC_SPR_PRIO_SP | (width==2?VDC_SPR_X_WIDTH_2:0) | (height==2?VDC_SPR_Y_HEIGHT_2:0) | pal));}
-    }
+    /* A boss room keeps the order -- $6BA0's pool draws the boss ahead of
+       the room's boxes -- but not the ceiling.  The elephant alone is thirty-
+       six to forty-eight cells depending on its pose, and with the HUD and
+       Mario ahead of it the cursor stood at fifty-eight on the fatter ones,
+       past this loop's old limit of fifty-four: the room's one mallet blinked
+       out for as long as the elephant held a wide pose.  Ammunition is not
+       decoration here -- with no mallet on the catwalk the fight cannot be
+       won -- so in a boss room the loop runs to the edge of the bubbles' own
+       reservation instead. */
+    n=emit_crate_sprites(satb,n,g_in_boss?62:54);
 
     /* Traversal-critical Level-2 moving platforms get SATB priority over
        enemies so a busy screen cannot make the floor disappear. */
@@ -4457,7 +4479,7 @@ static void draw_game_sprites(void)
             int sx,sy;
             u16 addr,pal,ctrl;
             if(!s->active)continue;
-            sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT)+bowser_room_object_y_offset();
+            sx=(int)(s->rx>>FIX_SHIFT);sy=(int)(s->ry>>FIX_SHIFT)+bowser_room_object_y_offset();
             if(sx<-32||sx>255||sy<-32||sy>239)continue;
             /* $1A3 names tile 1216 -- the bubble -- three tiles square.
                1225 next door is the mallet, which is the room's ammunition
@@ -4680,6 +4702,8 @@ static void start_boss(int fade_in)
         y=origin[g_boss_class-3][1]-BOSS_ROOM_BIAS-g_boss_origin_dy[g_boss_class-3];
     }
     g_boss_x=(s32)x<<FIX_SHIFT;g_boss_y=(s32)y<<FIX_SHIFT;
+    g_boss_draw_x=g_boss_x;g_boss_draw_y=g_boss_y;
+    g_boss_pass_x=g_boss_x;g_boss_pass_y=g_boss_y;
     g_boss_ground_y=y;g_boss_vx=-2*FIX_ONE;g_boss_vy=0;
     g_boss_phase=0;g_boss_face=-1;
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
@@ -4856,6 +4880,7 @@ static void boss_spawn_shot(int kind,int x,int y,s32 vx,s32 vy)
         BossShot *s=&g_boss_shots[i];
         s->active=1;s->kind=(unsigned char)kind;s->phase=0;s->timer=0;
         s->x=(s32)x<<FIX_SHIFT;s->y=(s32)y<<FIX_SHIFT;s->vx=vx;s->vy=vy;
+        s->rx=s->x;s->ry=s->y;
         return;
     }
 }
@@ -4912,6 +4937,7 @@ static void update_boss_shots(int step)
         int sx,sy,py;
         if(!s->active)continue;
         if(s->kind==BOSS_SHOT_BUBBLE){
+            s32 was_x=s->x,was_y=s->y;
             /* $96CE carries it two pixels sideways a pass while $98CE lifts
                it.  $971A then drops it a pixel a pass and jitters it left or
                right instead -- the aimed drift belongs to the rise alone, so
@@ -4934,10 +4960,14 @@ static void update_boss_shots(int step)
                     s->y+=FIX_ONE;
                     s->x+=(boss_random()&1)?2*FIX_ONE:-2*FIX_ONE;
                 }
-            }
+                /* Show the half-way point on the pass and the whole step on
+                   the field between passes, so a bubble drifts instead of
+                   hopping two pixels every other field. */
+                s->rx=(was_x+s->x)>>1;s->ry=(was_y+s->y)>>1;
+            }else{s->rx=s->x;s->ry=s->y;}
         }else if(s->kind!=BOSS_SHOT_BOMB){
-            s->x+=s->vx;s->y+=s->vy;
-        }
+            s->x+=s->vx;s->y+=s->vy;s->rx=s->x;s->ry=s->y;
+        }else{s->rx=s->x;s->ry=s->y;}
         sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT);
         /* Nothing retires a bubble by position: $965E owns all four slots and
            $9742 is the only thing that empties them, so one that wanders off
@@ -5546,6 +5576,7 @@ static void update_boss_actor(void)
         /* Source HP-zero path at $16398 changes the boss state instead of
            erasing it. Keep the sprite visible while it launches/falls away. */
         g_boss_vy+=72;if(g_boss_vy>7*FIX_ONE)g_boss_vy=7*FIX_ONE;g_boss_y+=g_boss_vy;
+        g_boss_draw_x=g_boss_x;g_boss_draw_y=g_boss_y;
         if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();g_state=STATE_LEVEL_FADE;g_state_frame=0;}
         return;
     }
@@ -5555,6 +5586,7 @@ static void update_boss_actor(void)
        are testing against does move every frame. */
     if(g_boss_class==5)g_boss19_field^=1;
     step=(g_boss_class!=5)||!g_boss19_field;
+    if(step){g_boss_pass_x=g_boss_x;g_boss_pass_y=g_boss_y;}
     if(g_boss_invuln>0)--g_boss_invuln;
     else{
         ++g_boss_timer;
@@ -5564,6 +5596,9 @@ static void update_boss_actor(void)
         if(g_boss_invuln==0&&step){++g_boss19_tick;update_boss_motion();}
     }
     if(g_boss_class>=3)update_boss_shots(step);
+    /* Half a pass on the pass, the whole of it on the field between. */
+    if(step){g_boss_draw_x=(g_boss_pass_x+g_boss_x)>>1;g_boss_draw_y=(g_boss_pass_y+g_boss_y)>>1;}
+    else{g_boss_draw_x=g_boss_x;g_boss_draw_y=g_boss_y;}
     if(g_screen_shake>0)--g_screen_shake;
     /* The source dispenser ($7958) waits while its previous crate object is
        live.  Do the same so unused ammunition cannot carpet the catwalk.
