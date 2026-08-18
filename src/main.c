@@ -3001,6 +3001,16 @@ static void defeat_enemy(Enemy *e)
     e->vy=FIX_ONE;
 }
 
+/* The rolling boulder is scenery with a hitbox, not a creature: $B844 never
+   registers it with the defeat handler, so nothing Mario has -- a stomp, a
+   thrown crate, a fireball -- removes it.  It only leaves the stage by
+   rolling out of view.  Landing on one is a hit like touching it anywhere
+   else. */
+static int enemy_indestructible(const Enemy *e)
+{
+    return e->kind==ENEMY_KIND_BOULDER;
+}
+
 static void update_fireballs(void)
 {
     int i,j;
@@ -3020,6 +3030,7 @@ static void update_fireballs(void)
             int ex,ey,eh;
             if (!e->active || !e->spawned || e->defeated) continue;
             ex=(int)(e->x>>FIX_SHIFT); ey=(int)(e->y>>FIX_SHIFT); eh=e->height;
+            if (enemy_indestructible(e)) continue;
             if (aabb(x+4,y+5,16,14,ex+3,ey+3,18,eh-5)) {
                 /* Fire travels through a target after defeating it. */
                 defeat_enemy(e);
@@ -3251,6 +3262,7 @@ static void update_enemies(void)
     for (i=0;i<MAX_ENEMIES;++i) {
         Enemy *e=&g_enemies[i];
         int x,y,h,bottom;
+        int was_grounded;
 
         if (!e->active) continue;
         x=(int)(e->x>>FIX_SHIFT);
@@ -3664,6 +3676,12 @@ static void update_enemies(void)
             goto enemy_attack_checks;
         }
 
+        /* Grab the standing flag before gravity is applied.  The vertical
+           solver zeroes vy on landing, so vy==0 here means "was on a floor
+           last frame"; testing it after the += below made the ledge probe
+           further down unreachable and let every walker stroll off its
+           authored ledge. */
+        was_grounded=(e->vy==0);
         e->vy+=64;
         if (e->vy>4*FIX_ONE) e->vy=4*FIX_ONE;
 
@@ -3680,7 +3698,7 @@ static void update_enemies(void)
             if (solid_h(side,y+8)||solid_h(side,y+h-3) ||
                 enemy_crate_blocked(e,nx,y))
                 e->vx=-e->vx;
-            else if (enemy_turns_at_ledge(e) && e->vy==0 && e->vx &&
+            else if (enemy_turns_at_ledge(e) && was_grounded && e->vx &&
                      enemy_floor_under(x+3,x+e->width-4,bottom) &&
                      !enemy_floor_under(lead,lead,bottom))
                 /* A walker that is already standing on something will not step
@@ -3719,7 +3737,7 @@ static void update_enemies(void)
 enemy_attack_checks:
         /* A thrown crate is the single-hit projectile: it defeats one enemy
            and disappears. Fireballs deliberately differ and pass through. */
-        {
+        if (!enemy_indestructible(e)) {
             int c;
             for (c=0;c<MAX_CRATES;++c) {
                 int cx,cy;
@@ -3743,7 +3761,8 @@ enemy_attack_checks:
             int old_bottom=old_py+PLAYER_BODY_H-1;
             int new_bottom=py+PLAYER_BODY_H-1;
             int stomp_x=aabb(px+3,py+PLAYER_BODY_H-6,10,8,x+2,y-2,e->width-4,8);
-            if (g_vy>0 && stomp_x && old_bottom<=y+5 && new_bottom>=y) {
+            if (g_vy>0 && stomp_x && old_bottom<=y+5 && new_bottom>=y &&
+                !enemy_indestructible(e)) {
                 defeat_enemy(e);
                 g_jump_active=0;
                 g_bounce_active=1;
@@ -5708,7 +5727,12 @@ static void update_boss_actor(void)
             if(hith<=0){hitw=0;hith=0;}
         }
     }
-    else{hitx=bx+12;hity=by-8;hitw=72;hith=72;
+    /* The class-0 canvases carry Bowser from row 17 down to the bottom edge
+       at 96, and the image is drawn at by-9, so his body runs by+8..by+87 --
+       79 tall, not the 72 the old value assumed, and the shortfall was all at
+       the foot end.  That left the box covering only his head and shell while
+       a crate thrown along the floor passed under his legs untouched. */
+    else{hitx=bx+12;hity=by+8;hitw=72;hith=79;
         if(g_boss_hit_offsets[g_current_level*2]>0)hitx=bx+(g_boss_hit_offsets[g_current_level*2]>>1);
         if(g_boss_hit_offsets[g_current_level*2+1]>0)hith=g_boss_hit_offsets[g_current_level*2+1];
         if(hith<48)hith=64;if(hith>88)hith=88;
