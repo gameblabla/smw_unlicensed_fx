@@ -10,6 +10,7 @@ void music_transition_to_level(int level_index);
 void music_prepare_level_transition(int next_level_index);
 void music_transition_to_boss(void);
 void music_transition_to_continue(void);
+void music_transition_to_staff(void);
 void music_stop_for_transition(void);
 /* Start a newly queued cue while the caller has the video fully black.  This
  * deliberately performs the CD seek/play command at that point, rather than

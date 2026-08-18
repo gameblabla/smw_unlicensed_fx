@@ -25,6 +25,7 @@
 #include "audio_stub.h"
 #include "music.h"
 #include "game_levels_generated.h"
+#include "staff_roll.h"
 /* Generated VRAM layout: see tools/vram_map.py, which owns every address
    below and rejects banks that would overlap while both are resident. */
 #include "vram_map.h"
@@ -224,6 +225,9 @@ extern void pcfx_tetsu_wait_frame(void);
 #define STATE_CONTINUE_FADE 8
 #define STATE_LEVEL_FADE 9
 #define STATE_STAGE_PREP 10
+#define STATE_STAFF_LOAD 11
+#define STATE_STAFF      12
+#define STATE_STAFF_OUT  13
 
 #define PMODE_NORMAL     0
 #define PMODE_DYING      1
@@ -417,6 +421,9 @@ static unsigned g_boot_dual_load_pos;
 static u16 g_title_exact_palette[256];
 
 static int g_fireball_ammo;
+/* Fireball pickups are the game's power-ups and they follow the player from
+   one stage to the next: only a fresh start or a death resets the count. */
+static int g_keep_ammo=0;
 static int g_continue_digit;
 static int g_continue_resume;
 static int g_current_level=0;
@@ -4665,7 +4672,8 @@ static void start_boss(int fade_in)
     g_player_x=(s32)x<<FIX_SHIFT;g_player_y=(s32)y<<FIX_SHIFT;
     g_vx=g_vy=0;g_grounded=(y>=144);g_facing=1;
     g_player_anim_clock=0;g_jump_active=0;g_bounce_active=0;g_camera_x=0;g_camera_tile=0;g_camera_hold=0;
-    g_fireball_ammo=3;g_player_hearts=PLAYER_MAX_HEARTS;g_invuln=0;g_hurt_pending_death=0;g_throw_timer=0;g_death_timer=0;
+    if(!g_keep_ammo)g_fireball_ammo=3;g_keep_ammo=0;
+    g_player_hearts=PLAYER_MAX_HEARTS;g_invuln=0;g_hurt_pending_death=0;g_throw_timer=0;g_death_timer=0;
 
     /* Loader $6CDE reads three words from $6DBA. The first two are the boss
        object position in the same +$80 coordinate system; the third is a
@@ -5774,7 +5782,8 @@ static void start_gameplay(int fade_in)
     g_jump_active=0; g_jump_index=0;
     g_bounce_active=0; g_bounce_index=0;
     g_camera_hold=0;
-    g_fireball_ammo=3;
+    if(!g_keep_ammo)g_fireball_ammo=3;
+    g_keep_ammo=0;
     g_player_hearts=PLAYER_MAX_HEARTS;
     g_invuln=0;
     g_hurt_pending_death=0;
@@ -5841,10 +5850,11 @@ static void update_play(u16 btn, u16 pressed)
             Stop_Sound_Sample(SFX_PLAYER_HURT,0);
             /* A normal death consumes one reserve life.  Do not enter the
                CONTINUE room while reserves remain: reload the current level
-               from its source spawn instead.  This also deliberately exits a
-               boss arena so a death resumes from the level, not mid-boss. */
+               from its source spawn instead.  A death inside a boss arena
+               reloads that arena, so the fight restarts rather than the
+               level that led into it. */
             if (g_lives>0) --g_lives;
-            if (g_lives>0) start_gameplay(1);
+            if (g_lives>0) {if (g_in_boss) start_boss(1); else start_gameplay(1);}
             else if (g_continues>0) load_continue_hidden();
             else enter_boot();
         }
@@ -6218,6 +6228,402 @@ static void draw_menu_people(int walking)
     submit_front_satb(satb);
 }
 
+#include "staff_font_generated.h"
+
+/* ------------------------------------------------------------------ *
+ * Staff roll.
+ *
+ * The Mega Drive ending scrolls its cast and staff over a moving field.  The
+ * port rebuilds that from parts it already has: the credit stream lives in
+ * src/staff_roll.c, the glyphs are expanded out of the 1bpp table in
+ * src/staff_font_generated.h, and each named family is drawn from its own
+ * level enemy bank rather than from a separate ending art set.
+ *
+ * Plane assignment follows the rest of the game.  VDC0 carries the starfield,
+ * which is opaque and scrolls on its full 64x64 map, and VDC1 carries the text
+ * on the 64x32 foreground map, whose index-0 cells let the stars through.  The
+ * text map wraps every 256 lines, so rows are refilled from the stream as they
+ * leave the top edge.
+ * ------------------------------------------------------------------ */
+
+/* Glyph tiles reuse the foreground tile bank, which no other staff-roll bank
+   touches.  Index 0 is the space glyph, so a blank cell is a real transparent
+   tile rather than tile 0 aliasing the BAT. */
+#define STAFF_FONT_TILE_BASE_WORD FG_TILE_BASE_WORD
+#define STAFF_FONT_TILE_INDEX (STAFF_FONT_TILE_BASE_WORD / TILE_WORDS)
+#define STAFF_BLANK_CELL ((u16)STAFF_FONT_TILE_INDEX)
+/* Starfield tiles: one empty plus eight sparse patterns, on VDC0. */
+#define STAFF_STAR_TILE_BASE_WORD BG_TILE_BASE_WORD
+#define STAFF_STAR_TILE_INDEX (STAFF_STAR_TILE_BASE_WORD / TILE_WORDS)
+#define STAFF_STAR_TILE_COUNT 9
+/* Cast art starts above the glyph bank and has the rest of VDC1 to itself. */
+#define STAFF_ENEMY_BASE_WORD 0x1000
+#define STAFF_ENEMY_TOP_WORD  0xE000
+#define STAFF_ENEMY_PAL0 4
+#define STAFF_ENEMY_PAL_COUNT 12
+#define STAFF_KIND_COUNT 13
+/* One text line every 16 lines, i.e. every second BAT row. */
+#define STAFF_LINE_PITCH 16
+#define STAFF_VISIBLE_COLS 32
+#define STAFF_TEXT_MAP_ROWS 32
+/* 8.8 pixels of scroll per frame.  The roll is 88 seconds at this rate, which
+   is the length of the staff cue on the disc. */
+#define STAFF_SCROLL_STEP 78
+#define STAFF_FADE_FRAMES 48
+
+static u16 g_staff_palette[256];
+static short g_staff_enemy_variant[STAFF_KIND_COUNT];
+static u16 g_staff_enemy_vram[STAFF_KIND_COUNT];
+static unsigned char g_staff_enemy_pal[STAFF_KIND_COUNT];
+static s32 g_staff_scroll;      /* 8.8 pixels */
+/* Scroll targets, published at frame wrap by commit_staff_scroll().  Writing
+   either plane's registers from update_staff() lands after that frame's
+   palette and SATB burst has already started, and the VDC restarts its line
+   fetch from the new BYR where the write falls -- which repeats the top of the
+   text plane a dozen lines down.  This is the same split commit_stage_camera()
+   exists to keep out of gameplay. */
+static u16 g_staff_scroll_y, g_staff_star_x, g_staff_star_y;
+
+static void commit_staff_scroll(void)
+{
+    vdc_set_scroll(FRONT_CHIP,0,g_staff_scroll_y);
+    vdc_set_scroll(BACK_CHIP,g_staff_star_x,g_staff_star_y);
+}
+static int g_staff_filled_row;  /* next absolute 8-line row to write */
+static int g_staff_total_px;
+static int g_staff_done;
+
+static void staff_upload_font(void)
+{
+    int g,row;
+    vdc_set_vram_write(FRONT_CHIP, STAFF_FONT_TILE_BASE_WORD);
+    for (g=0;g<STAFF_FONT_GLYPH_COUNT;++g) {
+        const unsigned char *bits=&g_staff_font[g*8];
+        /* Colour 1 is the face and colour 2 the drop shadow one pixel down and
+           right, which is what keeps the text readable over the stars.  Both
+           live in the low pair of bitplanes, so the high pair is all zero. */
+        for (row=0;row<8;++row) {
+            unsigned face=bits[row];
+            unsigned shadow=(row?bits[row-1]:0u)>>1;
+            shadow&=~face;
+            vdc_vram_write(FRONT_CHIP,(u16)(face|(shadow<<8)));
+        }
+        for (row=0;row<8;++row) vdc_vram_write(FRONT_CHIP,0);
+    }
+}
+
+/* A cheap deterministic sequence: the starfield only needs to look unplanned,
+   and a table of star positions would cost ROM for no visible gain. */
+static unsigned g_staff_rand;
+static unsigned staff_rand(void)
+{
+    g_staff_rand=g_staff_rand*1103515245u+12345u;
+    return (g_staff_rand>>16)&0x7FFF;
+}
+
+static void staff_upload_stars(void)
+{
+    int t,row,i;
+    vdc_set_vram_write(BACK_CHIP, STAFF_STAR_TILE_BASE_WORD);
+    for (row=0;row<TILE_WORDS;++row) vdc_vram_write(BACK_CHIP,0);
+    for (t=1;t<STAFF_STAR_TILE_COUNT;++t) {
+        u16 p0[8],p1[8];
+        for (row=0;row<8;++row) { p0[row]=0; p1[row]=0; }
+        /* One to three stars a tile, each in one of the three brightnesses
+           held in palette entries 1..3, which the twinkle then cycles. */
+        for (i=0;i<1+(int)(staff_rand()%3);++i) {
+            int x=(int)(staff_rand()&7), y=(int)(staff_rand()&7);
+            int c=1+(int)(staff_rand()%3);
+            if (c&1) p0[y]|=(u16)(1<<(7-x));
+            if (c&2) p1[y]|=(u16)(1<<(7-x));
+        }
+        for (row=0;row<8;++row) vdc_vram_write(BACK_CHIP,(u16)(p0[row]|(p1[row]<<8)));
+        for (row=0;row<8;++row) vdc_vram_write(BACK_CHIP,0);
+    }
+}
+
+static void staff_fill_star_bat(void)
+{
+    int i;
+    /* The full 64x64 map, so the field wraps every 512 pixels in both axes and
+       the diagonal drift never shows a seam. */
+    vdc_set_vram_write(BACK_CHIP, BG_BAT_BASE_WORD);
+    for (i=0;i<BG_BAT_WORDS;++i) {
+        /* Roughly one cell in five carries a star; the rest are the empty tile
+           so the field reads as sparse rather than as noise. */
+        int t=(staff_rand()%5)?0:(1+(int)(staff_rand()%(STAFF_STAR_TILE_COUNT-1)));
+        vdc_vram_write(BACK_CHIP,(u16)(STAFF_STAR_TILE_INDEX+t));
+    }
+}
+
+static int staff_find_variant(int kind)
+{
+    int l,i;
+    /* The cast is drawn from the ordinary stages: a family's first appearance
+       carries the palette and pose the player actually met it with. */
+    for (l=0;l<19;++l) {
+        const GameLevelData *g=&g_game_levels[l];
+        if (g_boss_level_flags[l]) continue;
+        for (i=0;i<(int)g->enemy_count;++i) {
+            if (g->enemies[i*ENEMY_RECORD_WORDS+7]!=kind) continue;
+            {
+                int lv=g->enemies[i*ENEMY_RECORD_WORDS+2];
+                if (lv>=0 && lv<(int)g->variant_count) return g->variant_ids[lv];
+            }
+        }
+    }
+    return -1;
+}
+
+static void staff_upload_cast(void)
+{
+    int k,i,j,uniq=0,top=STAFF_ENEMY_BASE_WORD;
+    const unsigned short *seen[STAFF_ENEMY_PAL_COUNT];
+    for (k=0;k<STAFF_KIND_COUNT;++k) {
+        const EnemyVariantData *v; int gi,fw,line=-1;
+        g_staff_enemy_variant[k]=-1;
+        gi=staff_find_variant(k);
+        if (gi<0) continue;
+        v=&g_enemy_variants[gi];
+        fw=enemy_frame_words(v);
+        if (top+fw*2>STAFF_ENEMY_TOP_WORD) continue;
+        /* Families that share a source palette share a line here too: sixteen
+           lines have to cover the stars, three text colours and the whole
+           cast at once. */
+        for (j=0;j<uniq;++j)
+            if (palettes_equal(seen[j],v->palette)) { line=STAFF_ENEMY_PAL0+j; break; }
+        if (line<0) {
+            if (uniq>=STAFF_ENEMY_PAL_COUNT) continue;
+            seen[uniq]=v->palette;
+            line=STAFF_ENEMY_PAL0+uniq;
+            for (i=0;i<16;++i) g_staff_palette[line*16+i]=v->palette[i];
+            ++uniq;
+        }
+        g_staff_enemy_variant[k]=(short)gi;
+        g_staff_enemy_pal[k]=(unsigned char)line;
+        g_staff_enemy_vram[k]=(u16)top;
+        /* Both walk cels, so the cast animates while it scrolls past. */
+        vdc_set_vram_write(FRONT_CHIP,(u16)top);
+        for (i=0;i<fw*2;++i) vdc_vram_write(FRONT_CHIP,v->words[i]);
+        top+=fw*2;
+    }
+}
+
+static void staff_build_palette(void)
+{
+    int i;
+    for (i=0;i<256;++i) g_staff_palette[i]=YUV_BLACK;
+    /* Line 0 is the starfield on VDC0.  Entry 0 is the night sky itself, and
+       1..3 are the three star brightnesses. */
+    g_staff_palette[0]=0x0A98;
+    g_staff_palette[1]=0x6298;
+    g_staff_palette[2]=0xB298;
+    g_staff_palette[3]=0xFF88;
+    /* Text lines: entry 1 is the face and entry 2 the shadow. */
+    g_staff_palette[STAFF_PAL_TITLE*16+1]=0xCA4B;  /* gold   */
+    g_staff_palette[STAFF_PAL_TITLE*16+2]=YUV_BLACK;
+    g_staff_palette[STAFF_PAL_NAME*16+1]=0xFF88;   /* white  */
+    g_staff_palette[STAFF_PAL_NAME*16+2]=YUV_BLACK;
+    g_staff_palette[STAFF_PAL_BODY*16+1]=0xBFA4;   /* cyan   */
+    g_staff_palette[STAFF_PAL_BODY*16+2]=YUV_BLACK;
+}
+
+static void set_staff_palette_fade(int level)
+{
+    int i;
+    for (i=0;i<256;++i) tetsu_set_palette((u16)i,fade_yuv(g_staff_palette[i],level));
+}
+
+/* Twinkle by rotating the three star brightnesses through palette 1..3 rather
+   than by rewriting any tile, so it costs three palette writes a second. */
+static void staff_twinkle(int level)
+{
+    static const u16 ramp[3]={0x6298,0xB298,0xFF88};
+    int phase=(int)((g_state_frame/20)%3),i;
+    for (i=0;i<3;++i)
+        tetsu_set_palette((u16)(1+i),fade_yuv(ramp[(i+phase)%3],level));
+}
+
+static void staff_fill_row(int abs_row)
+{
+    u16 cells[STAFF_VISIBLE_COLS];
+    int i,line,col,len;
+    const StaffLine *sl;
+    const char *s;
+    for (i=0;i<STAFF_VISIBLE_COLS;++i) cells[i]=STAFF_BLANK_CELL;
+    /* Text sits on the first BAT row of each 16-line slot; the second is the
+       gap between lines. */
+    if ((abs_row&1)==0) {
+        line=abs_row>>1;
+        if (line>=0 && line<(int)g_staff_line_count) {
+            sl=&g_staff_lines[line];
+            s=sl->text;
+            if (s) {
+                for (len=0;s[len];++len) {}
+                col=(sl->col==STAFF_COL_CENTER)?((STAFF_VISIBLE_COLS-len)/2):(int)sl->col;
+                if (col<0) col=0;
+                for (i=0;i<len && col+i<STAFF_VISIBLE_COLS;++i) {
+                    int c=(unsigned char)s[i]-STAFF_FONT_FIRST_CHAR;
+                    if (c<0 || c>=STAFF_FONT_GLYPH_COUNT) c=0;
+                    cells[col+i]=(u16)(((u16)sl->pal<<12)|(STAFF_FONT_TILE_INDEX+c));
+                }
+            }
+        }
+    }
+    vdc_set_vram_write(FRONT_CHIP,
+        (u16)(FG_BAT_BASE_WORD+(abs_row&(STAFF_TEXT_MAP_ROWS-1))*FG_BAT_W));
+    for (i=0;i<STAFF_VISIBLE_COLS;++i) vdc_vram_write(FRONT_CHIP,cells[i]);
+    /* The map is 64 cells wide against a 256-pixel screen; blank the offscreen
+       half so a horizontal scroll never exposes stale glyphs. */
+    for (;i<FG_BAT_W;++i) vdc_vram_write(FRONT_CHIP,STAFF_BLANK_CELL);
+}
+
+static void staff_fill_ahead(void)
+{
+    int scroll_px=(int)(g_staff_scroll>>FIX_SHIFT);
+    /* Writing absolute row R replaces the cell row that is still showing row
+       R-32, so R may only be written once that older row is entirely above the
+       top edge -- R-32 < scroll/8, against the cell row the top line actually
+       falls in and not against the raw pixel.  That still reaches one row past
+       the bottom of the 240-line screen, so nothing scrolls in blank. */
+    while (g_staff_filled_row*8 <= (scroll_px&~7)+248) {
+        staff_fill_row(g_staff_filled_row);
+        ++g_staff_filled_row;
+    }
+}
+
+static void draw_staff_sprites(void)
+{
+    static u16 satb[64*4];
+    int i,n=0,scroll_px=(int)(g_staff_scroll>>FIX_SHIFT);
+    for (i=0;i<64*4;++i) satb[i]=0;
+    for (i=0;i<(int)g_staff_line_count && n<62;++i) {
+        const StaffLine *sl=&g_staff_lines[i];
+        const EnemyVariantData *v;
+        int kind=sl->enemy_kind,cx,cy,cols,rows,sx,sy,frame; unsigned mask; u16 base;
+        if (kind<0 || kind>=STAFF_KIND_COUNT) continue;
+        if (g_staff_enemy_variant[kind]<0) continue;
+        v=&g_enemy_variants[g_staff_enemy_variant[kind]];
+        cols=v->cols; rows=v->rows;
+        /* Centre the metasprite on its own name row and right-align it against
+           the text column, so tall and short families share a baseline. */
+        sy=i*STAFF_LINE_PITCH+4-(rows*16)/2-scroll_px;
+        sx=104-cols*16;
+        if (sy<-64 || sy>240) continue;
+        frame=(int)((g_state_frame/12)&1);
+        mask=frame?v->mask1:v->mask0;
+        base=(u16)(g_staff_enemy_vram[kind]+(frame?enemy_frame_words(v):0));
+        for (cy=0;cy<rows && n<62;++cy) for (cx=0;cx<cols && n<62;++cx) {
+            int cell=cy*cols+cx;
+            if (!(mask&(1u<<cell))) continue;
+            set_sprite_entry(satb,n++,sx+cx*16,sy+cy*16,(u16)(base+cell*64),
+                (u16)(VDC_SPR_PRIO_SP|g_staff_enemy_pal[kind]));
+        }
+    }
+    submit_front_satb(satb);
+}
+
+static void enter_staff(void)
+{
+    int i;
+    /* Both outputs are already black when the ending reaches here, and the
+       uploads below span more than one frame. */
+    vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
+    vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
+    for (i=0;i<256;++i) tetsu_set_palette((u16)i,YUV_BLACK);
+    clear_satb();
+    clear_bat(FRONT_CHIP,FG_BAT_WORDS);
+    /* VDC0 keeps its full 64x64 map for the star drift; VDC1 wraps every 256
+       lines, which is what the row refill below is written against. */
+    set_map_height(BACK_CHIP,0);
+    set_map_height(FRONT_CHIP,1);
+    g_staff_scroll_y=0; g_staff_star_x=0; g_staff_star_y=0;
+    commit_staff_scroll();
+
+    g_staff_rand=0x1F2E3D4Cu;
+    staff_build_palette();
+    staff_upload_font();
+    staff_upload_stars();
+    staff_fill_star_bat();
+    staff_upload_cast();
+
+    g_staff_scroll=0;
+    g_staff_filled_row=0;
+    g_staff_done=0;
+    /* Run the last line clear of the top edge before the fade-out begins. */
+    g_staff_total_px=(int)g_staff_line_count*STAFF_LINE_PITCH;
+    staff_fill_ahead();
+    draw_staff_sprites();
+
+    g_in_boss=0;
+    music_stop_for_transition();
+    music_transition_to_staff();
+    music_start_at_black();
+    g_state=STATE_STAFF_LOAD;
+    g_state_frame=0;
+}
+
+static void update_staff(u16 pressed)
+{
+    int level,scroll_px;
+    if (g_state==STATE_STAFF_LOAD) {
+        /* One complete black frame after the uploads before either plane is
+           published, matching the stage loader. */
+        if (g_state_frame>=2) {
+            vdc_setreg(BACK_CHIP,VDC_REG_CR,VDC_CR_BB);
+            vdc_setreg(FRONT_CHIP,VDC_REG_CR,(u16)(VDC_CR_BB|VDC_CR_SB));
+            g_state=STATE_STAFF; g_state_frame=0;
+        }
+        return;
+    }
+    if (g_state==STATE_STAFF_OUT) {
+        level=16-(int)(g_state_frame*16/STAFF_FADE_FRAMES);
+        if (level<0) level=0;
+        set_staff_palette_fade(level);
+        if (g_state_frame>=(unsigned)STAFF_FADE_FRAMES) {
+            clear_front_sprites();
+            set_front_sprites_enabled(0);
+            music_stop_for_transition();
+            enter_boot();
+        }
+        return;
+    }
+
+    if (g_state_frame<(unsigned)STAFF_FADE_FRAMES) {
+        level=(int)(g_state_frame*16/STAFF_FADE_FRAMES);
+        set_staff_palette_fade(level);
+    } else {
+        /* Past the fade the palette is static, so only the three star entries
+           are rewritten each frame; a full 256-entry pass every frame is more
+           VBlank than this screen has to spend. */
+        level=16;
+    }
+    staff_twinkle(level);
+
+    /* RUN skips the rest of the roll rather than dropping straight out of it,
+       so the fade to the title is the same either way. */
+    if (!g_staff_done && (pressed&(JOY_RUN|JOY_I|JOY_II))) {
+        g_staff_done=1;
+        g_state=STATE_STAFF_OUT; g_state_frame=0;
+        return;
+    }
+
+    g_staff_scroll+=STAFF_SCROLL_STEP;
+    scroll_px=(int)(g_staff_scroll>>FIX_SHIFT);
+    staff_fill_ahead();
+    g_staff_scroll_y=(u16)(scroll_px&255);
+    /* The stars drift the other way and more slowly than the text, which reads
+       as depth behind it. */
+    g_staff_star_x=(u16)((g_state_frame/4)&511);
+    g_staff_star_y=(u16)((512-((g_state_frame/6)&511))&511);
+    draw_staff_sprites();
+
+    if (scroll_px>g_staff_total_px) {
+        g_staff_done=1;
+        g_state=STATE_STAFF_OUT; g_state_frame=0;
+    }
+}
+
 static void enter_boot(void)
 {
     music_transition_to_title();
@@ -6264,6 +6670,7 @@ static void enter_menu(void)
 
 static void update_frontend(u16 pressed)
 {
+    if (g_state>=STATE_STAFF_LOAD) { update_staff(pressed); return; }
     if (g_state==STATE_BOOT) {
         if (g_state_frame<BOOT_EXACT_FRAME_COUNT) {
             /* One PC-FX frame for every captured Mega Drive frame 12..600. */
@@ -6422,8 +6829,9 @@ static void update_frontend(u16 pressed)
         if (g_state_frame>=32) {
             Stop_Sound_Sample(SFX_MENU_CONFIRM,0);
             if (g_continue_resume) {
-                /* Continue resumes the current level from its normal spawn. */
-                start_gameplay(1);
+                /* Continue resumes where the run ended: the current level
+                   from its normal spawn, or the boss room it died in. */
+                if (g_in_boss) start_boss(1); else start_gameplay(1);
             } else enter_boot();
             return;
         }
@@ -6435,14 +6843,15 @@ static void update_frontend(u16 pressed)
                background and sprite palettes have reached black, blank the
                sprite plane before replacing the scene underneath it. */
             clear_front_sprites(); set_front_sprites_enabled(0);
+            g_keep_ammo=1;
             if(g_after_boss){
                 ++g_current_level; g_in_boss=0; g_after_boss=0;
-                if(g_current_level>=19){enter_boot();return;}
+                if(g_current_level>=19){g_keep_ammo=0;enter_staff();return;}
                 start_gameplay(1); return;
             }
             if(g_boss_level_flags[g_current_level]){start_boss(1);return;}
             ++g_current_level;
-            if(g_current_level>=19){enter_boot();return;}
+            if(g_current_level>=19){g_keep_ammo=0;enter_staff();return;}
             start_gameplay(1); return;
         }
     }
@@ -6455,12 +6864,18 @@ int main(void)
     audio_init();
     music_init();
     enter_boot();
+#ifdef FORCE_STAFF
+    /* Build with EXTRA_CFLAGS=-DFORCE_STAFF to boot straight into the roll. */
+    enter_staff();
+#endif
 
     for (;;) {
         u16 btn, pressed;
         wait_frame();
         if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE)
             commit_stage_camera();
+        else if (g_state==STATE_STAFF)
+            commit_staff_scroll();
         btn = read_buttons();
         pressed = (u16)(btn & (u16)~g_prev_buttons);
         g_prev_buttons = btn;

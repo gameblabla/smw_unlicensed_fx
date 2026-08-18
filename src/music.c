@@ -146,6 +146,13 @@ void music_transition_to_continue(void)
     music_transition_to(CDDA_TRACK_CONTINUE, 0);
 }
 
+void music_transition_to_staff(void)
+{
+    /* The roll is paced to the length of this cue, but it loops rather than
+     * falling silent if the player holds the scroll past its end. */
+    music_transition_to(CDDA_TRACK_STAFF, 1);
+}
+
 void music_update(void)
 {
     switch (g_state) {

@@ -18,7 +18,7 @@ LDFLAGS := -L$(V810GCC)/lib -L$(V810GCC)/$(PREFIX)/lib \
            -L$(V810GCC)/lib/gcc/$(PREFIX)/4.9.4 \
            $(V810GCC)/$(PREFIX)/lib/crt0.o --gc-sections
 LIBS := -lpcfx -lc -lsim -lgcc
-SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/music.c src/game_levels_generated.c
+SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/music.c src/game_levels_generated.c src/staff_roll.c
 ASM_SRCS := src/pcfx_tetsu_wait.S
 OBJS := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRCS)) $(patsubst src/%.S,$(OBJDIR)/%.o,$(ASM_SRCS))
 ELF := $(OBJDIR)/$(TARGET).elf
@@ -60,7 +60,10 @@ VRAM_MAP_HEADER := src/vram_map.h
 # the VRAM layout against the current generated assets.
 $(VRAM_MAP_HEADER): tools/vram_map.py src/game_levels_generated.c src/assets_generated.c
 	python3 tools/vram_map.py
-$(OBJDIR)/main.o: $(VRAM_MAP_HEADER)
+STAFF_FONT_HEADER := src/staff_font_generated.h
+$(STAFF_FONT_HEADER): tools/build_staff_font.py
+	python3 tools/build_staff_font.py
+$(OBJDIR)/main.o: $(VRAM_MAP_HEADER) $(STAFF_FONT_HEADER)
 $(OBJDIR)/audio_stub.o: $(SFX_ADPCM_HEADER)
 $(SFX_ADPCM_HEADER): tools/build_sfx_adpcm.py $(SFX_WAVS)
 	python3 tools/build_sfx_adpcm.py
