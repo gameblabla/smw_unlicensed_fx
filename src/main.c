@@ -57,6 +57,13 @@ extern void pcfx_tetsu_wait_frame(void);
    remainder column follows them. */
 #define LEVEL8_WEDGE_R_RIGHT_WORD (LEVEL8_WEDGE_R_BASE_WORD+512)
 #define LEVEL8_OBJ_SPR_PAL 12
+/* The fireball's four poses are banked in the stage-object bank but authored
+   against a different source sprite line: its pixels are indices 10..15, which
+   on the level's own line 2 are the white/yellow/orange/red fire ramp ($AECE's
+   art shares those indices in slots 9 and 10).  The bank as a whole sits on
+   line 3 (STAGE_OBJECT_PAL_LINE), whose browns are the ledges, so the fireball
+   is drawn on line 2 -- already loaded as part of the level palette -- instead. */
+#define FIREBALL_SPR_PAL 2
 #define CONTINUE_TILE_BASE_INDEX (CONTINUE_TILE_BASE_WORD / TILE_WORDS)
 #define CONTINUE_LUIGI_BASE_WORD (CONTINUE_PLAYER_BASE_WORD + 2 * PLAYER_FRAME_WORDS_LOCAL)
 #define CONTINUE_PLAYER_SPR_PAL 14
@@ -158,6 +165,11 @@ extern void pcfx_tetsu_wait_frame(void);
    few static ledges, none of the objects the source actually paints in
    between them. */
 #define PLATFORM_KIND_PULSE    20   /* handler 13: $104AA */
+/* $AECE, the other state of the $B31E table.  Authored under the floor and
+   thrown 218 pixels up the $B01E arc, so it is a hazard rather than a carrier;
+   only slots 9 and 10 have any.  Its four poses are banked behind its record's
+   own shape in phase order, the way the spring's and the pulse's are. */
+#define PLATFORM_KIND_FIREBALL 21   /* $AECE, from the $B31E table */
 #define PLATFORM_KIND_IS_STAGE_OBJECT(k) ((k)>=PLATFORM_KIND_STATIC)
 /* $F934 wraps a descending carrier from y 0x1C2 back to 0x6E and $F980 wraps a
    climbing one from 0x64 back to 0x17C, in the object space the records store,
@@ -691,6 +703,18 @@ static const signed char g_boulder_arc[BOULDER_ARC_LEN]={
     8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,
     8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8,8
 };
+
+/* $B01E: the arc $AECE's red fireball climbs, fifty-two unsigned words that sum
+   to 218 -- the leap out of the floor -- and that it walks backwards to fall
+   back down.  Their handler is the other state of the $B31E table (state 3,
+   where $B086 is state 4), thrown straight up with an X that never changes. */
+#define FIREBALL_ARC_LEN 52
+static const signed char g_fireball_arc[FIREBALL_ARC_LEN]={
+    8,8,8,7,7,7,7,7,6,6,6,6,6,6,5,5,5,5,5,4,4,4,4,4,4,4,
+    4,4,4,4,4,4,4,4,3,3,3,3,3,3,3,2,2,2,2,2,2,1,1,1,1,1
+};
+/* $AF34/$AF7C drift ten more pixels up and ten back down at the apex. */
+#define FIREBALL_APEX_TICKS 10
 
 /* $C6E0: the leap of the water fish, one signed word a frame for the fifty-one
    steps $C62C counts off.  It is symmetric, so the fish returns to the exact
@@ -1915,8 +1939,10 @@ static void resolve_player_vertical(s32 next_y)
             MovingPlatform *p=&g_moving_platforms[i];
             int px, top, platform_w;
             /* The boulder is a hazard rolling through the stage, not one of
-               the carriers: $B086 keeps no standing surface. */
-            if (p->kind==PLATFORM_KIND_BOULDER || p->hidden) continue;
+               the carriers: $B086 keeps no standing surface, and neither does
+               the fireball $AECE throws up through the floor beside it. */
+            if (p->kind==PLATFORM_KIND_BOULDER ||
+                p->kind==PLATFORM_KIND_FIREBALL || p->hidden) continue;
             px=platform_draw_x(p); top=platform_draw_y(p);
             platform_w=platform_width(p);
             if (bx+PLAYER_BODY_W-3<=px || bx+3>=px+platform_w) continue;
@@ -2316,6 +2342,10 @@ static void init_moving_platforms(void)
             /* A pulse keeps its record's first pose here so its cycle can
                step forward through the three banked past it. */
             if (rec[3]==PLATFORM_KIND_PULSE) p->step=(unsigned char)rec[2];
+            /* A fireball does the same for the four poses $AECE names, and
+               starts where $B00C leaves it: at the bottom of its leap on the
+               rising pose, with the arc index at zero. */
+            if (rec[3]==PLATFORM_KIND_FIREBALL) p->step=(unsigned char)rec[2];
             /* $F78E starts its shuttle moving left; $F5B0 starts sinking. */
             p->dir=(rec[3]==PLATFORM_KIND_SINKER)?1:-1;p->speed=1;
             p->min_y=(short)ry;p->max_y=(short)(ry+32);
@@ -2458,6 +2488,62 @@ static void update_stage_object(MovingPlatform *p, int index)
                 hurt_player();
         }
         break;
+    case PLATFORM_KIND_FIREBALL: {   /* $AECE */
+        /* Four phases in the source object's $1C, with $1D as the phase's own
+           counter.  Nothing here is horizontal: the fireball is thrown 218
+           pixels straight up the $B01E arc over 52 frames, drifts ten more up
+           and ten back down a pixel a frame, then falls the same arc read
+           backwards and drops under the floor to start again. */
+        int sx=(int)(p->x>>FIX_SHIFT)-g_camera_x;
+        /* $B242 streams the record in on its tile trigger.  Every record here
+           is instantiated at level load instead, so hold it under the floor at
+           its authored Y until the camera reaches its column -- the same
+           moment -- rather than letting it cycle unseen. */
+        if (sx>SCREEN_W+96 || sx<-96) {
+            p->y=p->home_y;p->state=0;p->timer=0;
+            p->shape=(unsigned char)p->step;
+            break;
+        }
+        switch (p->state) {
+        case 0:  /* $AED8: rising, one arc entry a frame */
+            p->y-=(s32)g_fireball_arc[p->timer]<<FIX_SHIFT;
+            if (++p->timer>=FIREBALL_ARC_LEN) {p->state=1;p->timer=0;}
+            break;
+        case 1:  /* $AF34: ten more pixels up, a pixel a frame */
+            p->y-=FIX_ONE;
+            if (++p->timer>=FIREBALL_APEX_TICKS) {p->state=2;p->timer=0;}
+            break;
+        case 2:  /* $AF7C: and ten back down */
+            p->y+=FIX_ONE;
+            if (++p->timer>=FIREBALL_APEX_TICKS) {
+                p->y-=8*FIX_ONE;                       /* $AF8E */
+                p->state=3;p->timer=FIREBALL_ARC_LEN-1;/* $AF98 loads $33 */
+            }
+            break;
+        default: /* $AFC8: falling, the same arc walked backwards */
+            p->y+=(s32)g_fireball_arc[p->timer]<<FIX_SHIFT;
+            if (p->timer==0) {
+                /* $AFEE resets every one of them to object Y $190.  Each
+                   record is authored on its own floor line here, so return it
+                   to that instead; on the source's single-storey stages the
+                   two are the same place. */
+                p->y=p->home_y;p->state=0;p->timer=0;
+            } else --p->timer;
+            break;
+        }
+        /* $AF16/$AF5E/$AFAA/$B00C name one pose per phase, banked in phase
+           order behind the record's own shape. */
+        p->shape=(unsigned char)(p->step+p->state);
+        /* Like the boulder, it is a hazard and not a carrier. */
+        if (g_invuln==0) {
+            const unsigned short *sh=platform_shape(p);
+            int bw=sh?(int)sh[5]:16,bh=sh?(int)sh[6]:16;
+            if (aabb(player_body_x(),player_body_y(),PLAYER_BODY_W,PLAYER_BODY_H,
+                     platform_draw_x(p),platform_draw_y(p),bw,bh))
+                hurt_player();
+        }
+        break;
+    }
     case PLATFORM_KIND_LEVER:        /* $10836 */
         /* The lever never moves; it only latches $FF00BC under a rider and
            shows the pressed pose for as long as the latch is up. */
@@ -4116,10 +4202,12 @@ static void draw_game_sprites(void)
             const unsigned short *sh=platform_shape(mp);
             u16 base=(u16)(STAGE_OBJECT_BASE_WORD+sh[0]);
             int cols=sh[1],rows=sh[2],cy2,cx2;
+            u16 pal=(u16)((mp->kind==PLATFORM_KIND_FIREBALL)?
+                          FIREBALL_SPR_PAL:LEVEL8_OBJ_SPR_PAL);
             for(cy2=0;cy2<rows&&n<58;++cy2)for(cx2=0;cx2<cols&&n<58;cx2+=2){
                 u16 addr=(u16)(base+(cy2*cols+cx2)*64);
                 set_sprite_entry(satb,n++,sx+cx2*16,sy+cy2*16,addr,
-                    (u16)(VDC_SPR_PRIO_SP|((cols-cx2>=2)?VDC_SPR_X_WIDTH_2:0)|LEVEL8_OBJ_SPR_PAL));
+                    (u16)(VDC_SPR_PRIO_SP|((cols-cx2>=2)?VDC_SPR_X_WIDTH_2:0)|pal));
             }
         }else if(mp->kind==PLATFORM_KIND_BRICK){
             set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,

@@ -1235,6 +1235,7 @@ STAGE_OBJECT_KINDS={
     # Not a $F4FA handler: the falling boulder of the second object table
     # below, given a synthetic key so it can ride the same record pipeline.
     100:12, # $B086: drops from above the ceiling, then bounces and rolls
+    101:21, # $AECE: the fireball that leaps out of the floor and falls back
 }
 
 # $B242 streams a second, much smaller object table whose per-level pointers
@@ -1246,6 +1247,19 @@ STAGE_OBJECT_KINDS={
 # falls from above the ceiling and then bounces in place -- is reproduced here.
 BOULDER_TABLE=0xB31E
 BOULDER_STATE=4
+# State 3 of the same table is $AECE, the red fireball: it is authored below
+# the floor (every record's Y is 340..420) and leaps 218 pixels straight up on
+# the 52-entry arc at $B01E, hangs ten frames up and ten down, then falls the
+# same arc backwards and restarts at Y $190.  Nine records in all -- five in
+# slot 9 and four in slot 10 -- and dropping the state left both stages with
+# nothing coming out of their floors at all.
+FIREBALL_STATE=3
+# $AF16/$AF5E/$AFAA/$B00C write the pose for the phase that is starting.  Slot
+# 10 has its own four cels and every other slot shares one set; the last two of
+# each set are deliberately out of numeric order, which is why they cannot be
+# banked by simply counting up from the record's own metasprite.
+FIREBALL_CELS_DEFAULT=(0x7A,0x7B,0x86,0x85)
+FIREBALL_CELS={10:(0x98,0x99,0x9B,0x9A)}
 # Levels 2, 6 and 8 already spawn their records through make_level8_carriers()
 # and the hand-built level-2/6 lifts.
 STAGE_OBJECT_SKIP_SLOTS={2,6,8}
@@ -1338,6 +1352,7 @@ def make_stage_objects(r,routes,initdata):
             seg,tile,_slot,x,y,ms,state=[b16(r,off+i*2) for i in range(7)]
             off+=14
             if state==BOULDER_STATE: recs.append((seg,tile,x,y,ms,100))
+            elif state==FIREBALL_STATE: recs.append((seg,tile,x,y,ms,101))
         if not recs and not placed:
             levels.append(dict(shapes=[],words=[],records=[],palette=None)); continue
 
@@ -1376,6 +1391,15 @@ def make_stage_objects(r,routes,initdata):
             if rec[5]==13 and rec[4]+1 not in ids:
                 ids.extend((rec[4]+1,rec[4]+2,rec[4]+3))
                 assert ids.index(rec[4])+4==len(ids), 'pulse art must follow its record shape'
+            # $AECE's four poses are named by the handler, not by the record,
+            # and they are not consecutive.  Bank them behind the record's own
+            # in phase order so the runtime can reach them as shape+1..shape+3.
+            if rec[5]==101:
+                cels=FIREBALL_CELS.get(slot,FIREBALL_CELS_DEFAULT)
+                assert rec[4]==cels[0], f'slot {slot}: fireball record names cel {rec[4]}'
+                if cels[1] not in ids:
+                    ids.extend(cels[1:])
+                    assert ids.index(rec[4])+4==len(ids), 'fireball art must follow its record shape'
         for _wx,_wy,ms,_handler in placed:
             if ms not in ids: ids.append(ms)
         line=STAGE_OBJECT_PAL_LINE.get(slot,2)
@@ -1437,7 +1461,7 @@ def make_stage_objects(r,routes,initdata):
             # The boulder table is streamed by $B242 rather than $10A48 and its
             # positions are already tuned against the port, so only the $10B2A
             # handlers take the trigger-axis correction.
-            if handler==100: wx,wy=ba.world_x_for_trigger(seg,tile)+(x-0x180), y-128
+            if handler in (100,101): wx,wy=ba.world_x_for_trigger(seg,tile)+(x-0x180), y-128
             else: wx,wy=trigger_world(seg,tile,x,y,modes)
             out.append((wx, wy, ids.index(ms), STAGE_OBJECT_KINDS[handler]))
         for wx,wy,ms,handler in placed:
