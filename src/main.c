@@ -3891,6 +3891,25 @@ static int boss13_driver_flip_dx(int frame)
 /* Slot 19's cel byte to strip pose, from the level's cel table at $7400. */
 static const unsigned char BOSS19_CEL_FRAME[6]={0,1,2,4,4,3};
 
+/* $15C9C and $162FE read the body straight out of $18BAC for whichever
+   metasprite is drawn, and the elephant's five differ far too much for one
+   rectangle to stand in for them all: around the actor $270 is -48..55 by
+   -96..-1, $272 -56..55 by -96..31, $274 -56..55 by -104..-1, $276 -48..39
+   by -96..31 and $278 -56..47 by -80..55.  The port draws all five bottom
+   aligned in one 112x144 canvas with the actor at (56,144), which turns
+   those into the canvas rectangles below -- and every one of them ends at
+   the canvas floor, exactly as the source's boxes all end at the actor once
+   the pose's own storey offset is taken back out.  The old 96x80 at (8,8)
+   sat in the empty top of the canvas, sixty pixels clear of the elephant,
+   so a thrown mallet could only connect from a jump. */
+static const unsigned char g_boss19_box[5][4]={
+    { 8, 48,104, 96},   /* $270 */
+    { 0, 16,112,128},   /* $272 */
+    { 0, 40,112,104},   /* $274 */
+    { 8, 16, 88,128},   /* $276 */
+    { 0,  8,104,136},   /* $278 */
+};
+
 static int later_boss_frame(const BossVisualData *v)
 {
     int frame,t=g_boss_timer;
@@ -3946,7 +3965,11 @@ static int later_boss_frame(const BossVisualData *v)
         if(g_boss_defeated)frame=BOSS19_CEL_FRAME[4];
         else if(g_boss_invuln>0)frame=BOSS19_CEL_FRAME[3];
         else if(g_boss_cel)frame=BOSS19_CEL_FRAME[g_boss_cel%6];
-        else frame=(t/8)%2;
+        /* $741C is one entry, ($1,$270) held for $0FFF frames, and $9418
+           never touches the cel byte while it counts the idle out.  The
+           elephant is genuinely still between moves; cycling it against
+           $272 was the port's own invention. */
+        else frame=BOSS19_CEL_FRAME[0];
         break;
     }
     if(frame<0)frame=0;
@@ -4806,19 +4829,6 @@ static int boss_shot_of_kind(int kind)
     return -1;
 }
 
-static int boss_shots_airborne(int kind)
-{
-    return boss_shot_of_kind(kind)>=0;
-}
-
-static int boss_shot_slots_used(int kind)
-{
-    int i,n=0;
-    for(i=0;i<MAX_BOSS_SHOTS;++i)
-        if(g_boss_shots[i].active&&g_boss_shots[i].kind==kind)++n;
-    return n;
-}
-
 static void boss_clear_shots(int kind)
 {
     int i;
@@ -4912,17 +4922,10 @@ static void update_boss_shots(void)
             s->x+=s->vx;s->y+=s->vy;
         }
         sx=(int)(s->x>>FIX_SHIFT);sy=(int)(s->y>>FIX_SHIFT);
-        /* $9742 waits for the first bubble to fall past $15E and then calls
-           $1312A on all four slots, which zeroes them: the spout's bubbles
-           pop, they never become ammunition.  $15E is room 222, still inside
-           this arena's 240 lines, so the threshold carries over unchanged --
-           they drift down through the catwalk and burst near the bottom. */
-        if(s->kind==BOSS_SHOT_BUBBLE&&s->phase&&sy>=BOSS19_BUBBLE_END_Y){
-            boss_clear_shots(BOSS_SHOT_BUBBLE);break;
-        }
-        /* The spout arc carries the bubbles a good way above the viewport, so
-           only the sides and the bottom retire an object. */
-        if(sx<-48||sx>288||sy>248){s->active=0;continue;}
+        /* Nothing retires a bubble by position: $965E owns all four slots and
+           $9742 is the only thing that empties them, so one that wanders off
+           the side has to stay in its slot or the spout would refill it. */
+        if(s->kind!=BOSS_SHOT_BUBBLE&&(sx<-48||sx>288||sy>248)){s->active=0;continue;}
         py=player_body_y()+bowser_room_object_y_offset();
         /* $9CE6 lowers the bell on a rope to place it, the way $8564 lowers
            the pig's crate -- it is cargo being set down, not a thrown
@@ -5474,30 +5477,43 @@ static void update_boss_motion(void)
             }
             break;
         }
-        case 6: /* $965E: spout the hammers one at a time, then let them rain */
-            if(!g_boss_phase){
-                /* $9666 walks the four projectile slots and stops at the first
-                   empty one, so exactly one hammer leaves the trunk per frame,
-                   all four from the same point.  Only once the last slot has
-                   been filled does $96A8 drop the cel and lower the actor a
-                   storey.  Emitting the whole spread in a single frame -- and
-                   fanning it eight pixels a hammer -- turned one shot into a
-                   wall of crates the player could not get between. */
-                /* $9670 spawns at the actor plus $2A/-$42 and minus $40.
-                   The source actor is a storey up here from $94F4's pose
-                   compensation, which the port does not apply, so the trunk
-                   tip is 96 above this actor rather than 64. */
-                int sx=ox+(g_boss_action_dir?42:-66),sy=oy-96;
-                if(boss_shot_slots_used(BOSS_SHOT_BUBBLE)<MAX_BOSS_SHOTS)
-                    boss_spawn_shot(BOSS_SHOT_BUBBLE,sx,sy,
-                        (s32)(g_boss_action_dir?2:-2)*FIX_ONE,0);
-                if(++g_boss_action_timer>=MAX_BOSS_SHOTS){
-                    g_boss_phase=1;g_boss_cel=0;
+        case 6: { /* $965E: spout the bubbles one at a time, then let them rain */
+            /* $9666 walks the four projectile slots in order and stops dead
+               at the first one that is not already falling: an empty slot is
+               filled and the frame ends there, a still-climbing bubble is
+               stepped and the frame ends there, and only a falling one lets
+               the walk reach the next slot.  So each bubble waits out the
+               whole of $98CE -- twenty-four frames -- before the next leaves
+               the trunk, and $96A8 does not drop the reared cel until the
+               fourth is out.  Filling all four slots on four consecutive
+               frames instead put the attack pose on screen for four frames
+               and threw the spread as one clump. */
+            int k;
+            for(k=0;k<MAX_BOSS_SHOTS;++k){
+                BossShot *s=&g_boss_shots[k];
+                if(!s->active){
+                    /* $9670 spawns at the actor plus $2A/-$42 and minus $40.
+                       The source actor is a storey up here from $94F4's pose
+                       compensation, which the port does not apply, so the
+                       trunk tip is 96 above this actor rather than 64. */
+                    boss_spawn_shot(BOSS_SHOT_BUBBLE,
+                                    ox+(g_boss_action_dir?42:-66),oy-96,
+                                    (s32)(g_boss_action_dir?2:-2)*FIX_ONE,0);
+                    /* $96A0: only the last slot drops the cel. */
+                    if(k==MAX_BOSS_SHOTS-1)g_boss_cel=0;
+                    break;
                 }
-            }else if(!boss_shots_airborne(BOSS_SHOT_BUBBLE)){
+                if(!s->phase)break;   /* still on the rise: the walk ends here */
+            }
+            /* $9742: with all four falling, the first one thrown decides when
+               $1312A clears the lot.  They pop, they never become ammunition. */
+            if(k>=MAX_BOSS_SHOTS&&
+               (int)(g_boss_shots[0].y>>FIX_SHIFT)>=BOSS19_BUBBLE_END_Y){
+                boss_clear_shots(BOSS_SHOT_BUBBLE);
                 g_boss_init=0;g_boss_phase=0;
             }
             break;
+        }
         default: g_boss_init=0; break;
         }
         boss_set_origin(ox,oy);
@@ -5600,6 +5616,15 @@ static void update_boss_actor(void)
         static const unsigned char hit_w[5]={48,64,80,112,96};
         static const unsigned char hit_h[5]={64,80,56,64,80};
         hitx=bx+8;hity=by+8;hitw=hit_w[g_boss_class-1];hith=hit_h[g_boss_class-1];
+        if(g_boss_class==5){
+            const BossVisualData *v=&g_later_boss_visuals[4];
+            int f=later_boss_frame(v);
+            const unsigned char *b=g_boss19_box[(f<0||f>4)?0:f];
+            /* emit_boss_cells mirrors the pose about the canvas centre when
+               the elephant faces right, so the box has to turn with it. */
+            hitx=bx+((g_boss_face<0)?(112-b[0]-b[2]):b[0]);
+            hity=by+b[1];hitw=b[2];hith=b[3];
+        }
         /* Slot 13's body is not a guess: $15C9C and $162FE both read the box
            straight out of $18BAC for the driver's current metasprite, which
            is 56x88 for every one of $28C/$28E/$290 and their mirrors, and
