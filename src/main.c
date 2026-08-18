@@ -4173,14 +4173,14 @@ static int emit_boss_cells(u16 *satb,int n,const BossVisualData *v,int frame,
 }
 
 /* One entry per loose crate, up to the caller's SATB ceiling. */
-static int emit_crate_sprites(u16 *satb,int n,int limit)
+static int emit_crate_sprites(u16 *satb,int n,int limit,int cam_x,int cam_y)
 {
     int i;
     for (i = 0; i < MAX_CRATES && n < limit; ++i) {
         int sx, sy;
         if (!g_crates[i].active || g_crates[i].carried) continue;
-        sx = (int)(g_crates[i].x >> FIX_SHIFT) - g_camera_x;
-        sy = (int)(g_crates[i].y >> FIX_SHIFT) - g_camera_y + bowser_room_object_y_offset();
+        sx = (int)(g_crates[i].x >> FIX_SHIFT) - cam_x;
+        sy = (int)(g_crates[i].y >> FIX_SHIFT) - cam_y + bowser_room_object_y_offset();
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
         {u16 addr=CRATE_BASE_WORD,pal=(u16)(g_in_boss?PLAYER_SPR_PAL:0); int width=2,height=2;
         if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
@@ -4205,8 +4205,19 @@ static void draw_game_sprites(void)
     static u16 satb[64 * 4];
     int i, n = 0;
     int frame = current_player_frame();
-    int px = (int)(g_player_x >> FIX_SHIFT) - g_camera_x;
-    int py = (int)(g_player_y >> FIX_SHIFT) - g_camera_y + bowser_room_object_y_offset();
+    /* The HuC6270 fetches the SATB list at the VDW->VCR transition, ahead of
+       the CPU's vblank service that written it, so a list is displayed one
+       whole frame after the blanking that produced it, while the scroll
+       register written in that same blanking is already live.  World sprites
+       therefore have to be positioned against the camera that will be
+       committed next frame -- the target update_camera() has just computed --
+       or every camera step shows up as a one-frame sprite offset against the
+       background that pops back as soon as the scroll pauses, which reads as
+       sprite wobble on upward climbs. */
+    int cam_x=g_camera_target_x;
+    int cam_y=g_camera_target_y;
+    int px = (int)(g_player_x >> FIX_SHIFT) - cam_x;
+    int py = (int)(g_player_y >> FIX_SHIFT) - cam_y + bowser_room_object_y_offset();
     u16 base = (u16)(g_satb_page ? SATB_BASE1 : SATB_BASE0);
     /* Every normal-level palette carries the original Mario/object colors in
        source line 0 (identical across all 19 level palettes).  r11 moved
@@ -4323,8 +4334,8 @@ static void draw_game_sprites(void)
     if (g_carry_index>=0 && g_carry_index<MAX_CRATES &&
         g_crates[g_carry_index].active && g_crates[g_carry_index].carried && n<64) {
         Crate *c=&g_crates[g_carry_index];
-        int sx=(int)(c->x>>FIX_SHIFT)-g_camera_x;
-        int sy=(int)(c->y>>FIX_SHIFT)-g_camera_y+bowser_room_object_y_offset();
+        int sx=(int)(c->x>>FIX_SHIFT)-cam_x;
+        int sy=(int)(c->y>>FIX_SHIFT)-cam_y+bowser_room_object_y_offset();
         if (sx>=-32 && sx<=255 && sy>=-32 && sy<=239) {
             u16 addr=CRATE_BASE_WORD,pal=player_pal;
             int width=2,height=2;
@@ -4389,7 +4400,7 @@ static void draw_game_sprites(void)
         for (i = 0; i < MAX_GEMS && n < 50; ++i) {
             int sx, sy;
             if (!g_gems[i].active) continue;
-            sx = g_gems[i].x - g_camera_x; sy = g_gems[i].y - g_camera_y;
+            sx = g_gems[i].x - cam_x; sy = g_gems[i].y - cam_y;
             if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
             set_sprite_entry(satb,n++,sx,sy,(u16)(GEM_BASE_WORD + gf*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
         }
@@ -4400,8 +4411,8 @@ static void draw_game_sprites(void)
     for (i = 0; i < MAX_ITEMS && n < 54; ++i) {
         int sx, sy;
         if (!g_items[i].active) continue;
-        sx = (int)(g_items[i].x >> FIX_SHIFT) - g_camera_x;
-        sy = (int)(g_items[i].y >> FIX_SHIFT) - g_camera_y;
+        sx = (int)(g_items[i].x >> FIX_SHIFT) - cam_x;
+        sy = (int)(g_items[i].y >> FIX_SHIFT) - cam_y;
         if (sx < -16 || sx > 255 || sy < -16 || sy > 239) continue;
         set_sprite_entry(satb,n++,sx,sy,
             (u16)(ITEM_BASE_WORD + (g_items[i].kind-1)*ITEM_CELL_WORDS),
@@ -4417,7 +4428,7 @@ static void draw_game_sprites(void)
        decoration here -- with no mallet on the catwalk the fight cannot be
        won -- so in a boss room the loop runs to the edge of the bubbles' own
        reservation instead. */
-    n=emit_crate_sprites(satb,n,g_in_boss?62:54);
+    n=emit_crate_sprites(satb,n,g_in_boss?62:54,cam_x,cam_y);
 
     /* Traversal-critical Level-2 moving platforms get SATB priority over
        enemies so a busy screen cannot make the floor disappear. */
@@ -4425,8 +4436,8 @@ static void draw_game_sprites(void)
         MovingPlatform *mp=&g_moving_platforms[i];
         int sx,sy;
         if (mp->hidden) continue;   /* metasprite 0: parked out of the cycle */
-        sx=platform_draw_x(mp)-g_camera_x;
-        sy=platform_draw_y(mp)-g_camera_y+bowser_room_object_y_offset();
+        sx=platform_draw_x(mp)-cam_x;
+        sy=platform_draw_y(mp)-cam_y+bowser_room_object_y_offset();
         if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
         if(PLATFORM_KIND_IS_STAGE_OBJECT(mp->kind)){
             /* Cells are stored row-major with an even pitch, so each pair is
@@ -4473,7 +4484,7 @@ static void draw_game_sprites(void)
        objects can exhaust the 64-entry SATB, and dropping the thing that
        hurts the player is worse than dropping one enemy cell. */
     for(i=0;i<4&&n<62;++i)if(g_enemy_shots[i].active){
-        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-g_camera_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT)-g_camera_y;
+        int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-cam_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT)-cam_y;
         int c;
         for(c=0;c<g_enemy_shots[i].cols&&n<62;++c)
             set_sprite_entry(satb,n++,sx+c*16,sy,(u16)(g_enemy_shots[i].base+c*64),
@@ -4484,7 +4495,7 @@ static void draw_game_sprites(void)
         int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_chip,special_frame,use_hit_frame,use_alt=0,use_atk=0,use_atk2=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
-        sx=(int)(e->x>>FIX_SHIFT)-g_camera_x;sy=(int)(e->y>>FIX_SHIFT)-g_camera_y;
+        sx=(int)(e->x>>FIX_SHIFT)-cam_x;sy=(int)(e->y>>FIX_SHIFT)-cam_y;
         if(sx<-56||sx>255||sy<-56||sy>239)continue;
         li=e->variant;if(li>=g_level->variant_count)continue;gi=g_level->variant_ids[li];v=&g_enemy_variants[gi];
         /* mimic_open() keeps the record's box the same height as the pose on
@@ -4685,8 +4696,8 @@ static void draw_game_sprites(void)
         int sx,sy;
         u16 ctrl=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|player_pal);
         if (!g_fireballs[i].active) continue;
-        sx=(int)(g_fireballs[i].x>>FIX_SHIFT)-g_camera_x;
-        sy=(int)(g_fireballs[i].y>>FIX_SHIFT)-g_camera_y;
+        sx=(int)(g_fireballs[i].x>>FIX_SHIFT)-cam_x;
+        sy=(int)(g_fireballs[i].y>>FIX_SHIFT)-cam_y;
         if (sx<-32 || sx>255 || sy<-32 || sy>239) continue;
         if (g_fireballs[i].vx<0) ctrl|=VDC_SPR_X_INVERT;
         set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,ctrl);
