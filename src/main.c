@@ -499,6 +499,19 @@ static int g_screen_shake;
 /* $7D04's own two bytes: the countdown to the next mallet and the drop column
    it will use.  The final room hands the player one mallet at a time. */
 static int g_boss19_ammo_delay,g_boss19_ammo_slot;
+/* $6BA0 drives the whole object update from one pass of the main loop at
+   $6B4C, and in the final room that loop turns over on every other field.
+   $940E's own numbers say so out loud: $98CE lifts a bubble 144 pixels in
+   twenty-four entries and the source takes about forty-eight fields over it,
+   and the forty entries of $988B keep the elephant airborne for something
+   near a hundred and sixty.  Every count in the handler is therefore quoted
+   in thirtieths of a second, so stepping it once a frame ran the elephant,
+   its bubbles and its ammunition at double speed -- the reared cel lasted
+   seventy frames where the source holds it for a hundred and forty, and the
+   spout emptied in half the time.  g_boss19_field is the field parity and
+   g_boss19_tick stands in for $FF002A, which $95CE tests for its own
+   half-speed walk and which counts passes, not fields. */
+static int g_boss19_field,g_boss19_tick;
 
 /* Boss 3's handler at MD $806A is a byte-pair action script.  The first byte
    selects the movement state and the second is the source direction flag.
@@ -4672,7 +4685,7 @@ static void start_boss(int fade_in)
     g_boss_action=0;g_boss_action_timer=(g_boss_class==1||g_boss_class==2)?-1:0;g_boss_action_dir=0;g_boss_script_index=0;
     g_boss_init=0;g_boss_group=0;g_boss_cel=0;g_boss_anim_step=0;g_boss_anim_div=0;
     g_boss_hidden=0;g_boss_intangible=0;g_screen_shake=0;g_boss16_pick_count=0;
-    g_boss19_ammo_delay=0;g_boss19_ammo_slot=2;
+    g_boss19_ammo_delay=0;g_boss19_ammo_slot=2;g_boss19_field=0;g_boss19_tick=0;
     for(i=0;i<MAX_BOSS_SHOTS;++i)g_boss_shots[i].active=0;
     g_boss10_floor_y=y;
     g_boss8_crate=-1;
@@ -4891,7 +4904,7 @@ static void boss16_release_bell(int i)
 
 /* Everything the three handlers put in the air moves here.  Only the frog's
    bomb is walked by its own handler, because $9132 owns the arc table. */
-static void update_boss_shots(void)
+static void update_boss_shots(int step)
 {
     int i;
     for(i=0;i<MAX_BOSS_SHOTS;++i){
@@ -4899,24 +4912,28 @@ static void update_boss_shots(void)
         int sx,sy,py;
         if(!s->active)continue;
         if(s->kind==BOSS_SHOT_BUBBLE){
-            /* $96CE carries it two pixels sideways a frame while $98CE lifts
-               it.  $971A then drops it a pixel a frame and jitters it left or
+            /* $96CE carries it two pixels sideways a pass while $98CE lifts
+               it.  $971A then drops it a pixel a pass and jitters it left or
                right instead -- the aimed drift belongs to the rise alone, so
                the fall must not keep adding it. */
-            if(!s->phase){
-                s->x+=s->vx;
-                if(g_boss19_bubble_arc[s->timer]==0x88){s->phase=1;s->timer=0;}
-                else{
-                    s->y-=(s32)g_boss19_bubble_arc[s->timer]*FIX_ONE;++s->timer;
-                    /* $98CE throws them 144 pixels up, which the source's
-                       taller plane still shows.  Hold them at the ceiling of
-                       this arena instead of letting the spout spend four
-                       seconds out of sight; the arc's timing is unchanged. */
-                    if((int)(s->y>>FIX_SHIFT)<8)s->y=(s32)8<<FIX_SHIFT;
+            if(step){
+                if(!s->phase){
+                    s->x+=s->vx;
+                    if(g_boss19_bubble_arc[s->timer]==0x88){s->phase=1;s->timer=0;}
+                    else{
+                        /* $98CE throws them 144 pixels up from $40 above the
+                           actor, so they leave through the top of the room
+                           and rain back in a pixel a pass.  Pinning them to
+                           the ceiling instead, as the port used to, turned a
+                           spout that arcs away and comes back into a row of
+                           bubbles sitting on the top edge. */
+                        s->y-=(s32)g_boss19_bubble_arc[s->timer]*FIX_ONE;
+                        ++s->timer;
+                    }
+                }else{
+                    s->y+=FIX_ONE;
+                    s->x+=(boss_random()&1)?2*FIX_ONE:-2*FIX_ONE;
                 }
-            }else{
-                s->y+=FIX_ONE;
-                s->x+=(boss_random()&1)?2*FIX_ONE:-2*FIX_ONE;
             }
         }else if(s->kind!=BOSS_SHOT_BOMB){
             s->x+=s->vx;s->y+=s->vy;
@@ -5458,8 +5475,8 @@ static void update_boss_motion(void)
             int step=(state<=2)?1:2;
             hop=hops[state-1];
             if(state==5)ox=g_boss19_anchor_x[g_boss_group]-BOSS_ROOM_BIAS;
-            /* $95CE runs at half speed; the rest move every frame. */
-            else if(state!=2||!(t&1))ox+=g_boss_action_dir?step:-step;
+            /* $95CE tests $FF002A and skips the move on its odd passes. */
+            else if(state!=2||!(g_boss19_tick&1))ox+=g_boss_action_dir?step:-step;
             if(hop[g_boss_action_timer]==0x88){
                 if(!g_boss_phase){
                     /* $9540 turns the arc around and comes back down on cel 2.
@@ -5524,7 +5541,7 @@ static void update_boss_motion(void)
 
 static void update_boss_actor(void)
 {
-    int i,bx,by,hitx,hity,hitw,hith;
+    int i,bx,by,hitx,hity,hitw,hith,step;
     if(g_boss_defeated){
         /* Source HP-zero path at $16398 changes the boss state instead of
            erasing it. Keep the sprite visible while it launches/falls away. */
@@ -5532,15 +5549,21 @@ static void update_boss_actor(void)
         if((int)(g_boss_y>>FIX_SHIFT)>256){g_after_boss=1;music_stop_for_transition();g_state=STATE_LEVEL_FADE;g_state_frame=0;}
         return;
     }
+    /* Slot 19 alone runs on the source's own thirty-hertz pass; see the note
+       on g_boss19_field.  Only the parts $6BA0 owns are held back -- the
+       contact tests below still sample every frame, because the player they
+       are testing against does move every frame. */
+    if(g_boss_class==5)g_boss19_field^=1;
+    step=(g_boss_class!=5)||!g_boss19_field;
     if(g_boss_invuln>0)--g_boss_invuln;
     else{
         ++g_boss_timer;
 #ifdef FORCE_BOSS_HURT
         if(g_boss_timer==FORCE_BOSS_HURT)boss_take_hit();
 #endif
-        if(g_boss_invuln==0)update_boss_motion();
+        if(g_boss_invuln==0&&step){++g_boss19_tick;update_boss_motion();}
     }
-    if(g_boss_class>=3)update_boss_shots();
+    if(g_boss_class>=3)update_boss_shots(step);
     if(g_screen_shake>0)--g_screen_shake;
     /* The source dispenser ($7958) waits while its previous crate object is
        live.  Do the same so unused ammunition cannot carpet the catwalk.
@@ -5559,7 +5582,7 @@ static void update_boss_actor(void)
        next of three, and lowers the next mallet from $68 two pixels a frame.
        The elephant supplies no ammunition itself -- $9742 pops its bubbles --
        so without this the final room had nothing to throw. */
-    if(g_boss_class==5&&g_boss_invuln==0&&!g_boss_defeated){
+    if(g_boss_class==5&&g_boss_invuln==0&&!g_boss_defeated&&step){
         int any_crate=0;
         for(i=0;i<MAX_CRATES;++i)if(g_crates[i].active){any_crate=1;break;}
         if(any_crate)g_boss19_ammo_delay=0;
