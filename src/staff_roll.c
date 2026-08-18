@@ -69,8 +69,8 @@ const StaffLine g_staff_lines[] = {
     { "- THE CAST -", T, C, -1 },
     BLANK,
 
-    CAST("BARNETT",  0),
-    CAST("OSCAR",    1),
+    CAST("KOOPA",    0),
+    CAST("GOOMBA",   1),
     CAST("DALE",     2),
     CAST("GORDON",   3),
     CAST("MATTHEW",  4),
