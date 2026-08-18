@@ -2203,6 +2203,70 @@ static void update_camera(void)
     g_spring_camera_step=0;
 }
 
+/* Slot 9's fake parallax.  $14804 fills the Mega Drive's per-cell horizontal
+   scroll table for plane B from four free-running counters, none of which is
+   tied to the camera at all -- which is why its clouds keep moving while Mario
+   stands still, and why the sky never slides at a fraction of his speed:
+
+     rows   0..32   $FF008E   +1 every 8 frames   (drifts right)
+     rows  33..56   $FF0064   -1 every 4 frames   (drifts left)
+     rows  57..80   $FF008C   -1 every 8 frames   (drifts left)
+     rows  81..128  (skipped, so it stands still)
+     rows 129 down  $FF003A   half the camera step
+
+   The HuC6270 has one BXR per plane, so the bands have to be made by rewriting
+   it as the beam crosses each boundary.  Three splits are enough: the last band
+   is the half-rate scroll commit_stage_camera() has already published, and the
+   static one above it is a horizontally dithered fog band whose offset reads
+   the same either way, so it is folded into the half-rate band rather than
+   spending a fourth split -- and, more to the point, rather than spinning the
+   CPU another fifty lines into the picture. */
+#define PARALLAX_LEVEL     8    /* g_current_level, i.e. ROM slot 9 */
+#define PARALLAX_SPLIT_B   32
+#define PARALLAX_SPLIT_C   56
+#define PARALLAX_SPLIT_END 80
+/* Screen line 0 in tetsu_get_raster()'s numbering: the counter starts at the
+   top of the blanking interval, twenty-two lines above the picture.  Measured
+   against the Mega Drive -- with a bias of zero every band came out one band
+   too fast, because each split was landing twenty-odd lines early. */
+#ifndef PARALLAX_RASTER_BIAS
+#define PARALLAX_RASTER_BIAS 22
+#endif
+
+static unsigned g_parallax_clock;
+
+/* Spin until the beam reaches a line, without ever being able to hang: if the
+   raster is already past it -- a frame we entered late -- the window test
+   fails all the way round and the bounded loop simply gives up, costing that
+   one frame its split rather than the whole game. */
+static void wait_raster(int line)
+{
+    int guard=6000;
+    line+=PARALLAX_RASTER_BIAS;
+    while(guard-->0){
+        int r=tetsu_get_raster();
+        if(r>=line && r<line+48) break;
+    }
+}
+
+static void backdrop_parallax_splits(void)
+{
+    int chip;
+    unsigned t;
+    if(g_in_boss || !g_level || g_current_level!=PARALLAX_LEVEL) return;
+    chip=level_backdrop_chip();
+    t=g_parallax_clock;
+    /* BXR counts the view rightwards, so a band that drifts right on screen
+       needs a falling BXR.  The plane is 64 cells wide and wraps at 512. */
+    vdc_setreg(chip,VDC_REG_BXR,(int)((0u-(t>>3))&0x1FFu));
+    wait_raster(PARALLAX_SPLIT_B);
+    vdc_setreg(chip,VDC_REG_BXR,(int)((t>>2)&0x1FFu));
+    wait_raster(PARALLAX_SPLIT_C);
+    vdc_setreg(chip,VDC_REG_BXR,(int)((t>>3)&0x1FFu));
+    wait_raster(PARALLAX_SPLIT_END);
+    vdc_setreg(chip,VDC_REG_BXR,(int)((g_camera_x>>1)&0x1FF));
+}
+
 static void commit_stage_camera(void)
 {
     int stage_chip,backdrop_chip;
@@ -6991,8 +7055,10 @@ int main(void)
     for (;;) {
         u16 btn, pressed;
         wait_frame();
-        if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE)
+        if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE) {
             commit_stage_camera();
+            backdrop_parallax_splits();
+        }
         else if (g_state==STATE_STAFF)
             commit_staff_scroll();
         btn = read_buttons();
@@ -7002,6 +7068,7 @@ int main(void)
         if (g_state == STATE_PLAY) update_play(btn, pressed);
         else update_frontend(pressed);
         music_update();
+        ++g_parallax_clock;
         ++g_state_frame;
     }
     return 0;
