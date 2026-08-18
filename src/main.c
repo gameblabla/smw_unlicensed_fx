@@ -146,6 +146,15 @@ extern void pcfx_tetsu_wait_frame(void);
    object bank.  build_full_game.py's STAGE_OBJECT_KINDS assigns these. */
 #define PLATFORM_KIND_STATIC    4   /* handler 0  */
 #define PLATFORM_KIND_SHUTTLE   5   /* handler 3  */
+/* $F78E's shuttle runs 70 pixels left of its record and back. */
+#define SHUTTLE_RUN      70
+/* Slot 12's shaft asks the player to cross between shuttles that only ever
+   retreat from him, which leaves one frame per 140 to make each jump.  Carry
+   its run the same distance again past the record so it comes to meet him.
+   This is a deliberate deviation the user asked for, and it is confined to
+   that level: every other stage keeps the exact run. */
+#define SHUTTLE_OVERRUN_LEVEL 11
+#define SHUTTLE_OVERRUN       70
 #define PLATFORM_KIND_FALLER    6   /* handler 4  */
 #define PLATFORM_KIND_DESCEND   7   /* handler 5  */
 #define PLATFORM_KIND_ASCEND    8   /* handler 6  */
@@ -2413,10 +2422,22 @@ static void update_stage_object(MovingPlatform *p, int index)
     switch (p->kind) {
     case PLATFORM_KIND_STATIC:
         break;
-    case PLATFORM_KIND_SHUTTLE:      /* $F78E */
+    case PLATFORM_KIND_SHUTTLE: {    /* $F78E */
+        /* The record position is the right end of the run and the shuttle only
+           ever leaves it, so on slot 12's shaft the carriers are always
+           retreating from the ledge Mario is trying to leave: the crossing has
+           to be made on the one frame the platform is back home.  Carry the
+           run past the record by SHUTTLE_OVERRUN there, and bound both ends
+           against home_x rather than counting frames, so the extra travel
+           cannot walk the whole run a little further right on every cycle. */
+        int hx=(int)(p->home_x>>FIX_SHIFT),x;
         p->x+=(s32)p->dir*FIX_ONE;
-        if (++p->timer>=70) { p->timer=0; p->dir=(signed char)-p->dir; }
+        x=(int)(p->x>>FIX_SHIFT);
+        if (p->dir<0) { if (x<=hx-SHUTTLE_RUN) p->dir=1; }
+        else if (x>=hx+((g_current_level==SHUTTLE_OVERRUN_LEVEL)?SHUTTLE_OVERRUN:0))
+            p->dir=-1;
         break;
+    }
     case PLATFORM_KIND_FALLER:       /* $F8E2 */
         base=platform_storey_base(p);
         if (p->state==PLATFORM_STATE_IDLE) {
