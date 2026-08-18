@@ -285,6 +285,9 @@ typedef struct {
        $C25C/$BB98 both drive their throw phase off "is my next object slot
        still occupied", which is what this reproduces. */
     unsigned char shot_slot;
+    /* Set when a ledge turned the walker round without it moving, cleared the
+       moment it does move.  See update_enemies(). */
+    unsigned char ledge_pinned;
 } Enemy;
 
 typedef struct {
@@ -2898,6 +2901,7 @@ static void init_objects(void)
             g_enemies[i].flight_phase=0;
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
             g_enemies[i].face_right=0;g_enemies[i].shot_slot=0;
+            g_enemies[i].ledge_pinned=0;
 #ifdef FORCE_ENEMY_ACTION
             if(g_enemies[i].state==2||g_enemies[i].state==4||g_enemies[i].state==5||g_enemies[i].state==6||g_enemies[i].state==7){
                 g_enemies[i].behavior_phase=1;g_enemies[i].behavior_timer=40;
@@ -3326,20 +3330,36 @@ static int enemy_crate_floor_top(const Enemy *e, int x, int old_bottom,
 /* Is there something to stand on directly under the span x0..x1?  Both stage
    terrain and a resting crate count, so a walker will step onto a crate that
    has been set down at the end of its ledge rather than turn away from it. */
-static int enemy_floor_under(int x0,int x1,int bottom)
+static int enemy_floor_under_depth(int x0,int x1,int bottom,int depth)
 {
-    int i,foot=bottom+1;
-    if(solid_v(x0,foot)||solid_v(x1,foot))return 1;
+    int i,d;
+    /* Terrain sits on an eight-pixel grid, so probing every eighth pixel
+       cannot step over a tile row -- three reads cover the whole drop. */
+    for(d=1;d<=depth;d+=8)
+        if(solid_v(x0,bottom+d)||solid_v(x1,bottom+d))return 1;
     for(i=0;i<MAX_CRATES;++i){
         const Crate *c=&g_crates[i];
         int cx,cy;
         if(!c->active||c->carried||c->thrown)continue;
         cx=(int)(c->x>>FIX_SHIFT);cy=(int)(c->y>>FIX_SHIFT);
         if(x1<cx||x0>=cx+CRATE_W)continue;
-        if(foot>=cy&&foot<cy+CRATE_H)return 1;
+        if(bottom+depth>=cy&&bottom+1<cy+CRATE_H)return 1;
     }
     return 0;
 }
+
+static int enemy_floor_under(int x0,int x1,int bottom)
+{
+    return enemy_floor_under_depth(x0,x1,bottom,1);
+}
+
+/* How far below its feet a walker will still call ground "ground".  A step
+   down out of a ledge is part of the terrain and the source walks it; only an
+   actual pit turns one round, and every pit in these stages runs to the
+   bottom of the storey.  Probing a single pixel made the walkers refuse to
+   follow the ground down a one-tile step and pace the little plateau they
+   were left on instead. */
+#define ENEMY_LEDGE_DROP 20
 
 /* Which walkers refuse to step off the end of what they are standing on.  The
    hopper is out because its $BA7A leap is exactly how it changes platform, and
@@ -3811,8 +3831,10 @@ static void update_enemies(void)
                 enemy_crate_blocked(e,nx,y))
                 e->vx=-e->vx;
             else if (enemy_turns_at_ledge(e) && was_grounded && e->vx &&
+                     !e->ledge_pinned &&
                      enemy_floor_under(x+3,x+e->width-4,bottom) &&
-                     !enemy_floor_under(lead,lead,bottom))
+                     !enemy_floor_under_depth(lead,lead,bottom,
+                                              ENEMY_LEDGE_DROP))
                 /* A walker that is already standing on something will not step
                    off the end of it.  The source keeps these enemies on their
                    authored ledge by giving them fixed-length legs and no
@@ -3820,10 +3842,17 @@ static void update_enemies(void)
                    of the leading edge reaches the same place without having to
                    re-time every patrol.  The hopper is the deliberate
                    exception -- its $BA7A leap crosses gaps, and it runs that
-                   leap outside this solver entirely. */
-                e->vx=-e->vx;
+                   leap outside this solver entirely.
+
+                   A turn here does not move the walker, so two of them in a
+                   row is a deadlock: on a ledge shorter than its own body, or
+                   pinned between a wall and a drop, it stood shivering on the
+                   spot forever.  One stationary ledge turn is all it gets --
+                   after that it walks off the end as it did before the probe
+                   existed, which is the one outcome that cannot lock up. */
+                { e->vx=-e->vx; e->ledge_pinned=1; }
             else
-                e->x=nx;
+                { e->x=nx; e->ledge_pinned=0; }
         }
 
         {
