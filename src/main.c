@@ -288,6 +288,9 @@ typedef struct {
     /* Set when a ledge turned the walker round without it moving, cleared the
        moment it does move.  See update_enemies(). */
     unsigned char ledge_pinned;
+    /* Jump-over bonus state: 0 idle, 1 airborne player is passing overhead,
+       2 the pass already sounded.  See update_enemies(). */
+    unsigned char jumped_over;
 } Enemy;
 
 typedef struct {
@@ -2902,6 +2905,7 @@ static void init_objects(void)
             g_enemies[i].behavior_phase=0;g_enemies[i].behavior_timer=0;
             g_enemies[i].face_right=0;g_enemies[i].shot_slot=0;
             g_enemies[i].ledge_pinned=0;
+            g_enemies[i].jumped_over=0;
 #ifdef FORCE_ENEMY_ACTION
             if(g_enemies[i].state==2||g_enemies[i].state==4||g_enemies[i].state==5||g_enemies[i].state==6||g_enemies[i].state==7){
                 g_enemies[i].behavior_phase=1;g_enemies[i].behavior_timer=40;
@@ -3894,6 +3898,31 @@ enemy_attack_checks:
             }
         }
         if (e->defeated) continue;
+
+        /* Jump-over bonus: while airborne over a living enemy, a player who
+           clears its whole body horizontally earns the chime -- once per pass,
+           and only for obstacle-free jumps, never for a landing stomp, which
+           defeats the enemy before this check can sound it. */
+        {
+            int player_bottom = py + PLAYER_BODY_H - 1;
+            int over = px + PLAYER_BODY_W > x + 2 && px < x + e->width - 2;
+            int above = player_bottom < y && !g_grounded;
+            if (e->jumped_over == 1) {
+                if (!over) {
+                    Play_Sound_Sample(SFX_JUMP_OVER_ENEMY, 0, 0);
+                    e->jumped_over = 2;
+                } else if (!above) {
+                    e->jumped_over = 0;
+                }
+            } else if (e->jumped_over == 2 && !over) {
+                /* The pass is fully over; re-arm so a jump back across the
+                   same enemy can earn the chime again. */
+                e->jumped_over = 0;
+            } else if (e->jumped_over == 0 && over && above &&
+                       !enemy_indestructible(e)) {
+                e->jumped_over = 1;
+            }
+        }
 
         /* Use separate stomp and hurt volumes. The visible sprites are much
            wider than their gameplay bodies in the MD code; r6's single broad

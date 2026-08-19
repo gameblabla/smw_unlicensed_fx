@@ -31,6 +31,10 @@ SOURCES = {
     7: ('player_hurt', '99'),
     8: ('menu_confirm', '9C'),
     9: ('boss_defeat', 'A9'),
+    # $B7 never rendered from the Z80 driver (the capture failed with a format
+    # mismatch), so command_B7.wav is the custom assets/jumpoverenemy.wav in the
+    # same stereo 16-bit 48 kHz container as the driver renders.
+    10: ('jump_over_enemy', 'B7'),
 }
 
 
@@ -156,8 +160,8 @@ def main():
     source_dir = root / 'megadrive_sfx_wav_lowlevel'
     output = root / 'src' / 'sfx_adpcm_generated.h'
     bank = bytearray()
-    metas = [(0, 0)] * 10
-    labels = ['unused'] * 10
+    metas = [(0, 0)] * 11
+    labels = ['unused'] * 11
 
     for effect_id, (name, command) in SOURCES.items():
         while (len(bank) // 2) % ALIGN_WORDS:
@@ -182,7 +186,7 @@ def main():
         f.write('#define SMB_PCFX_SFX_ADPCM_GENERATED_H\n\n')
         f.write('#define SFX_ADPCM_BANK_BYTES %du\n\n' % len(bank))
         f.write('typedef struct { unsigned short start_word, word_count; } sfx_adpcm_meta_t;\n')
-        f.write('static const sfx_adpcm_meta_t sfx_adpcm_meta[10] = {\n')
+        f.write('static const sfx_adpcm_meta_t sfx_adpcm_meta[%d] = {\n' % len(metas))
         for i, (start, count) in enumerate(metas):
             f.write('    { %du, %du }, /* %s */\n' % (start, count, labels[i]))
         f.write('};\n\nstatic const unsigned char sfx_adpcm_bank[SFX_ADPCM_BANK_BYTES] = {\n')

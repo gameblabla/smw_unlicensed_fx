@@ -39,7 +39,8 @@ SFX_WAVS := megadrive_sfx_wav_lowlevel/command_90.wav \
             megadrive_sfx_wav_lowlevel/command_9E.wav \
             megadrive_sfx_wav_lowlevel/command_AE.wav \
             megadrive_sfx_wav_lowlevel/command_A8.wav \
-            megadrive_sfx_wav_lowlevel/command_A9.wav
+            megadrive_sfx_wav_lowlevel/command_A9.wav \
+            megadrive_sfx_wav_lowlevel/command_B7.wav
 all: disc
 assets:
 	KIT=$(KIT) python3 tools/prepare_boot_frames.py
