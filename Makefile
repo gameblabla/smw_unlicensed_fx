@@ -27,9 +27,10 @@ MAP := $(OBJDIR)/$(TARGET).map
 
 .PHONY: all disc clean assets editor apply-level-edits vram-map
 CDDA_TOOL := tools/build_cdda.py
-CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/forest.wav \
-             NEWMUSIC/graveyard.wav NEWMUSIC/nuclear\ dump.wav NEWMUSIC/staff.wav \
-             NEWMUSIC/street.wav NEWMUSIC/titlescreen.wav NEWMUSIC/world.wav
+CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/finallevelsmusic.wav \
+             NEWMUSIC/forest.wav NEWMUSIC/graveyard.wav NEWMUSIC/nuclear\ dump.wav \
+             NEWMUSIC/staff.wav NEWMUSIC/street.wav NEWMUSIC/titlescreen.wav \
+             NEWMUSIC/world.wav
 SFX_ADPCM_HEADER := src/sfx_adpcm_generated.h
 SFX_WAVS := megadrive_sfx_wav_lowlevel/command_90.wav \
             megadrive_sfx_wav_lowlevel/command_9C.wav \
