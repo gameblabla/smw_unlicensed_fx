@@ -106,6 +106,16 @@
 #define CONTINUE_TILE_BASE_WORD 0x2000
 /* 0x5000..0x6000 [boot] opening dual-plane streaming buffer */
 #define BOOT_DUAL_BACK_BASE_WORD 0x5000
+/* 0x4E80..0x5780 [play,boss] auxiliary player frames 1..6 */
+#define BACK_MIRROR_PLAYER_WORD 0x4E80
+/* 0x5780..0x6080 [play,boss] auxiliary player frames 10..15 */
+#define BACK_MIRROR_PLAYER_CARRY_WORD 0x5780
+/* 0x6080..0x6240 [play,boss] auxiliary death/throw pose */
+#define BACK_MIRROR_THROW_WORD 0x6080
+/* 0x6280..0x6400 [play,boss] auxiliary crouch Mario */
+#define BACK_MIRROR_DOWN_MARIO_WORD 0x6280
+/* 0x6400..0x6580 [play,boss] auxiliary crouch Luigi */
+#define BACK_MIRROR_DOWN_LUIGI_WORD 0x6400
 /* 0x6800..0x6900 [play,boss] auxiliary crate sprite mirror */
 #define BACK_MIRROR_CRATE_WORD 0x6800
 /* 0x6900..0x69C0 [play,boss] auxiliary gem sprite mirror */

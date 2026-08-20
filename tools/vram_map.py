@@ -108,6 +108,11 @@ BANKS = [
     # Gameplay entries may migrate to VDC0 at runtime.  Declare the complete
     # mirrored resource closure here as real banks so a later backdrop or SATB
     # relocation cannot silently overwrite only the auxiliary copy.
+    ('BACK_MIRROR_PLAYER_WORD',     BACK,  0x4E80, 6*PLAYER_FRAME_WORDS, (PLAY, BOSS), 'auxiliary player frames 1..6'),
+    ('BACK_MIRROR_PLAYER_CARRY_WORD',BACK, 0x5780, 6*PLAYER_FRAME_WORDS, (PLAY, BOSS), 'auxiliary player frames 10..15'),
+    ('BACK_MIRROR_THROW_WORD',      BACK,  0x6080, 448,    (PLAY, BOSS), 'auxiliary death/throw pose', 128),
+    ('BACK_MIRROR_DOWN_MARIO_WORD', BACK,  0x6280, PLAYER_FRAME_WORDS, (PLAY, BOSS), 'auxiliary crouch Mario', 128),
+    ('BACK_MIRROR_DOWN_LUIGI_WORD', BACK,  0x6400, PLAYER_FRAME_WORDS, (PLAY, BOSS), 'auxiliary crouch Luigi', 128),
     ('BACK_MIRROR_CRATE_WORD',      BACK,  0x6800, 256,    (PLAY, BOSS), 'auxiliary crate sprite mirror'),
     ('BACK_MIRROR_GEM_WORD',        BACK,  0x6900, 192,    (PLAY, BOSS), 'auxiliary gem sprite mirror'),
     ('BACK_MIRROR_HUD_WORD',        BACK,  0x6A00, 192,    (PLAY, BOSS), 'auxiliary HUD icon mirror'),

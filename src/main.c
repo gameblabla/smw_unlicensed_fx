@@ -72,6 +72,9 @@ extern void pcfx_tetsu_wait_frame(void);
 
 #define PLAYER_FRAME_WORDS_LOCAL 384
 #define CONTINUE_PLAYER_FRAME_COUNT 2
+#define BACK_PLAYER_FIRST_FRAME_COUNT 6
+#define BACK_PLAYER_CARRY_FIRST_FRAME 10
+#define BACK_PLAYER_CARRY_FRAME_COUNT 6
 #define PLAYER_STRIP_WORDS 128
 #define BOOT_PLAYER_BANK_WORDS (PLAYER_FRAME_COUNT * PLAYER_FRAME_WORDS_LOCAL)
 /* Bank overlap and 128-word sprite alignment are checked for every scene by
@@ -1212,6 +1215,30 @@ static int sprite_height(u16 ctrl)
            (ctrl&VDC_SPR_Y_HEIGHT_2)?32:16;
 }
 
+/* VDC0's background patterns occupy the normal player addresses.  Translate
+   only player resources into their explicit auxiliary mirrors when the SATB
+   allocator moves an entry to that chip. */
+static u16 back_sprite_address(u16 address)
+{
+    u16 carry_front=(u16)(PLAYER_BASE_WORD+
+        (BACK_PLAYER_CARRY_FIRST_FRAME-1)*PLAYER_FRAME_WORDS_LOCAL);
+    if(address>=PLAYER_BASE_WORD&&
+       address<PLAYER_BASE_WORD+BACK_PLAYER_FIRST_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL)
+        return (u16)(BACK_MIRROR_PLAYER_WORD+address-PLAYER_BASE_WORD);
+    if(address>=carry_front&&
+       address<carry_front+BACK_PLAYER_CARRY_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL)
+        return (u16)(BACK_MIRROR_PLAYER_CARRY_WORD+address-carry_front);
+    if(address>=THROW_BASE_WORD&&address<THROW_BASE_WORD+448)
+        return (u16)(BACK_MIRROR_THROW_WORD+address-THROW_BASE_WORD);
+    if(address>=GAMEPLAY_DOWN_MARIO_BASE_WORD&&
+       address<GAMEPLAY_DOWN_MARIO_BASE_WORD+PLAYER_FRAME_WORDS_LOCAL)
+        return (u16)(BACK_MIRROR_DOWN_MARIO_WORD+address-GAMEPLAY_DOWN_MARIO_BASE_WORD);
+    if(address>=GAMEPLAY_DOWN_LUIGI_BASE_WORD&&
+       address<GAMEPLAY_DOWN_LUIGI_BASE_WORD+PLAYER_FRAME_WORDS_LOCAL)
+        return (u16)(BACK_MIRROR_DOWN_LUIGI_WORD+address-GAMEPLAY_DOWN_LUIGI_BASE_WORD);
+    return address;
+}
+
 /* Split one priority-ordered logical list across both HuC6270s.  VDC1 wins
    the PC-FX VDC pre-mixer whenever both chips produce a non-transparent
    pixel, so a later (lower-priority) entry may use VDC1 only when no earlier
@@ -1257,6 +1284,7 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
                 for(j=first;j<last;++j)front_line[j]=(u16)(front_line[j]+add);
             }else if(use_back){
                 for(j=0;j<4;++j)back[nb*4+j]=e[j];
+                back[nb*4+2]=back_sprite_address(e[2]);
                 ++nb;
                 for(j=first;j<last;++j)back_line[j]=(u16)(back_line[j]+add);
             }
@@ -1306,6 +1334,8 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
                 for(j=first;j<last;++j)front_line[j]=(u16)(front_line[j]+add_line[j]);
             }else if(use_back){
                 for(k=0;k<len;++k)for(j=0;j<4;++j)back[(nb+k)*4+j]=logical[(i+k)*4+j];
+                for(k=0;k<len;++k)back[(nb+k)*4+2]=
+                    back_sprite_address(logical[(i+k)*4+2]);
                 nb+=len;
                 for(j=first;j<last;++j)back_line[j]=(u16)(back_line[j]+add_line[j]);
             }
@@ -1360,13 +1390,24 @@ static int palettes_equal(const unsigned short *a, const unsigned short *b)
    Mirror every world-object bank there while both outputs are hidden so an
    entry can move between VDC sprite engines without changing its pattern
    number or exposing a partially-uploaded frame. */
-static void upload_world_sprite_words(u16 address,const u16 *words,unsigned count)
+static void upload_sprite_words(int chip,u16 address,const u16 *words,unsigned count)
 {
     unsigned i;
-    vdc_set_vram_write(FRONT_CHIP,address);
-    for(i=0;i<count;++i)vdc_vram_write(FRONT_CHIP,words[i]);
-    vdc_set_vram_write(BACK_CHIP,address);
-    for(i=0;i<count;++i)vdc_vram_write(BACK_CHIP,words[i]);
+    vdc_set_vram_write(chip,address);
+    for(i=0;i<count;++i)vdc_vram_write(chip,words[i]);
+}
+
+static void upload_world_sprite_words(u16 address,const u16 *words,unsigned count)
+{
+    upload_sprite_words(FRONT_CHIP,address,words,count);
+    upload_sprite_words(BACK_CHIP,address,words,count);
+}
+
+static void upload_throw_sprite_words(int chip,u16 address)
+{
+    upload_sprite_words(chip,address,g_player_death_words,320);
+    /* The final 16x16 cell follows the 32x32 cell's 128-word alignment gap. */
+    upload_sprite_words(chip,(u16)(address+384),g_player_death_words+320,64);
 }
 
 static void upload_hud_heart_strip(void)
@@ -1396,22 +1437,24 @@ static void upload_game_sprites(void)
     for (i=0;i<16;++i) tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),g_continue_player_palette[i]);
     if(g_in_boss)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_CROUCH_SPR_PAL*16+i),g_continue_player_palette[i]);
 
-    vdc_set_vram_write(FRONT_CHIP, PLAYER_BASE_WORD);
-    for (i=0;i<PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL;++i) vdc_vram_write(FRONT_CHIP,g_player_frame_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,THROW_BASE_WORD);
-    for (i=0;i<256;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,(u16)(THROW_BASE_WORD+256));
-    for (i=256;i<320;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,(u16)(THROW_BASE_WORD+384));
-    for (i=320;i<384;++i) vdc_vram_write(FRONT_CHIP,g_player_death_words[i]);
+    upload_sprite_words(FRONT_CHIP,PLAYER_BASE_WORD,g_player_frame_words,
+                        PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL);
+    upload_sprite_words(BACK_CHIP,BACK_MIRROR_PLAYER_WORD,g_player_frame_words,
+                        BACK_PLAYER_FIRST_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL);
+    upload_sprite_words(BACK_CHIP,BACK_MIRROR_PLAYER_CARRY_WORD,
+                        g_player_frame_words+
+                        (BACK_PLAYER_CARRY_FIRST_FRAME-1)*PLAYER_FRAME_WORDS_LOCAL,
+                        BACK_PLAYER_CARRY_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL);
+    upload_throw_sprite_words(FRONT_CHIP,THROW_BASE_WORD);
+    upload_throw_sprite_words(BACK_CHIP,BACK_MIRROR_THROW_WORD);
     vdc_set_vram_write(FRONT_CHIP,CONTINUE_PLAYER_BASE_WORD);
     for (i=0;i<768;++i) vdc_vram_write(FRONT_CHIP,g_continue_mario_words[i]);
     vdc_set_vram_write(FRONT_CHIP,CONTINUE_LUIGI_BASE_WORD);
     for (i=0;i<768;++i) vdc_vram_write(FRONT_CHIP,g_continue_luigi_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,GAMEPLAY_DOWN_MARIO_BASE_WORD);
-    for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_player_down_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,GAMEPLAY_DOWN_LUIGI_BASE_WORD);
-    for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_luigi_down_words[i]);
+    upload_sprite_words(FRONT_CHIP,GAMEPLAY_DOWN_MARIO_BASE_WORD,g_player_down_words,384);
+    upload_sprite_words(BACK_CHIP,BACK_MIRROR_DOWN_MARIO_WORD,g_player_down_words,384);
+    upload_sprite_words(FRONT_CHIP,GAMEPLAY_DOWN_LUIGI_BASE_WORD,g_luigi_down_words,384);
+    upload_sprite_words(BACK_CHIP,BACK_MIRROR_DOWN_LUIGI_WORD,g_luigi_down_words,384);
     /* A full two-player HUD is 18 entries / 288 sprite pixels on its busiest
        scanline, so its tail legitimately spills to VDC0.  Mirror all HUD art,
        not only world objects; otherwise Luigi's last hearts name unrelated
