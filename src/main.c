@@ -849,6 +849,7 @@ typedef struct {
     s32 x,y,vx,vy;
     int grounded,facing,anim_clock,jump_active,jump_index,down;
     int mode,death_timer,invuln,hearts,lives,out;
+    int carry_index,lift_timer,throw_timer,crate_hide,fireball_ammo;
     u16 prev_buttons;
 } SecondPlayer;
 static SecondPlayer g_luigi;
@@ -3089,6 +3090,8 @@ static void init_objects(void)
     init_moving_platforms();
     g_carry_index=-1;g_lift_timer=0;g_gem_count=0;g_invuln=0;
     g_crate_hide=0;
+    g_luigi.carry_index=-1;g_luigi.lift_timer=0;g_luigi.throw_timer=0;
+    g_luigi.crate_hide=0;
     for(i=0;i<MAX_FIREBALLS;++i)g_fireballs[i].active=0;
     for(i=0;i<MAX_ITEMS;++i)g_items[i].active=0;
     g_enemy_freeze=0;
@@ -3102,10 +3105,15 @@ static void update_crates(void)
         int x,y,bottom,old_bottom,crate_top;
         if (!c->active) continue;
         if (c->carried) {
-            c->x=g_player_x+(s32)4*FIX_ONE;
-            /* The disguised 24px crate rests on Mario's standing surface
-               (anchor + 24), rather than floating six pixels above it. */
-            c->y=g_player_y+(s32)(g_crate_hide?24:-13)*FIX_ONE;
+            if (multiplayer_active() && g_luigi.carry_index==i) {
+                c->x=g_luigi.x+(s32)4*FIX_ONE;
+                c->y=g_luigi.y+(s32)(g_luigi.crate_hide?24:-13)*FIX_ONE;
+            } else {
+                c->x=g_player_x+(s32)4*FIX_ONE;
+                /* The disguised 24px crate rests on the carrier's standing
+                   surface (anchor + 24), rather than floating above it. */
+                c->y=g_player_y+(s32)(g_crate_hide?24:-13)*FIX_ONE;
+            }
             c->vx=c->vy=0;
             c->thrown=0;
             continue;
@@ -3179,6 +3187,24 @@ static int find_pickup_crate(void)
                   cx, cy, CRATE_W, CRATE_H)) continue;
         d = iabs_i((cx + 12) - (px + 8));
         if (d < bestd) { bestd = d; best = i; }
+    }
+    return best;
+}
+
+static int find_luigi_pickup_crate(void)
+{
+    int i;
+    int px=(int)(g_luigi.x>>FIX_SHIFT)+PLAYER_BODY_XOFF;
+    int py=(int)(g_luigi.y>>FIX_SHIFT)+PLAYER_BODY_YOFF;
+    int best=-1,bestd=9999;
+    for(i=0;i<MAX_CRATES;++i){
+        int cx,cy,d;
+        if(!g_crates[i].active||g_crates[i].carried)continue;
+        cx=(int)(g_crates[i].x>>FIX_SHIFT);cy=(int)(g_crates[i].y>>FIX_SHIFT);
+        if(!aabb(px-20,py-8,PLAYER_BODY_W+40,PLAYER_BODY_H+16,
+                 cx,cy,CRATE_W,CRATE_H))continue;
+        d=iabs_i((cx+12)-(px+8));
+        if(d<bestd){bestd=d;best=i;}
     }
     return best;
 }
@@ -3270,6 +3296,36 @@ static void fire_fireball(void)
     f->life=52;
     g_throw_timer=31;
     /* As with a crate throw, air firing keeps normal horizontal control. */
+    Play_Sound_Sample(SFX_FIREBALL,0,0);
+}
+
+static void do_luigi_crate_action(u16 btn)
+{
+    if(g_luigi.carry_index>=0){
+        Crate *c=&g_crates[g_luigi.carry_index];
+        spawn_crate_item(c);c->carried=0;
+        if(btn&JOY_UP){c->x=g_luigi.x+4*FIX_ONE;c->y=g_luigi.y-8*FIX_ONE;c->vx=0;c->vy=-6*FIX_ONE;}
+        else if(btn&JOY_DOWN){c->x=g_luigi.x+4*FIX_ONE;c->y=g_luigi.y+34*FIX_ONE;c->vx=0;c->vy=6*FIX_ONE;}
+        else{c->x=g_luigi.x+(g_luigi.facing>0?18:-14)*FIX_ONE;c->y=g_luigi.y+26*FIX_ONE;c->vx=g_luigi.facing*6*FIX_ONE;c->vy=0;}
+        c->thrown=1;c->flight_timer=0;g_luigi.carry_index=-1;
+        g_luigi.lift_timer=0;g_luigi.throw_timer=31;
+        Play_Sound_Sample(SFX_CRATE_THROW,0,0);
+    }else{
+        int i=find_luigi_pickup_crate();
+        if(i>=0){g_luigi.carry_index=i;g_crates[i].carried=1;g_crates[i].thrown=0;g_luigi.lift_timer=18;g_luigi.vx=0;}
+    }
+}
+
+static void fire_luigi_fireball(void)
+{
+    int i;Fireball *f=0;
+    if((!g_debug_mode&&g_luigi.fireball_ammo<=0)||g_luigi.mode!=PMODE_NORMAL)return;
+    for(i=0;i<MAX_FIREBALLS;++i)if(!g_fireballs[i].active){f=&g_fireballs[i];break;}
+    if(!f)return;
+    if(!g_debug_mode)--g_luigi.fireball_ammo;
+    f->active=1;f->x=g_luigi.x+(g_luigi.facing>0?32:-24)*FIX_ONE;
+    f->y=g_luigi.y+16*FIX_ONE;f->vx=g_luigi.facing*7*FIX_ONE;f->life=52;
+    g_luigi.throw_timer=31;
     Play_Sound_Sample(SFX_FIREBALL,0,0);
 }
 
@@ -3398,11 +3454,13 @@ static void finish_mario_multiplayer_death(void)
     g_player_x=(s32)((int)(g_player_x>>FIX_SHIFT))<<FIX_SHIFT;
     g_player_y=(s32)g_camera_y<<FIX_SHIFT;
     g_vx=g_vy=0;g_death_timer=0;g_player_hearts=PLAYER_MAX_HEARTS;
+    g_fireball_ammo=3;
     g_player_mode=PMODE_REENTRY;
 }
 
 static void hurt_luigi(void)
 {
+    if(g_luigi.crate_hide&&g_luigi.carry_index>=0)return;
     if(g_luigi.mode!=PMODE_NORMAL||g_luigi.invuln>0||g_luigi.out)return;
     if(g_luigi.hearts>0)--g_luigi.hearts;
     g_luigi.invuln=HURT_FRAMES;
@@ -3411,6 +3469,11 @@ static void hurt_luigi(void)
 static void begin_luigi_death(void)
 {
     if(g_luigi.mode!=PMODE_NORMAL||g_luigi.out)return;
+    if(g_luigi.carry_index>=0){
+        Crate *c=&g_crates[g_luigi.carry_index];
+        c->carried=0;c->thrown=0;c->vx=c->vy=0;
+        g_luigi.carry_index=-1;g_luigi.crate_hide=0;
+    }
     g_luigi.mode=PMODE_DYING;g_luigi.death_timer=0;g_luigi.invuln=0;
     g_luigi.vx=0;g_luigi.vy=-(6*FIX_ONE+FIX_ONE/2);g_luigi.down=0;
     Play_Sound_Sample(SFX_PLAYER_DEATH,0,0);
@@ -3432,7 +3495,8 @@ static void update_luigi(u16 btn,u16 pressed)
             if(g_luigi.lives>0)--g_luigi.lives;
             if(g_luigi.lives<=0){g_luigi.lives=0;g_luigi.out=1;g_luigi.mode=PMODE_OUT;if(g_player_mode==PMODE_OUT)multiplayer_all_out();return;}
             g_luigi.y=(s32)g_camera_y<<FIX_SHIFT;g_luigi.vx=g_luigi.vy=0;g_luigi.down=0;
-            g_luigi.death_timer=0;g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.mode=PMODE_REENTRY;
+            g_luigi.death_timer=0;g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.fireball_ammo=3;
+            g_luigi.mode=PMODE_REENTRY;
         }
         return;
     }
@@ -3452,15 +3516,24 @@ static void update_luigi(u16 btn,u16 pressed)
     g_player_x=g_luigi.x;g_player_y=g_luigi.y;g_vx=g_luigi.vx;g_vy=g_luigi.vy;
     g_grounded=g_luigi.grounded;g_facing=g_luigi.facing;g_jump_active=g_luigi.jump_active;g_jump_index=g_luigi.jump_index;
     g_prev_body_y=player_body_y();g_on_moving_platform=-1;g_drop_platform_timer=0;
-    g_luigi.down=(g_grounded&&(btn&JOY_DOWN))?1:0;
+    g_luigi.crate_hide=(g_luigi.carry_index>=0&&g_grounded&&(btn&JOY_DOWN))?1:0;
+    g_luigi.down=(g_luigi.carry_index<0&&g_grounded&&g_luigi.lift_timer==0&&
+                  g_luigi.throw_timer==0&&(btn&JOY_DOWN))?1:0;
+    if((pressed&JOY_II)&&!g_luigi.crate_hide&&g_luigi.lift_timer==0&&g_luigi.throw_timer==0)
+        do_luigi_crate_action(btn);
+    if((pressed&JOY_III)&&g_luigi.lift_timer==0&&g_luigi.throw_timer==0)
+        fire_luigi_fireball();
     if(g_luigi.down&&!(pressed&JOY_I))g_vx=0;
+    else if(g_luigi.lift_timer>0){--g_luigi.lift_timer;g_vx=0;}
+    else if(g_luigi.throw_timer>0&&g_grounded)g_vx=0;
     else if(btn&JOY_LEFT){g_vx=-speed;g_facing=-1;}else if(btn&JOY_RIGHT){g_vx=speed;g_facing=1;}else g_vx=0;
-    if(g_grounded&&(pressed&JOY_I)){g_grounded=0;g_jump_active=1;g_jump_index=0;g_luigi.down=0;Play_Sound_Sample(SFX_JUMP,0,0);}
+    if(g_grounded&&(pressed&JOY_I)&&g_luigi.lift_timer==0&&g_luigi.throw_timer==0){g_grounded=0;g_jump_active=1;g_jump_index=0;g_luigi.down=0;g_luigi.crate_hide=0;Play_Sound_Sample(SFX_JUMP,0,0);}
     resolve_player_horizontal(g_player_x+g_vx);
     if((int)(g_player_x>>FIX_SHIFT)<g_camera_x)g_player_x=(s32)g_camera_x<<FIX_SHIFT;
     if(g_jump_active){int dy;if(g_jump_index<=19&&!(btn&JOY_I))g_jump_index=44-g_jump_index;if(g_jump_index>44)g_jump_index=44;dy=g_md_jump_dy[g_jump_index++];g_vy=(s32)dy*FIX_ONE;resolve_player_vertical(g_player_y+g_vy);if(g_jump_index>=45)g_jump_active=0;}
     else{g_vy+=88;if(g_vy>5*FIX_ONE)g_vy=5*FIX_ONE;resolve_player_vertical(g_player_y+g_vy);}
     g_luigi.x=g_player_x;g_luigi.y=g_player_y;g_luigi.vx=g_vx;g_luigi.vy=g_vy;g_luigi.grounded=g_grounded;g_luigi.facing=g_facing;g_luigi.jump_active=g_jump_active;g_luigi.jump_index=g_jump_index;++g_luigi.anim_clock;
+    if(g_luigi.throw_timer>0)--g_luigi.throw_timer;
     if(g_player_mode==PMODE_OUT)update_camera();
     g_player_x=ox;g_player_y=oy;g_vx=ovx;g_vy=ovy;g_grounded=og;g_facing=of;g_jump_active=oja;g_jump_index=oji;g_prev_body_y=opby;g_on_moving_platform=oop;g_drop_platform_timer=odrop;
     if((int)(g_luigi.y>>FIX_SHIFT)>player_pit_floor()){begin_luigi_death();return;}
@@ -3490,34 +3563,41 @@ static void hurt_player(void)
    $9C -- the port's SFX_MENU_CONFIRM -- is the shared collect chime played by
    the caller; the $B0 jingle the life and ammo entries add on top of it has no
    capture in the ADPCM bank, so those two are left with the chime alone. */
-static void apply_item(unsigned char kind)
+static void apply_item(unsigned char kind, int player2)
 {
     switch (kind) {
     case ITEM_FULL_HEAL:
-        g_player_hearts = PLAYER_MAX_HEARTS;
+        if(player2)g_luigi.hearts=PLAYER_MAX_HEARTS;
+        else g_player_hearts=PLAYER_MAX_HEARTS;
         break;
     case ITEM_FIRST_AID:
-        if (g_player_hearts < PLAYER_MAX_HEARTS) ++g_player_hearts;
+        if(player2){if(g_luigi.hearts<PLAYER_MAX_HEARTS)++g_luigi.hearts;}
+        else if(g_player_hearts<PLAYER_MAX_HEARTS)++g_player_hearts;
         break;
     case ITEM_POISON:
         /* The one harmful box.  $15AF4 spends a heart with the ordinary hurt
            sound and kills outright at zero, granting no mercy invulnerability
            the way an enemy hit does. */
-        if (g_player_hearts > 0) --g_player_hearts;
+        if(player2){if(g_luigi.hearts>0)--g_luigi.hearts;}
+        else if(g_player_hearts>0)--g_player_hearts;
         Play_Sound_Sample(SFX_PLAYER_HURT,0,0);
-        if (g_player_hearts <= 0) g_hurt_pending_death = 1;
+        if(player2){if(g_luigi.hearts<=0)begin_luigi_death();}
+        else if(g_player_hearts<=0)g_hurt_pending_death=1;
         break;
     case ITEM_EXTRA_LIFE:
-        if (g_lives < 9) ++g_lives;
+        if(player2){if(g_luigi.lives<9)++g_luigi.lives;}
+        else if(g_lives<9)++g_lives;
         break;
     case ITEM_STOPWATCH:
         g_enemy_freeze = STOPWATCH_FRAMES;
         break;
     case ITEM_SHIELD:
-        g_invuln = SHIELD_FRAMES;
+        if(player2)g_luigi.invuln=SHIELD_FRAMES;
+        else g_invuln=SHIELD_FRAMES;
         break;
     case ITEM_FIREBALL:
-        if (g_fireball_ammo < 9) ++g_fireball_ammo;
+        if(player2){if(g_luigi.fireball_ammo<9)++g_luigi.fireball_ammo;}
+        else if(g_fireball_ammo<9)++g_fireball_ammo;
         break;
     default:
         break;
@@ -3556,13 +3636,21 @@ static void update_items(void)
             }
             continue;
         }
-        if (g_player_mode != PMODE_NORMAL) continue;
-        if (!aabb(px, py, 28, 44,
-                  (int)(it->x >> FIX_SHIFT) + 4, (int)(it->y >> FIX_SHIFT),
-                  ITEM_W - 4, ITEM_H - 4)) continue;
+        {
+            int player2=0;
+            int ix=(int)(it->x>>FIX_SHIFT)+4,iy=(int)(it->y>>FIX_SHIFT);
+            if(g_player_mode!=PMODE_NORMAL||
+               !aabb(px,py,28,44,ix,iy,ITEM_W-4,ITEM_H-4)){
+                int lx=(int)(g_luigi.x>>FIX_SHIFT)+4;
+                int ly=(int)(g_luigi.y>>FIX_SHIFT);
+                if(!multiplayer_active()||g_luigi.out||g_luigi.mode!=PMODE_NORMAL||
+                   !aabb(lx,ly,28,44,ix,iy,ITEM_W-4,ITEM_H-4))continue;
+                player2=1;
+            }
         it->active = 0;
         Play_Sound_Sample(SFX_MENU_CONFIRM,0,0);
-        apply_item(it->kind);
+            apply_item(it->kind,player2);
+        }
     }
 }
 
@@ -4588,13 +4676,18 @@ static void draw_game_sprites(void)
         set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
     if(multiplayer_active() && n<GAME_SPRITE_CAPACITY){
-        int lives=g_luigi.lives;
+        int lives=g_luigi.lives,digit=g_luigi.fireball_ammo;
         if(lives<0)lives=0;if(lives>9)lives=9;
-        set_sprite_entry(satb,n++,136,209+hud_yoff,HUD_LIFE_BASE_WORD,
+        if(digit<0)digit=0;if(digit>9)digit=9;
+        set_sprite_entry(satb,n++,120,209+hud_yoff,HUD_LIFE_BASE_WORD,
             (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LUIGI_SPR_PAL));
-        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,160,217+hud_yoff,
+        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,144,217+hud_yoff,
             (u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
-        emit_hud_hearts(satb,&n,168,217+hud_yoff,g_luigi.hearts,LUIGI_SPR_PAL);
+        emit_hud_hearts(satb,&n,152,217+hud_yoff,g_luigi.hearts,LUIGI_SPR_PAL);
+        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,200,209+hud_yoff,
+            HUD_FIRE_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
+        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,216,217+hud_yoff,
+            (u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
     }
     /* Everything emitted from here on is world content and may be occluded by
        a front-plane scenery layer; the HUD above never is. */
@@ -4671,13 +4764,17 @@ static void draw_game_sprites(void)
     /* SATB entries with lower indices win sprite/sprite overlap.  A carried
        crate is the one exception to the normal object ordering: it must cover
        Mario's hands/body, while every world crate remains behind Mario. */
-    if (g_carry_index>=0 && g_carry_index<MAX_CRATES &&
-        g_crates[g_carry_index].active && g_crates[g_carry_index].carried && n<GAME_SPRITE_CAPACITY) {
-        Crate *c=&g_crates[g_carry_index];
+    {
+      int owner;
+      for(owner=0;owner<(multiplayer_active()?2:1)&&n<GAME_SPRITE_CAPACITY;++owner){
+        int carry=owner?g_luigi.carry_index:g_carry_index;
+        Crate *c;
+        if(carry<0||carry>=MAX_CRATES||!g_crates[carry].active||!g_crates[carry].carried)continue;
+        c=&g_crates[carry];
         int sx=(int)(c->x>>FIX_SHIFT)-cam_x;
         int sy=(int)(c->y>>FIX_SHIFT)-cam_y+bowser_room_object_y_offset();
         if (sx>=-32 && sx<=255 && sy>=-32 && sy<=239) {
-            u16 addr=CRATE_BASE_WORD,pal=player_pal;
+            u16 addr=CRATE_BASE_WORD,pal=owner?LUIGI_SPR_PAL:player_pal;
             int width=2,height=2;
             if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
                (g_in_boss&&g_boss_class==1)) {
@@ -4695,6 +4792,7 @@ static void draw_game_sprites(void)
                 (width==2?VDC_SPR_X_WIDTH_2:0) |
                 (height==2?VDC_SPR_Y_HEIGHT_2:0) | pal));
         }
+      }
     }
 
     if (g_invuln>0 && g_player_mode==PMODE_NORMAL)
@@ -4741,6 +4839,7 @@ static void draw_game_sprites(void)
                         VDC_SPR_Y_HEIGHT_1|LUIGI_SPR_PAL);
         int visible=(g_luigi.invuln<=0)||
                     (((g_luigi.invuln/HURT_FLICKER_HALF_PERIOD)&1)!=0);
+        if(g_luigi.crate_hide&&g_luigi.carry_index>=0)visible=0;
         if (g_luigi.mode==PMODE_DYING) {
             lf=((const unsigned char[]){4,5,6,5})[(g_luigi.death_timer/6)&3];
             la=(u16)(PLAYER_BASE_WORD+(lf-1)*PLAYER_FRAME_WORDS_LOCAL);
@@ -4751,6 +4850,8 @@ static void draw_game_sprites(void)
             lc=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_1|
                      (g_in_boss?BOSS_CROUCH_SPR_PAL:CONTINUE_PLAYER_SPR_PAL));
             ly+=8;
+        } else if(g_luigi.throw_timer>0){
+            la=THROW_BASE_WORD;
         } else {
             if (!g_luigi.grounded) lf=4;
             else if (g_luigi.vx) lf=((const unsigned char[]){1,2,1,3})[(g_luigi.anim_clock/7)&3];
@@ -4758,9 +4859,21 @@ static void draw_game_sprites(void)
         }
         if(g_luigi.facing<0)lc|=VDC_SPR_X_INVERT;
         if(visible || g_luigi.mode==PMODE_DYING || g_luigi.mode==PMODE_REENTRY){
-            set_sprite_entry(satb,n++,lx,ly,la,lc);
-            set_sprite_entry(satb,n++,lx,ly+16,(u16)(la+PLAYER_STRIP_WORDS),lc);
-            set_sprite_entry(satb,n++,lx,ly+32,(u16)(la+PLAYER_STRIP_WORDS*2),lc);
+            if(g_luigi.throw_timer>0){
+                u16 tc=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_Y_HEIGHT_2|LUIGI_SPR_PAL);
+                if(g_luigi.facing>0){
+                    set_sprite_entry(satb,n++,lx,ly+16,THROW_BASE_WORD,(u16)(tc|VDC_SPR_X_WIDTH_2));
+                    set_sprite_entry(satb,n++,lx+32,ly+16,(u16)(THROW_BASE_WORD+256),tc);
+                }else{
+                    tc|=VDC_SPR_X_INVERT;
+                    set_sprite_entry(satb,n++,lx+16,ly+16,THROW_BASE_WORD,(u16)(tc|VDC_SPR_X_WIDTH_2));
+                    set_sprite_entry(satb,n++,lx,ly+16,(u16)(THROW_BASE_WORD+256),tc);
+                }
+            }else{
+                set_sprite_entry(satb,n++,lx,ly,la,lc);
+                set_sprite_entry(satb,n++,lx,ly+16,(u16)(la+PLAYER_STRIP_WORDS),lc);
+                set_sprite_entry(satb,n++,lx,ly+32,(u16)(la+PLAYER_STRIP_WORDS*2),lc);
+            }
         }
     }
 
@@ -5228,7 +5341,7 @@ static void start_boss(int fade_in)
     g_player_x=(s32)x<<FIX_SHIFT;g_player_y=(s32)y<<FIX_SHIFT;
     g_vx=g_vy=0;g_grounded=(y>=144);g_facing=1;
     g_player_anim_clock=0;g_jump_active=0;g_bounce_active=0;g_camera_x=0;g_camera_tile=0;g_camera_hold=0;
-    if(!g_keep_ammo)g_fireball_ammo=3;g_keep_ammo=0;
+    if(!g_keep_ammo){g_fireball_ammo=3;g_luigi.fireball_ammo=3;}g_keep_ammo=0;
     g_player_hearts=PLAYER_MAX_HEARTS;g_invuln=0;g_hurt_pending_death=0;g_throw_timer=0;g_death_timer=0;
 
     /* Loader $6CDE reads three words from $6DBA. The first two are the boss
@@ -5279,6 +5392,7 @@ static void start_boss(int fade_in)
         g_luigi.anim_clock=0;g_luigi.jump_active=0;g_luigi.jump_index=0;g_luigi.down=0;
         g_luigi.mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;g_luigi.death_timer=0;
         g_luigi.invuln=0;g_luigi.hearts=PLAYER_MAX_HEARTS;
+        g_luigi.carry_index=-1;g_luigi.lift_timer=0;g_luigi.throw_timer=0;g_luigi.crate_hide=0;
     }
     music_start_at_black();
     draw_game_sprites();
@@ -6350,7 +6464,7 @@ static void start_gameplay(int fade_in)
     g_jump_active=0; g_jump_index=0;
     g_bounce_active=0; g_bounce_index=0;
     g_camera_hold=0;
-    if(!g_keep_ammo)g_fireball_ammo=3;
+    if(!g_keep_ammo){g_fireball_ammo=3;g_luigi.fireball_ammo=3;}
     g_keep_ammo=0;
     g_player_hearts=PLAYER_MAX_HEARTS;
     g_invuln=0;
@@ -6364,6 +6478,7 @@ static void start_gameplay(int fade_in)
         g_luigi.anim_clock=0;g_luigi.jump_active=0;g_luigi.jump_index=0;g_luigi.down=0;
         g_luigi.mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;g_luigi.death_timer=0;
         g_luigi.invuln=0;g_luigi.hearts=PLAYER_MAX_HEARTS;
+        g_luigi.carry_index=-1;g_luigi.lift_timer=0;g_luigi.throw_timer=0;g_luigi.crate_hide=0;
     }
     {int c;for(c=0;c<PALETTE_CYCLE_COUNT;++c)g_palette_cycle_shift[c]=0;}
     set_game_palette_fade(fade_in?0:16);
@@ -6385,11 +6500,12 @@ static void update_play(u16 btn, u16 pressed)
         g_debug_mode^=1;
         if (g_debug_mode) {
             g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;
+            g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.fireball_ammo=DEBUG_AMMO_DISPLAY;
             g_invuln=0;g_hurt_pending_death=0;
             if(g_player_mode==PMODE_DYING||g_player_mode==PMODE_FADE_OUT)g_player_mode=PMODE_NORMAL;
         }
     }
-    if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;}
+    if (g_debug_mode) {g_player_hearts=PLAYER_MAX_HEARTS;g_fireball_ammo=DEBUG_AMMO_DISPLAY;g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.fireball_ammo=DEBUG_AMMO_DISPLAY;}
     /* START pauses active play only.  music_update() remains in the outer
        frame loop, so the Red Book track continues without a fade or seek. */
     if (g_player_mode==PMODE_NORMAL && (pressed&JOY_RUN)) {
@@ -7390,7 +7506,8 @@ static void update_frontend(u16 pressed)
                pool; do not consume a reserve merely for entering gameplay. */
             g_lives=4; g_continues=5; g_current_level=0; g_in_boss=0;
             g_luigi.lives=4;g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.out=0;
-            g_luigi.mode=PMODE_NORMAL;g_luigi.prev_buttons=0;
+            g_luigi.mode=PMODE_NORMAL;g_luigi.prev_buttons=0;g_luigi.fireball_ammo=3;
+            g_luigi.carry_index=-1;g_luigi.lift_timer=0;g_luigi.throw_timer=0;g_luigi.crate_hide=0;
 #ifdef FORCE_LEVEL
             g_current_level=FORCE_LEVEL;
 #endif
