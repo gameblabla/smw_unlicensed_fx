@@ -1217,7 +1217,8 @@ static int sprite_height(u16 ctrl)
    VDC0 entry covers any of the same scanlines.  That conservative barrier,
    plus retaining source order inside each SATB, preserves sprite overlap
    priority while doubling the 16-sprite/256-pixel scanline budget. */
-static void submit_game_satbs(const u16 *logical,int logical_count)
+static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
+                              int logical_count)
 {
     static u16 front[64*4],back[64*4];
     unsigned char front_count[240]={0},back_count[240]={0},back_used[240]={0};
@@ -1227,29 +1228,41 @@ static void submit_game_satbs(const u16 *logical,int logical_count)
     u16 back_base=(u16)(g_back_satb_page?BACK_SATB_BASE1:BACK_SATB_BASE0);
     for(i=0;i<64*4;++i)front[i]=back[i]=0;
 
-    for(i=0;i<logical_count;++i){
-        const u16 *e=logical+i*4;
-        int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
-        int width=(e[3]&VDC_SPR_X_WIDTH_2)?32:16;
-        int first=y<0?0:y,last=y+h; int use_front=(nf<64),use_back=(nb<64);
-        if(last>240)last=240;
-        if(first<last){
-            for(j=first;j<last;++j){
-                if(back_used[j]||front_count[j]>=VDC_SPRITES_PER_LINE||
-                   front_pixels[j]+width>VDC_SPRITE_PIXELS_PER_LINE)use_front=0;
-                if(back_count[j]>=VDC_SPRITES_PER_LINE||
-                   back_pixels[j]+width>VDC_SPRITE_PIXELS_PER_LINE)use_back=0;
-            }
+    for(i=0;i<logical_count;){
+        unsigned char add_count[240]={0};
+        unsigned short add_pixels[240]={0};
+        int k,len=group_len[i]?group_len[i]:1;
+        int use_front=(nf+len<=64),use_back=(nb+len<=64);
+        if(i+len>logical_count)len=logical_count-i;
+
+        /* A moving platform is one visual object even when it occupies eight
+           SATB entries.  Measure the complete object before selecting a VDC;
+           assigning its strips independently lets them migrate across the
+           fixed VDC1-over-VDC0 mixer as scanline pressure changes. */
+        for(k=0;k<len;++k){
+            const u16 *e=logical+(i+k)*4;
+            int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
+            int width=(e[3]&VDC_SPR_X_WIDTH_2)?32:16;
+            int first=y<0?0:y,last=y+h;
+            if(last>240)last=240;
+            for(j=first;j<last;++j){++add_count[j];add_pixels[j]=(u16)(add_pixels[j]+width);}
+        }
+        for(j=0;j<240;++j){
+            if(back_used[j]||front_count[j]+add_count[j]>VDC_SPRITES_PER_LINE||
+               front_pixels[j]+add_pixels[j]>VDC_SPRITE_PIXELS_PER_LINE)use_front=0;
+            if(back_count[j]+add_count[j]>VDC_SPRITES_PER_LINE||
+               back_pixels[j]+add_pixels[j]>VDC_SPRITE_PIXELS_PER_LINE)use_back=0;
         }
         if(use_front){
-            for(j=0;j<4;++j)front[nf*4+j]=e[j];
-            ++nf;
-            for(j=first;j<last;++j){++front_count[j];front_pixels[j]=(u16)(front_pixels[j]+width);}
+            for(k=0;k<len;++k)for(j=0;j<4;++j)front[(nf+k)*4+j]=logical[(i+k)*4+j];
+            nf+=len;
+            for(j=0;j<240;++j){front_count[j]=(unsigned char)(front_count[j]+add_count[j]);front_pixels[j]=(u16)(front_pixels[j]+add_pixels[j]);}
         }else if(use_back){
-            for(j=0;j<4;++j)back[nb*4+j]=e[j];
-            ++nb;
-            for(j=first;j<last;++j){++back_count[j];back_pixels[j]=(u16)(back_pixels[j]+width);back_used[j]=1;}
+            for(k=0;k<len;++k)for(j=0;j<4;++j)back[(nb+k)*4+j]=logical[(i+k)*4+j];
+            nb+=len;
+            for(j=0;j<240;++j){back_count[j]=(unsigned char)(back_count[j]+add_count[j]);back_pixels[j]=(u16)(back_pixels[j]+add_pixels[j]);if(add_count[j])back_used[j]=1;}
         }
+        i+=len;
     }
 
     /* Prepare both hidden pages completely, then queue both SATB DMAs.  They
@@ -4519,6 +4532,7 @@ static void emit_hud_hearts(u16 *satb,int *n,int x,int y,int count,u16 palette)
 static void draw_game_sprites(void)
 {
     static u16 satb[GAME_SPRITE_CAPACITY * 4];
+    static unsigned char group_len[GAME_SPRITE_CAPACITY];
     int i, n = 0;
     int frame = current_player_frame();
     /* The HuC6270 fetches the SATB list at the VDW->VCR transition, ahead of
@@ -4554,6 +4568,7 @@ static void draw_game_sprites(void)
     int hud_yoff=(g_in_boss||(!g_in_boss&&g_current_level==2))?-16:0;
 
     for (i = 0; i < GAME_SPRITE_CAPACITY * 4; ++i) satb[i] = 0;
+    for (i = 0; i < GAME_SPRITE_CAPACITY; ++i) group_len[i] = 1;
 
     /* Exact Mega Drive HUD object boundaries, emitted first in SATB so a busy
        room cannot drop them: 24x16 life icon/x, 16x16 fire icon, then live
@@ -4790,11 +4805,12 @@ static void draw_game_sprites(void)
        enemies so a busy screen cannot make the floor disappear. */
     for (i=0;i<g_moving_platform_count && n<GAME_SPRITE_CAPACITY-6;++i) {
         MovingPlatform *mp=&g_moving_platforms[i];
-        int sx,sy;
+        int sx,sy,group_start;
         if (mp->hidden) continue;   /* metasprite 0: parked out of the cycle */
         sx=platform_draw_x(mp)-cam_x;
         sy=platform_draw_y(mp)-cam_y+bowser_room_object_y_offset();
         if (sx<-platform_width(mp) || sx>255 || sy<-platform_height(mp) || sy>239) continue;
+        group_start=n;
         if(PLATFORM_KIND_IS_STAGE_OBJECT(mp->kind)){
             /* Cells are stored row-major with an even pitch, so each pair is
                128-word aligned and can go out as one 32-pixel-wide sprite. */
@@ -4834,6 +4850,7 @@ static void draw_game_sprites(void)
             set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2));
             if(n<GAME_SPRITE_CAPACITY-6)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),VDC_SPR_PRIO_SP);
         }
+        group_len[group_start]=(unsigned char)(n-group_start);
     }
 
     /* Projectiles are emitted ahead of the enemies: a screen full of stage
@@ -5064,7 +5081,7 @@ static void draw_game_sprites(void)
     if (level_front_scenery_over_sprites())
         for (i=hud_entries;i<n;++i) satb[i*4+3]&=(u16)~VDC_SPR_PRIO_SP;
 
-    submit_game_satbs(satb,n);
+    submit_game_satbs(satb,group_len,n);
 }
 
 static void set_continue_palette_fade(int level)
