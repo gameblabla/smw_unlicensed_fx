@@ -6775,21 +6775,29 @@ static void add_menu_32x48(u16 *satb,int *n,int x,int y,u16 addr,int facing,u16 
 static void draw_menu_people(int walking)
 {
     static u16 satb[64*4];
+    static const unsigned char luigi_walk_frames[4]={0,1,0,2};
     int i,n=0;
     int frame=walking?(int)((g_state_frame/5)&3):0;
     int mx=walking?(int)(g_menu_mario_x>>FIX_SHIFT):38;
+    int my=walking?152:160;
     for (i=0;i<64*4;++i) satb[i]=0;
 
     /* Palette line 15 is no longer needed by PUSH START once the menu is up. */
     for (i=0;i<16;++i) tetsu_set_palette((u16)(240+i),fade_yuv(g_menu_mario_palette[i],g_menu_sprite_fade));
 
-    add_menu_32x48(satb,&n,mx,160,
+    add_menu_32x48(satb,&n,mx,my,
         (u16)(MENU_MARIO_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL),1,15);
-    if (g_menu_choice==MENU_2P)
-        /* Keep Luigi beside Mario during the confirmation walk.  His menu
-           art is a single standing cel, but the pair must share Mario's
-           moving X position so Luigi does not remain behind at the menu. */
-        add_menu_32x48(satb,&n,mx+30,160,MENU_LUIGI_BASE_WORD,1,15);
+    if (g_menu_choice==MENU_2P) {
+        u16 la=MENU_LUIGI_BASE_WORD;
+        /* The menu asset has one idle cel; the resident opening bank has the
+           matching green walk cels. Use the player's 1,2,1,3 walk sequence,
+           not the adjacent jump/death graphics, and compensate its eight
+           pixels of metasprite top padding. */
+        if (walking)
+            la=(u16)(BOOT_LUIGI_BASE_WORD+
+                     luigi_walk_frames[frame]*PLAYER_FRAME_WORDS_LOCAL);
+        add_menu_32x48(satb,&n,mx+30,my,la,1,15);
+    }
 
     /* Never scroll VDC1 during the menu. r5's scroll-based walk caused the
        brief centered/shifted frame during transitions. */
