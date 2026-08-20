@@ -8,6 +8,12 @@ import wave
 
 RATE = 16000
 ALIGN_WORDS = 256
+KRAM_BUDGET_BYTES = 256 * 1024
+# KING's interpolation field is part of the decoder state.  At 16 kHz one
+# selected nibble is held for two output samples, so the decoder applies half
+# of the native delta on each of those two updates.  The encoder must choose a
+# nibble from the predictor value after both updates, not after the first one.
+ADPCM_RATE_FIELD = {32000: 0, 16000: 1, 8000: 2, 4000: 3}[RATE]
 # Preserve the source effects' relative loudness while using the 14-bit KING
 # predictor's range.  The loudest selected capture peaks just below 0x2000.
 ENCODE_GAIN = 1.9
@@ -142,6 +148,18 @@ def command_tuning(command):
     return {}
 
 
+def decode_step(predictor, step_index, nibble):
+    """Mirror one KING nibble, including its interpolation hold time."""
+    delta = STEP_SIZES[step_index] * ((nibble & 7) + 1)
+    delta >>= ADPCM_RATE_FIELD
+    if nibble & 8:
+        delta = -delta
+    step_index = clamp(step_index + STEP_DELTAS[nibble], 0, 48)
+    for _ in range(1 << ADPCM_RATE_FIELD):
+        predictor = clamp(predictor + delta, -0x4000, 0x3fff)
+    return predictor, step_index
+
+
 def encode(samples):
     """Encode the KING/SoundBox 4-bit ADPCM stream (four nibbles per word)."""
     predictor = step_index = 0
@@ -150,18 +168,15 @@ def encode(samples):
         target = clamp(sample, -0x4000, 0x3fff)
         best = None
         for nibble in range(16):
-            # At 16 kHz the interpolation divider is two: the hardware
-            # applies the full native SoundBox delta across two output
-            # samples, so each sample sees only half of it.
-            delta = STEP_SIZES[step_index] * ((nibble & 7) + 1)
-            if nibble & 8:
-                delta = -delta
-            candidate = clamp(predictor + delta // 2, -0x4000, 0x3fff)
+            # Score the predictor the decoder will actually reach after the
+            # complete interpolation hold.  The old converter scored only
+            # the first half-step, so its encoder state drifted away from the
+            # hardware state and accumulated harsh noise on later samples.
+            candidate, candidate_index = decode_step(predictor, step_index, nibble)
             error = (target - candidate) ** 2
             if best is None or error < best[0]:
-                best = (error, nibble, candidate)
-        _, nibble, predictor = best
-        step_index = clamp(step_index + STEP_DELTAS[nibble], 0, 48)
+                best = (error, nibble, candidate, candidate_index)
+        _, nibble, predictor, step_index = best
         nibbles.append(nibble)
     while len(nibbles) % 4:
         nibbles.append(0)
@@ -194,8 +209,8 @@ def main():
         print('%-12s: %6d PCM samples, %5d ADPCM bytes' %
               (name, len(prepared), len(encoded)))
 
-    if len(bank) > 512 * 1024:
-        raise ValueError('ADPCM bank exceeds the 512 KiB KRAM page')
+    if len(bank) > KRAM_BUDGET_BYTES:
+        raise ValueError('ADPCM bank exceeds the 256 KiB KRAM budget')
     if any(start > 0xffff or count > 0xffff for start, count in metas):
         raise ValueError('ADPCM metadata exceeds its 16-bit word fields')
 

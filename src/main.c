@@ -155,12 +155,14 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PLATFORM_KIND_SHUTTLE   5   /* handler 3  */
 /* $F78E's shuttle runs 70 pixels left of its record and back. */
 #define SHUTTLE_RUN      70
-/* Slot 12's shaft asks the player to cross between shuttles that only ever
-   retreat from him, which leaves one frame per 140 to make each jump.  Carry
-   its run the same distance again past the record so it comes to meet him.
-   This is a deliberate deviation the user asked for, and it is confined to
-   that level: every other stage keeps the exact run. */
-#define SHUTTLE_OVERRUN_LEVEL 11
+/* These shafts ask the player to cross between shuttles that can retreat from
+   him, which leaves too little time to make the jump.  Carry their run the
+   same distance again past the record so each carrier comes farther toward
+   him.  The adjustment is confined to the two requested late stages and the
+   earlier shaft that already had this accessibility fix. */
+#define SHUTTLE_OVERRUN_LEVEL_12 11
+#define SHUTTLE_OVERRUN_LEVEL_13 12
+#define SHUTTLE_OVERRUN_LEVEL_19 18
 #define SHUTTLE_OVERRUN       70
 #define PLATFORM_KIND_FALLER    6   /* handler 4  */
 #define PLATFORM_KIND_DESCEND   7   /* handler 5  */
@@ -1462,8 +1464,8 @@ static void upload_game_sprites(void)
     upload_world_sprite_words(HUD_LIFE_BASE_WORD,g_hud_life_words,128);
     upload_world_sprite_words(HUD_FIRE_BASE_WORD,g_hud_fire_words,64);
     upload_world_sprite_words(CRATE_BASE_WORD,g_crate_sprite_words,256);
-    /* Level 3 uses the same supplied pot object as boss 3, while the later
-       boss rooms upload their complete auxiliary bank in start_boss(). */
+    /* Boss 3 uses the supplied pot object; upload it with the shared gameplay
+       bank so entering that room does not need a mid-frame pattern transfer. */
     upload_world_sprite_words(BOSS_POT_BASE_WORD,g_boss_pot_words,256);
     upload_world_sprite_words(GEM_BASE_WORD,g_gem_sprite_words,192);
     upload_world_sprite_words(FIREBALL_BASE_WORD,g_fireball_sprite_words,256);
@@ -1609,10 +1611,9 @@ static void set_game_palette_fade(int level)
             for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),fade_yuv(v->palette[j],level));
         }
     }
-    /* World 3's stage crates (levels 7, 8 and 9; zero-based slots 6..8) are
-       the same pot object used by boss 3. Keep their supplied purple/grey
-       palette on a dedicated sprite line. */
-    if(!g_in_boss&&g_current_level>=6&&g_current_level<=8)
+    /* Boss 3's stage object is the supplied pot.  Normal stages, including
+       World 3 and all later worlds, keep the ordinary crate palette. */
+    if(g_in_boss&&g_boss_class==1)
         for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_pot_palette[i],level));
     /* Level 8's carriers and wedges are all on source palette line 2. */
     if(!g_in_boss&&g_current_level==7)
@@ -2474,9 +2475,9 @@ static void update_camera(void)
 }
 
 /* Slot 9's fake parallax.  $14804 fills the Mega Drive's per-cell horizontal
-   scroll table for plane B from four free-running counters, none of which is
-   tied to the camera at all -- which is why its clouds keep moving while Mario
-   stands still, and why the sky never slides at a fraction of his speed:
+   scroll table for plane B from four free-running counters.  The counters
+   make the cloud bands drift while the player stands still; the camera base
+   below makes them follow the level when the player moves:
 
      rows   0..32   $FF008E   +1 every 8 frames   (drifts right)
      rows  33..56   $FF0064   -1 every 4 frames   (drifts left)
@@ -2521,20 +2522,24 @@ static void wait_raster(int line)
 
 static void backdrop_parallax_splits(void)
 {
-    int chip;
+    int chip,camera;
     unsigned t;
     if(g_in_boss || !g_level || g_current_level!=PARALLAX_LEVEL) return;
     chip=level_backdrop_chip();
     t=g_parallax_clock;
+    /* Use the camera target rather than the already-published camera.  The
+       target is what the next frame's BAT/scroll commit will use, so the
+       raster bands do not lag one frame behind the clouds' backdrop. */
+    camera=(int)((g_camera_target_x>>1)&0x1FF);
     /* BXR counts the view rightwards, so a band that drifts right on screen
        needs a falling BXR.  The plane is 64 cells wide and wraps at 512. */
-    vdc_setreg(chip,VDC_REG_BXR,(int)((0u-(t>>3))&0x1FFu));
+    vdc_setreg(chip,VDC_REG_BXR,(camera-(int)(t>>3))&0x1FF);
     wait_raster(PARALLAX_SPLIT_B);
-    vdc_setreg(chip,VDC_REG_BXR,(int)((t>>2)&0x1FFu));
+    vdc_setreg(chip,VDC_REG_BXR,(camera+(int)(t>>2))&0x1FF);
     wait_raster(PARALLAX_SPLIT_C);
-    vdc_setreg(chip,VDC_REG_BXR,(int)((t>>3)&0x1FFu));
+    vdc_setreg(chip,VDC_REG_BXR,(camera+(int)(t>>3))&0x1FF);
     wait_raster(PARALLAX_SPLIT_END);
-    vdc_setreg(chip,VDC_REG_BXR,(int)((g_camera_x>>1)&0x1FF));
+    vdc_setreg(chip,VDC_REG_BXR,camera);
 }
 
 static void commit_stage_camera(void)
@@ -2758,17 +2763,18 @@ static void update_stage_object(MovingPlatform *p, int index)
         break;
     case PLATFORM_KIND_SHUTTLE: {    /* $F78E */
         /* The record position is the right end of the run and the shuttle only
-           ever leaves it, so on slot 12's shaft the carriers are always
-           retreating from the ledge Mario is trying to leave: the crossing has
-           to be made on the one frame the platform is back home.  Carry the
-           run past the record by SHUTTLE_OVERRUN there, and bound both ends
-           against home_x rather than counting frames, so the extra travel
-           cannot walk the whole run a little further right on every cycle. */
+           ever leaves it, so these shafts can leave the player one frame to
+           make a crossing.  Bound both ends against home_x rather than
+           counting frames, so the extra travel cannot walk the whole run a
+           little further right on every cycle. */
         int hx=(int)(p->home_x>>FIX_SHIFT),x;
+        int overrun=(g_current_level==SHUTTLE_OVERRUN_LEVEL_12||
+                     g_current_level==SHUTTLE_OVERRUN_LEVEL_13||
+                     g_current_level==SHUTTLE_OVERRUN_LEVEL_19)?SHUTTLE_OVERRUN:0;
         p->x+=(s32)p->dir*FIX_ONE;
         x=(int)(p->x>>FIX_SHIFT);
         if (p->dir<0) { if (x<=hx-SHUTTLE_RUN) p->dir=1; }
-        else if (x>=hx+((g_current_level==SHUTTLE_OVERRUN_LEVEL)?SHUTTLE_OVERRUN:0))
+        else if (x>=hx+overrun)
             p->dir=-1;
         break;
     }
@@ -4672,8 +4678,7 @@ static int emit_crate_sprites(u16 *satb,int n,int limit,int cam_x,int cam_y)
         sy = (int)(g_crates[i].y >> FIX_SHIFT) - cam_y + bowser_room_object_y_offset();
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
         {u16 addr=CRATE_BASE_WORD,pal=(u16)(g_in_boss?MARIO_BOSS_SPR_PAL:0); int width=2,height=2;
-        if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
-           (g_in_boss&&g_boss_class==1)){
+        if(g_in_boss&&g_boss_class==1){
             addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
         }else if(g_in_boss&&g_boss_class==2){
             addr=BOSS_CRATE4_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;width=1;
@@ -4866,8 +4871,7 @@ static void draw_game_sprites(void)
         if (sx>=-32 && sx<=255 && sy>=-32 && sy<=239) {
             u16 addr=CRATE_BASE_WORD,pal=owner?LUIGI_SPR_PAL:player_pal;
             int width=2,height=2;
-            if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
-               (g_in_boss&&g_boss_class==1)) {
+            if(g_in_boss&&g_boss_class==1) {
                 addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
             } else if(g_in_boss&&g_boss_class==2) {
                 addr=BOSS_CRATE4_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;width=1;
@@ -5061,10 +5065,14 @@ static void draw_game_sprites(void)
        hurts the player is worse than dropping one enemy cell. */
     for(i=0;i<4&&n<GAME_SPRITE_CAPACITY-2;++i)if(g_enemy_shots[i].active){
         int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-cam_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT)-cam_y;
+        int flip=(g_enemy_shots[i].mode==SHOT_MODE_SPEAR&&g_enemy_shots[i].vx<0);
         int c;
-        for(c=0;c<g_enemy_shots[i].cols&&n<GAME_SPRITE_CAPACITY-2;++c)
-            set_sprite_entry(satb,n++,sx+c*16,sy,(u16)(g_enemy_shots[i].base+c*64),
-                (u16)(VDC_SPR_PRIO_SP|g_enemy_shots[i].palette));
+        for(c=0;c<g_enemy_shots[i].cols&&n<GAME_SPRITE_CAPACITY-2;++c){
+            int draw_c=flip?g_enemy_shots[i].cols-1-c:c;
+            set_sprite_entry(satb,n++,sx+draw_c*16,sy,(u16)(g_enemy_shots[i].base+c*64),
+                (u16)(VDC_SPR_PRIO_SP|g_enemy_shots[i].palette|
+                      (flip?VDC_SPR_X_INVERT:0)));
+        }
     }
 
     for (i=0;i<MAX_ENEMIES && n<GAME_SPRITE_CAPACITY-6;++i) {
@@ -5677,9 +5685,9 @@ static int boss13_room_bomb(void)
 
 static void boss13_release_bomb(int i)
 {
-    /* $91D0 announces it with $2E0 as it lands in the room. */
+    /* $91D0 only creates the room object; unlike the other boss drops it has
+       no sound-effect call in the original path. */
     boss_shot_to_crate(i,3);
-    Play_Sound_Sample(SFX_BOSS_HIT,0,0);
 }
 
 static void boss16_release_bell(int i)
