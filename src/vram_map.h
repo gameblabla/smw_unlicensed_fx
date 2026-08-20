@@ -36,10 +36,10 @@
 #define HUD_BASE_WORD 0x6A00
 /* 0x6B00..0x6CC0 [play] seven hidden crate items, 16x16 each */
 #define ITEM_BASE_WORD 0x6B00
+/* 0x6D00..0x6DC0 [play,boss] packed 1-5 heart HUD strip */
+#define HUD_HEART_STRIP_BASE_WORD 0x6D00
 /* 0x6E00..0x6F00 [play,boss] fireball */
 #define FIREBALL_BASE_WORD 0x6E00
-/* 0x7000..0x7040 [play,boss] heart */
-#define HUD_HEART_BASE_WORD 0x7000
 /* 0x7040..0x72C0 [play,boss] HUD digits */
 #define HUD_DIGIT_BASE_WORD 0x7040
 /* 0x7300..0x73C0 [play] level 2/6/8 carrier, 48x16 */
@@ -106,7 +106,63 @@
 #define CONTINUE_TILE_BASE_WORD 0x2000
 /* 0x5000..0x6000 [boot] opening dual-plane streaming buffer */
 #define BOOT_DUAL_BACK_BASE_WORD 0x5000
+/* 0x6800..0x6900 [play,boss] auxiliary crate sprite mirror */
+#define BACK_MIRROR_CRATE_WORD 0x6800
+/* 0x6900..0x69C0 [play,boss] auxiliary gem sprite mirror */
+#define BACK_MIRROR_GEM_WORD 0x6900
+/* 0x6A00..0x6AC0 [play,boss] auxiliary HUD icon mirror */
+#define BACK_MIRROR_HUD_WORD 0x6A00
+/* 0x6B00..0x6CC0 [play] auxiliary item sprite mirror */
+#define BACK_MIRROR_ITEM_WORD 0x6B00
+/* 0x6D00..0x6DC0 [play,boss] auxiliary packed-heart mirror */
+#define BACK_MIRROR_HEART_STRIP_WORD 0x6D00
+/* 0x6E00..0x6F00 [play,boss] auxiliary fireball mirror */
+#define BACK_MIRROR_FIREBALL_WORD 0x6E00
+/* 0x7040..0x72C0 [play,boss] auxiliary HUD digit mirror */
+#define BACK_MIRROR_HUD_DIGIT_WORD 0x7040
+/* 0x7300..0x73C0 [play] auxiliary carrier mirror */
+#define BACK_MIRROR_PLATFORM_WORD 0x7300
+/* 0x7400..0xA580 [play] auxiliary enemy bank mirror */
+#define BACK_MIRROR_ENEMY_WORD 0x7400
+/* 0x7400..0xBD80 [boss] auxiliary boss body mirror */
+#define BACK_MIRROR_BOSS_WORD 0x7400
+/* 0x9800..0x9C80 [play] auxiliary monkey pose mirror */
+#define BACK_MIRROR_MONKEY_WORD 0x9800
+/* 0xA100..0xAD00 [play] auxiliary snake pose mirror */
+#define BACK_MIRROR_SNAKE_WORD 0xA100
+/* 0xB900..0xBC00 [play] auxiliary right wedge mirror */
+#define BACK_MIRROR_WEDGE_R_WORD 0xB900
+/* 0xBC00..0xBD80 [play] auxiliary left wedge mirror */
+#define BACK_MIRROR_WEDGE_L_WORD 0xBC00
+/* 0xBD80..0xC8C0 [play] auxiliary enemy attack mirror */
+#define BACK_MIRROR_ENEMY_ALT_WORD 0xBD80
+/* 0xC900..0xE1C0 [play] auxiliary enemy hit mirror */
+#define BACK_MIRROR_ENEMY_HIT_WORD 0xC900
 /* 0xD000..0xE560 [title,menu] menu/transition tile set on VDC0 */
 #define FRONT_TILE_BASE_WORD 0xD000
+/* 0xDD00..0xDE80 [boss] auxiliary Bowser flame mirror */
+#define BACK_MIRROR_BOWSER_FLAME_WORD 0xDD00
+/* 0xE000..0xE900 [boss] auxiliary boss item mirror */
+#define BACK_MIRROR_BOSS_AUX_WORD 0xE000
+/* 0xE200..0xE300 [play] auxiliary stage pot mirror */
+#define BACK_MIRROR_POT_WORD 0xE200
+/* 0xE300..0xE400 [play] auxiliary enemy shot mirror */
+#define BACK_MIRROR_ENEMY_SHOT_WORD 0xE300
+/* 0xE400..0xE440 [play] auxiliary banana mirror */
+#define BACK_MIRROR_BANANA_WORD 0xE400
+/* 0xE500..0xE980 [play] auxiliary crate-walk mirror */
+#define BACK_MIRROR_CRATE_WALK_WORD 0xE500
+/* 0xE900..0xE940 [boss] auxiliary boss water mirror */
+#define BACK_MIRROR_BOSS_WATER_WORD 0xE900
+/* 0xEC80..0xECC0 [play] auxiliary flier bomb mirror */
+#define BACK_MIRROR_CHIP_BOMB_WORD 0xEC80
+/* 0xECC0..0xEDC0 [play] auxiliary flier attack mirror */
+#define BACK_MIRROR_CHIP_ATTACK_WORD 0xECC0
+/* 0xF000..0xF100 [boot,title,menu,play,boss,continue] auxiliary sprite attribute table, page 0 */
+#define BACK_SATB_BASE0 0xF000
+/* 0xF200..0xF300 [boot,title,menu,play,boss,continue] auxiliary sprite attribute table, page 1 */
+#define BACK_SATB_BASE1 0xF200
+/* 0xF300..0xFD80 [play] auxiliary stage-object mirror */
+#define BACK_MIRROR_STAGE_OBJECT_WORD 0xF300
 
 #endif

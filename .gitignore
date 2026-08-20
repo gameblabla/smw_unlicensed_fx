@@ -10,6 +10,7 @@ smb_pcfx_shot_*.png
 
 # Documentation and verification artifacts
 *.md
+!.agents/skills/**/SKILL.md
 /FILES.txt
 /verification/
 /verification_r*/

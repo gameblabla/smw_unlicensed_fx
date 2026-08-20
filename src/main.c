@@ -106,6 +106,9 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BOSS_HURT_FRAMES 30
 #define SPR_ORIGIN_X 0x20
 #define SPR_ORIGIN_Y 0x40
+#define VDC_SPRITES_PER_LINE 16
+#define VDC_SPRITE_PIXELS_PER_LINE 256
+#define GAME_SPRITE_CAPACITY 128
 
 #define SCREEN_W 256
 #define FIX_SHIFT 8
@@ -403,10 +406,13 @@ static int g_camera_tile;
 static int g_camera_y;
 static int g_camera_target_y;
 static int g_camera_row;   /* world tile row at the top of the streamed window */
+static int g_pending_level_rows[FG_BAT_H];
+static int g_pending_level_row_count;
 static int g_level_rows=1; /* stacked screens; 1 for a purely horizontal level */
 static int g_level_cols;
 static int g_room;      /* route index of the live room, the port's FF0046 */
 static int g_satb_page;
+static int g_back_satb_page;
 static int g_player_anim_clock;
 static int g_player_down;
 static int g_lift_timer;
@@ -903,11 +909,17 @@ static void clear_satb(void)
 {
     int i;
     vdc_set_vram_write(FRONT_CHIP, SATB_BASE0);
-    for (i = 0; i < 0x200; ++i) vdc_vram_write(FRONT_CHIP, 0);
+    for (i = 0; i < 0x100; ++i) vdc_vram_write(FRONT_CHIP, 0);
     vdc_set_vram_write(FRONT_CHIP, SATB_BASE1);
-    for (i = 0; i < 0x200; ++i) vdc_vram_write(FRONT_CHIP, 0);
+    for (i = 0; i < 0x100; ++i) vdc_vram_write(FRONT_CHIP, 0);
     vdc_set_satb_address(FRONT_CHIP, SATB_BASE0);
     g_satb_page = 0;
+    vdc_set_vram_write(BACK_CHIP, BACK_SATB_BASE0);
+    for (i = 0; i < 0x100; ++i) vdc_vram_write(BACK_CHIP, 0);
+    vdc_set_vram_write(BACK_CHIP, BACK_SATB_BASE1);
+    for (i = 0; i < 0x100; ++i) vdc_vram_write(BACK_CHIP, 0);
+    vdc_set_satb_address(BACK_CHIP, BACK_SATB_BASE0);
+    g_back_satb_page = 0;
 }
 
 static void clear_bat(int chip, int words)
@@ -1182,12 +1194,70 @@ static void set_baked_title_prompt(int visible)
 static void set_sprite_entry(u16 *satb, int index, int x, int y, u16 addr, u16 ctrl)
 {
     u16 *e;
-    if (index < 0 || index >= 64) return;
+    if (index < 0 || index >= GAME_SPRITE_CAPACITY) return;
     e = satb + index * 4;
     e[0] = (u16)(y + SPR_ORIGIN_Y);
     e[1] = (u16)(x + SPR_ORIGIN_X);
     e[2] = VDC_SPR_PATTERN(addr);
     e[3] = ctrl;
+}
+
+static int sprite_height(u16 ctrl)
+{
+    return ((ctrl&VDC_SPR_Y_HEIGHT_4)==VDC_SPR_Y_HEIGHT_4)?64:
+           (ctrl&VDC_SPR_Y_HEIGHT_2)?32:16;
+}
+
+/* Split one priority-ordered logical list across both HuC6270s.  VDC1 wins
+   the PC-FX VDC pre-mixer whenever both chips produce a non-transparent
+   pixel, so a later (lower-priority) entry may use VDC1 only when no earlier
+   VDC0 entry covers any of the same scanlines.  That conservative barrier,
+   plus retaining source order inside each SATB, preserves sprite overlap
+   priority while doubling the 16-sprite/256-pixel scanline budget. */
+static void submit_game_satbs(const u16 *logical,int logical_count)
+{
+    static u16 front[64*4],back[64*4];
+    unsigned char front_count[240]={0},back_count[240]={0},back_used[240]={0};
+    unsigned short front_pixels[240]={0},back_pixels[240]={0};
+    int i,j,nf=0,nb=0;
+    u16 front_base=(u16)(g_satb_page?SATB_BASE1:SATB_BASE0);
+    u16 back_base=(u16)(g_back_satb_page?BACK_SATB_BASE1:BACK_SATB_BASE0);
+    for(i=0;i<64*4;++i)front[i]=back[i]=0;
+
+    for(i=0;i<logical_count;++i){
+        const u16 *e=logical+i*4;
+        int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
+        int width=(e[3]&VDC_SPR_X_WIDTH_2)?32:16;
+        int first=y<0?0:y,last=y+h; int use_front=(nf<64),use_back=(nb<64);
+        if(last>240)last=240;
+        if(first<last){
+            for(j=first;j<last;++j){
+                if(back_used[j]||front_count[j]>=VDC_SPRITES_PER_LINE||
+                   front_pixels[j]+width>VDC_SPRITE_PIXELS_PER_LINE)use_front=0;
+                if(back_count[j]>=VDC_SPRITES_PER_LINE||
+                   back_pixels[j]+width>VDC_SPRITE_PIXELS_PER_LINE)use_back=0;
+            }
+        }
+        if(use_front){
+            for(j=0;j<4;++j)front[nf*4+j]=e[j];
+            ++nf;
+            for(j=first;j<last;++j){++front_count[j];front_pixels[j]=(u16)(front_pixels[j]+width);}
+        }else if(use_back){
+            for(j=0;j<4;++j)back[nb*4+j]=e[j];
+            ++nb;
+            for(j=first;j<last;++j){++back_count[j];back_pixels[j]=(u16)(back_pixels[j]+width);back_used[j]=1;}
+        }
+    }
+
+    /* Prepare both hidden pages completely, then queue both SATB DMAs.  They
+       become visible together at the following VDW->VCR boundary. */
+    vdc_set_vram_write(FRONT_CHIP,front_base);
+    for(i=0;i<64*4;++i)vdc_vram_write(FRONT_CHIP,front[i]);
+    vdc_set_vram_write(BACK_CHIP,back_base);
+    for(i=0;i<64*4;++i)vdc_vram_write(BACK_CHIP,back[i]);
+    vdc_set_satb_address(FRONT_CHIP,front_base);
+    vdc_set_satb_address(BACK_CHIP,back_base);
+    g_satb_page^=1;g_back_satb_page^=1;
 }
 
 static void upload_front_sprites(void)
@@ -1222,6 +1292,34 @@ static int palettes_equal(const unsigned short *a, const unsigned short *b)
     return 1;
 }
 
+/* VDC0's gameplay pattern space above the background banks is otherwise idle.
+   Mirror every world-object bank there while both outputs are hidden so an
+   entry can move between VDC sprite engines without changing its pattern
+   number or exposing a partially-uploaded frame. */
+static void upload_world_sprite_words(u16 address,const u16 *words,unsigned count)
+{
+    unsigned i;
+    vdc_set_vram_write(FRONT_CHIP,address);
+    for(i=0;i<count;++i)vdc_vram_write(FRONT_CHIP,words[i]);
+    vdc_set_vram_write(BACK_CHIP,address);
+    for(i=0;i<count;++i)vdc_vram_write(BACK_CHIP,words[i]);
+}
+
+static void upload_hud_heart_strip(void)
+{
+    static u16 words[192];
+    int i;
+    /* The source heart is an 8x8 image in the upper half of a 16x16 cell.
+       Duplicate those eight bits into the right half. Two paired cells make
+       four adjacent hearts in one 32-pixel sprite; the original cell at the
+       tail supplies odd counts. */
+    for(i=0;i<64;++i){
+        u16 pair=(u16)(g_hud_heart_words[i]|(g_hud_heart_words[i]>>8));
+        words[i]=pair;words[64+i]=pair;words[128+i]=g_hud_heart_words[i];
+    }
+    upload_world_sprite_words(HUD_HEART_STRIP_BASE_WORD,words,192);
+}
+
 static void upload_game_sprites(void)
 {
     int i,j,k,uniq=0,walk_top=0,hit_top=0,alt_top=0,shot_top=0;
@@ -1250,40 +1348,40 @@ static void upload_game_sprites(void)
     for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_player_down_words[i]);
     vdc_set_vram_write(FRONT_CHIP,GAMEPLAY_DOWN_LUIGI_BASE_WORD);
     for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_luigi_down_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,HUD_LIFE_BASE_WORD); for(i=0;i<128;++i)vdc_vram_write(FRONT_CHIP,g_hud_life_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,HUD_FIRE_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_fire_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,CRATE_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_crate_sprite_words[i]);
+    /* A full two-player HUD is 18 entries / 288 sprite pixels on its busiest
+       scanline, so its tail legitimately spills to VDC0.  Mirror all HUD art,
+       not only world objects; otherwise Luigi's last hearts name unrelated
+       background VRAM on the auxiliary chip. */
+    upload_world_sprite_words(HUD_LIFE_BASE_WORD,g_hud_life_words,128);
+    upload_world_sprite_words(HUD_FIRE_BASE_WORD,g_hud_fire_words,64);
+    upload_world_sprite_words(CRATE_BASE_WORD,g_crate_sprite_words,256);
     /* Level 3 uses the same supplied pot object as boss 3, while the later
        boss rooms upload their complete auxiliary bank in start_boss(). */
-    vdc_set_vram_write(FRONT_CHIP,BOSS_POT_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,GEM_BASE_WORD); for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,g_gem_sprite_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,FIREBALL_BASE_WORD); for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_fireball_sprite_words[i]);
-    if(!g_in_boss){vdc_set_vram_write(FRONT_CHIP,ITEM_BASE_WORD); for(i=0;i<ITEM_KIND_COUNT*ITEM_CELL_WORDS;++i)vdc_vram_write(FRONT_CHIP,g_item_sprite_words[i]);}
-    vdc_set_vram_write(FRONT_CHIP,HUD_HEART_BASE_WORD); for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_hud_heart_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,HUD_DIGIT_BASE_WORD); for(i=0;i<640;++i)vdc_vram_write(FRONT_CHIP,g_hud_digit_words[i]);
+    upload_world_sprite_words(BOSS_POT_BASE_WORD,g_boss_pot_words,256);
+    upload_world_sprite_words(GEM_BASE_WORD,g_gem_sprite_words,192);
+    upload_world_sprite_words(FIREBALL_BASE_WORD,g_fireball_sprite_words,256);
+    if(!g_in_boss)upload_world_sprite_words(ITEM_BASE_WORD,g_item_sprite_words,ITEM_KIND_COUNT*ITEM_CELL_WORDS);
+    upload_world_sprite_words(HUD_DIGIT_BASE_WORD,g_hud_digit_words,640);
+    upload_hud_heart_strip();
     if (!g_in_boss && (g_current_level==1 || g_current_level==5 || g_current_level==7)) {
         const u16 *platform_words=(g_current_level==5)?g_level6_platform_words:
                                   (g_current_level==7)?g_level8_platform_words:
                                   g_level2_platform_words;
-        vdc_set_vram_write(FRONT_CHIP,PLATFORM_BASE_WORD);
-        for(i=0;i<192;++i)vdc_vram_write(FRONT_CHIP,platform_words[i]);
+        upload_world_sprite_words(PLATFORM_BASE_WORD,platform_words,192);
     }
     /* Every other level's stage objects share one bank and one palette line. */
     if (!g_in_boss) {
         const StageObjectData *so=stage_objects();
         if (so->word_count) {
-            vdc_set_vram_write(FRONT_CHIP,STAGE_OBJECT_BASE_WORD);
-            for(i=0;i<so->word_count;++i)vdc_vram_write(FRONT_CHIP,so->words[i]);
+            upload_world_sprite_words(STAGE_OBJECT_BASE_WORD,so->words,so->word_count);
             for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),so->palette[i]);
         }
     }
 
     /* Level 8's two sliding wedges (metasprites 168/169). */
     if (!g_in_boss && g_current_level==7) {
-        vdc_set_vram_write(FRONT_CHIP,LEVEL8_WEDGE_R_BASE_WORD);
-        for(i=0;i<768;++i)vdc_vram_write(FRONT_CHIP,g_level8_wedge_right_words[i]);
-        vdc_set_vram_write(FRONT_CHIP,LEVEL8_WEDGE_L_BASE_WORD);
-        for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_level8_wedge_left_words[i]);
+        upload_world_sprite_words(LEVEL8_WEDGE_R_BASE_WORD,g_level8_wedge_right_words,768);
+        upload_world_sprite_words(LEVEL8_WEDGE_L_BASE_WORD,g_level8_wedge_left_words,384);
     }
 
     /* F3AE/F3E4 in the 68000 disassembly load an enemy palette from F426 ->
@@ -1291,14 +1389,12 @@ static void upload_game_sprites(void)
        generated table reproduces those combinations. Only variants referenced
        by the current level are copied to VDC1. */
     if (!g_in_boss && g_level) {
-        if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){vdc_set_vram_write(FRONT_CHIP,ENEMY_BANANA_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_monkey_banana_words[i]);}
+        if(level_has_enemy_kind(ENEMY_KIND_MONKEY))upload_world_sprite_words(ENEMY_BANANA_BASE_WORD,g_monkey_banana_words,64);
         /* One copy of the flier's bombing pose and its bomb serves every
            variant of the family: their DMA buffers hold the same images. */
         if(level_has_enemy_kind(ENEMY_KIND_CHIP)){
-            vdc_set_vram_write(FRONT_CHIP,CHIP_BOMB_BASE_WORD);
-            for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_chip_bomb_words[i]);
-            vdc_set_vram_write(FRONT_CHIP,CHIP_ATTACK_BASE_WORD);
-            for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_chip_attack_words[i]);
+            upload_world_sprite_words(CHIP_BOMB_BASE_WORD,g_chip_bomb_words,64);
+            upload_world_sprite_words(CHIP_ATTACK_BASE_WORD,g_chip_attack_words,256);
         }
         walk_top=ENEMY_BASE_WORD; hit_top=ENEMY_HIT_BASE_WORD; alt_top=ENEMY_ALT_BASE_WORD;
         shot_top=ENEMY_SHOT_BASE_WORD;
@@ -1309,13 +1405,11 @@ static void upload_game_sprites(void)
             if(line<0){ seen[uniq]=v->palette; line=4+uniq; for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),v->palette[j]); ++uniq; }
             g_enemy_palette_line[i]=(unsigned char)line;
             g_enemy_vram[i]=(u16)walk_top;
-            vdc_set_vram_write(FRONT_CHIP,(u16)walk_top);
-            for(j=0;j<fw*2;++j)vdc_vram_write(FRONT_CHIP,v->words[j]);
+            upload_world_sprite_words((u16)walk_top,v->words,(unsigned)(fw*2));
             walk_top+=fw*2;
             g_enemy_hit_vram[i]=(u16)hit_top;
             if(v->has_hit_frame){
-                vdc_set_vram_write(FRONT_CHIP,(u16)hit_top);
-                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,v->words[fw*2+j]);
+                upload_world_sprite_words((u16)hit_top,v->words+fw*2,(unsigned)fw);
                 hit_top+=fw;
             }
             /* The three extra live cels are shared arrays: a family's DMA
@@ -1337,8 +1431,7 @@ static void upload_game_sprites(void)
                 if(*slot)continue;
                 if(alt_top+fw>ENEMY_ALT_BASE_WORD+ENEMY_ALT_WORDS)continue;
                 *slot=(u16)alt_top;
-                vdc_set_vram_write(FRONT_CHIP,(u16)alt_top);
-                for(j=0;j<fw;++j)vdc_vram_write(FRONT_CHIP,src[j]);
+                upload_world_sprite_words((u16)alt_top,src,(unsigned)fw);
                 alt_top+=fw;
             }
             /* Every variant of a throwing family shares one projectile array,
@@ -1351,8 +1444,7 @@ static void upload_game_sprites(void)
                     }
                 if(!g_enemy_shot_vram[i]&&shot_top+v->shot_cols*64<=ENEMY_SHOT_BASE_WORD+ENEMY_SHOT_WORDS){
                     g_enemy_shot_vram[i]=(u16)shot_top;
-                    vdc_set_vram_write(FRONT_CHIP,(u16)shot_top);
-                    for(j=0;j<v->shot_cols*64;++j)vdc_vram_write(FRONT_CHIP,v->shot_words[j]);
+                    upload_world_sprite_words((u16)shot_top,v->shot_words,(unsigned)(v->shot_cols*64));
                     shot_top+=v->shot_cols*64;
                 }
             }
@@ -1361,16 +1453,13 @@ static void upload_game_sprites(void)
            legacy 3x3-cell enemy frame. Its authored variant set leaves room
            at $9800 for the three 4x4 poses. */
         if(level_has_enemy_kind(ENEMY_KIND_STRIKE_SNAKE)){
-            vdc_set_vram_write(FRONT_CHIP,STRIKE_SNAKE_BASE_WORD);
-            for(i=0;i<3072;++i)vdc_vram_write(FRONT_CHIP,g_level8_snake_words[i]);
+            upload_world_sprite_words(STRIKE_SNAKE_BASE_WORD,g_level8_snake_words,3072);
         }
         if(level_has_enemy_kind(ENEMY_KIND_MONKEY)){
-            vdc_set_vram_write(FRONT_CHIP,MONKEY_SPECIAL_BASE_WORD);
-            for(i=0;i<1152;++i)vdc_vram_write(FRONT_CHIP,g_monkey_special_words[i]);
+            upload_world_sprite_words(MONKEY_SPECIAL_BASE_WORD,g_monkey_special_words,1152);
         }
         if(level_has_enemy_kind(ENEMY_KIND_CRATE_MIMIC)){
-            vdc_set_vram_write(FRONT_CHIP,CRATE_MIMIC_WALK_BASE_WORD);
-            for(i=0;i<1152;++i)vdc_vram_write(FRONT_CHIP,g_crate_walk_words[i]);
+            upload_world_sprite_words(CRATE_MIMIC_WALK_BASE_WORD,g_crate_walk_words,1152);
         }
     }
 }
@@ -1709,12 +1798,11 @@ static u16 level_fg_bat_entry(int world_col,int tile_row)
 static void stream_level_column(int world_col, int display_enabled)
 {
     int row,chip=level_stage_chip(),map_col=world_col&(FG_BAT_W-1);
-    /* Only VDC1 carries the SATB.  Levels 6 and 7 stream their stage plane
-       into VDC0, so restoring a blanket BB|SB here switched sprites on for a
-       chip with no sprite table, which drew shifting garbage over the scenery
-       from the first scrolled column onward. */
+    /* Gameplay keeps a complete auxiliary SATB on VDC0.  Preserve its sprite
+       enable while a stage-plane column temporarily changes the increment
+       mode; both the table and every pattern it can reference are resident. */
     u16 planes=display_enabled
-        ? (u16)(VDC_CR_BB|((chip==FRONT_CHIP)?VDC_CR_SB:0)) : 0;
+        ? (u16)(VDC_CR_BB|VDC_CR_SB) : 0;
     if(world_col<0||world_col>=g_level_width_tiles)return;
 
     /* A BAT column is contiguous when MAWR advances by the 64-word map
@@ -1754,6 +1842,29 @@ static void stream_level_row(int world_row)
     }
 }
 
+/* Vertical BAT rows are selected during simulation, after the leading VBlank
+   interval may already have expired.  Queue their world coordinates and write
+   them at the next frame wrap, before the scroll that makes them reachable.
+   Camera motion is normally at most one tile per frame, but retain a complete
+   window's worth so a future larger step cannot silently drop an entering row. */
+static void queue_level_row(int world_row)
+{
+    int i;
+    if(world_row<0)return;
+    for(i=0;i<g_pending_level_row_count;++i)
+        if(g_pending_level_rows[i]==world_row)return;
+    if(g_pending_level_row_count<FG_BAT_H)
+        g_pending_level_rows[g_pending_level_row_count++]=world_row;
+}
+
+static void flush_level_rows(void)
+{
+    int i;
+    for(i=0;i<g_pending_level_row_count;++i)
+        stream_level_row(g_pending_level_rows[i]);
+    g_pending_level_row_count=0;
+}
+
 static int level_uses_front_backdrop(void)
 {
     return !g_in_boss && (g_current_level == 6 || g_current_level == 7);
@@ -1790,6 +1901,7 @@ static void upload_level_backdrop(void)
 static void init_level_ring(void)
 {
     int col,i,chip;
+    g_pending_level_row_count=0;
     g_level=&g_game_levels[g_current_level]; g_stage_set=&g_stage_sets[g_level->set_index];
     build_level_layout(); g_level_width_tiles=g_level_cols*32; g_room=0;
     clear_bat(BACK_CHIP,BG_BAT_WORDS); clear_bat(FRONT_CHIP,FG_BAT_WORDS);
@@ -2236,8 +2348,8 @@ static void update_camera(void)
         if(target_y<min_camera_y)target_y=min_camera_y;
         if(target_y>max_camera_y)target_y=max_camera_y;
         new_row=target_y>>3;
-        while(g_camera_row<new_row){++g_camera_row;stream_level_row(g_camera_row+30);}
-        while(g_camera_row>new_row){--g_camera_row;stream_level_row(g_camera_row-1);}
+        while(g_camera_row<new_row){++g_camera_row;queue_level_row(g_camera_row+30);}
+        while(g_camera_row>new_row){--g_camera_row;queue_level_row(g_camera_row-1);}
     }else target_y=0;
     g_camera_target_y=target_y;
 
@@ -4333,7 +4445,7 @@ static int emit_boss_cells(u16 *satb,int n,const BossVisualData *v,int frame,
 {
     unsigned long long mask=v->sprite_masks[frame];
     int frame_words=v->cols*v->rows*64,cx,cy;
-    for(cy=0;cy<v->rows && n<62;++cy)for(cx=0;cx<v->cols && n<62;++cx){
+    for(cy=0;cy<v->rows && n<GAME_SPRITE_CAPACITY-2;++cy)for(cx=0;cx<v->cols && n<GAME_SPRITE_CAPACITY-2;++cx){
         int cell=cy*v->cols+cx,dx,palette;
         if(!(mask&(1ULL<<cell)))continue;
         dx=mirror?(v->cols-1-cx)*16:cx*16;
@@ -4374,9 +4486,27 @@ static int emit_crate_sprites(u16 *satb,int n,int limit,int cam_x,int cam_y)
     return n;
 }
 
+static void emit_hud_hearts(u16 *satb,int *n,int x,int y,int count,u16 palette)
+{
+    u16 ctrl=(u16)(VDC_SPR_PRIO_SP|palette);
+    if(count>PLAYER_MAX_HEARTS)count=PLAYER_MAX_HEARTS;
+    if(count>=4&&*n<GAME_SPRITE_CAPACITY){
+        set_sprite_entry(satb,(*n)++,x,y,HUD_HEART_STRIP_BASE_WORD,
+                         (u16)(ctrl|VDC_SPR_X_WIDTH_2));
+        x+=32;count-=4;
+    }
+    if(count>=2&&*n<GAME_SPRITE_CAPACITY){
+        set_sprite_entry(satb,(*n)++,x,y,HUD_HEART_STRIP_BASE_WORD,ctrl);
+        x+=16;count-=2;
+    }
+    if(count&&*n<GAME_SPRITE_CAPACITY)
+        set_sprite_entry(satb,(*n)++,x,y,
+                         (u16)(HUD_HEART_STRIP_BASE_WORD+128),ctrl);
+}
+
 static void draw_game_sprites(void)
 {
-    static u16 satb[64 * 4];
+    static u16 satb[GAME_SPRITE_CAPACITY * 4];
     int i, n = 0;
     int frame = current_player_frame();
     /* The HuC6270 fetches the SATB list at the VDW->VCR transition, ahead of
@@ -4392,7 +4522,6 @@ static void draw_game_sprites(void)
     int cam_y=g_camera_target_y;
     int px = (int)(g_player_x >> FIX_SHIFT) - cam_x;
     int py = (int)(g_player_y >> FIX_SHIFT) - cam_y + bowser_room_object_y_offset();
-    u16 base = (u16)(g_satb_page ? SATB_BASE1 : SATB_BASE0);
     /* Every normal-level palette carries the original Mario/object colors in
        source line 0 (identical across all 19 level palettes).  r11 moved
        normal sprites to line 13 and produced the observed yellow/green Mario
@@ -4412,7 +4541,7 @@ static void draw_game_sprites(void)
     int player_visible=1;
     int hud_yoff=(g_in_boss||(!g_in_boss&&g_current_level==2))?-16:0;
 
-    for (i = 0; i < 64 * 4; ++i) satb[i] = 0;
+    for (i = 0; i < GAME_SPRITE_CAPACITY * 4; ++i) satb[i] = 0;
 
     /* Exact Mega Drive HUD object boundaries, emitted first in SATB so a busy
        room cannot drop them: 24x16 life icon/x, 16x16 fire icon, then live
@@ -4421,27 +4550,24 @@ static void draw_game_sprites(void)
         (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|player_pal));
     set_sprite_entry(satb,n++,80,209+hud_yoff,HUD_FIRE_BASE_WORD,
         (u16)(VDC_SPR_PRIO_SP|player_pal));
-    if (n<64) {
+    if (n<GAME_SPRITE_CAPACITY) {
         int lives=g_lives; if (lives<0) lives=0; if (lives>9) lives=9;
         set_sprite_entry(satb,n++,32,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
-    for (i=0;i<g_player_hearts && i<PLAYER_MAX_HEARTS && n<64;++i)
-        set_sprite_entry(satb,n++,40+i*8,217+hud_yoff,HUD_HEART_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|player_pal));
-    if (n<64) {
+    emit_hud_hearts(satb,&n,40,217+hud_yoff,g_player_hearts,player_pal);
+    if (n<GAME_SPRITE_CAPACITY) {
         int digit=g_fireball_ammo;
         if (digit<0) digit=0; if (digit>9) digit=9;
         set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
     }
-    if(multiplayer_active() && n<64){
+    if(multiplayer_active() && n<GAME_SPRITE_CAPACITY){
         int lives=g_luigi.lives;
         if(lives<0)lives=0;if(lives>9)lives=9;
         set_sprite_entry(satb,n++,136,209+hud_yoff,HUD_LIFE_BASE_WORD,
             (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LUIGI_SPR_PAL));
-        if(n<64)set_sprite_entry(satb,n++,160,217+hud_yoff,
+        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,160,217+hud_yoff,
             (u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
-        for(i=0;i<g_luigi.hearts&&i<PLAYER_MAX_HEARTS&&n<64;++i)
-            set_sprite_entry(satb,n++,168+i*8,217+hud_yoff,HUD_HEART_BASE_WORD,
-                (u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
+        emit_hud_hearts(satb,&n,168,217+hud_yoff,g_luigi.hearts,LUIGI_SPR_PAL);
     }
     /* Everything emitted from here on is world content and may be occluded by
        a front-plane scenery layer; the HUD above never is. */
@@ -4453,7 +4579,7 @@ static void draw_game_sprites(void)
        0 and the boss slot 12, so Mario passes in front of it there, but
        both the carriers (slots 38/39) and the room's boxes are behind it,
        which is what the old order got wrong.  */
-    if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<58){
+    if(g_in_boss && (g_boss_hp>0||g_boss_defeated) && n<GAME_SPRITE_CAPACITY-6){
         /* Hurt includes an impact puff four pixels above the body, so its
            capture origin needs +4 relative to the old value to keep Bowser's
            feet aligned with the neighboring walk poses. */
@@ -4510,7 +4636,7 @@ static void draw_game_sprites(void)
            six pixels clear of the catwalk Mario stands on. */
         by-=9;
         mask=g_bowser_special_masks[special];
-        for(cy=0;cy<6 && n<62;++cy)for(cx=0;cx<7 && n<62;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
+        for(cy=0;cy<6 && n<GAME_SPRITE_CAPACITY-2;++cy)for(cx=0;cx<7 && n<GAME_SPRITE_CAPACITY-2;++cx){int cell=cy*7+cx,dx;if(!(mask&(1ULL<<cell)))continue;dx=(g_boss_face<0)?(6-cx)*16:cx*16;set_sprite_entry(satb,n++,bx+dx,by+cy*16,(u16)(BOWSER_ANIM_BASE_WORD+special*BOWSER_SPECIAL_FRAME_WORDS+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));}
         }
     }
 
@@ -4519,7 +4645,7 @@ static void draw_game_sprites(void)
        crate is the one exception to the normal object ordering: it must cover
        Mario's hands/body, while every world crate remains behind Mario. */
     if (g_carry_index>=0 && g_carry_index<MAX_CRATES &&
-        g_crates[g_carry_index].active && g_crates[g_carry_index].carried && n<64) {
+        g_crates[g_carry_index].active && g_crates[g_carry_index].carried && n<GAME_SPRITE_CAPACITY) {
         Crate *c=&g_crates[g_carry_index];
         int sx=(int)(c->x>>FIX_SHIFT)-cam_x;
         int sy=(int)(c->y>>FIX_SHIFT)-cam_y+bowser_room_object_y_offset();
@@ -4580,7 +4706,7 @@ static void draw_game_sprites(void)
         }
     }
 
-    if (multiplayer_active() && !g_luigi.out && n<61) {
+    if (multiplayer_active() && !g_luigi.out && n<GAME_SPRITE_CAPACITY-3) {
         int lx=(int)(g_luigi.x>>FIX_SHIFT)-cam_x;
         int ly=(int)(g_luigi.y>>FIX_SHIFT)-cam_y+bowser_room_object_y_offset();
         int lf=3;
@@ -4615,7 +4741,7 @@ static void draw_game_sprites(void)
     {
         int t = g_state_frame % 37;
         int gf = (t < 15) ? 0 : (t < 22 ? 1 : 2);
-        for (i = 0; i < MAX_GEMS && n < 50; ++i) {
+        for (i = 0; i < MAX_GEMS && n < GAME_SPRITE_CAPACITY-14; ++i) {
             int sx, sy;
             if (!g_gems[i].active) continue;
             sx = g_gems[i].x - cam_x; sy = g_gems[i].y - cam_y;
@@ -4626,7 +4752,7 @@ static void draw_game_sprites(void)
 
     /* Freed crate contents.  Metasprites 191..197 are single 16x16 parts on
        the same sprite palette line the crate and gem use. */
-    for (i = 0; i < MAX_ITEMS && n < 54; ++i) {
+    for (i = 0; i < MAX_ITEMS && n < GAME_SPRITE_CAPACITY-10; ++i) {
         int sx, sy;
         if (!g_items[i].active) continue;
         sx = (int)(g_items[i].x >> FIX_SHIFT) - cam_x;
@@ -4646,11 +4772,11 @@ static void draw_game_sprites(void)
        decoration here -- with no mallet on the catwalk the fight cannot be
        won -- so in a boss room the loop runs to the edge of the bubbles' own
        reservation instead. */
-    n=emit_crate_sprites(satb,n,g_in_boss?62:54,cam_x,cam_y);
+    n=emit_crate_sprites(satb,n,g_in_boss?GAME_SPRITE_CAPACITY-2:GAME_SPRITE_CAPACITY-10,cam_x,cam_y);
 
     /* Traversal-critical Level-2 moving platforms get SATB priority over
        enemies so a busy screen cannot make the floor disappear. */
-    for (i=0;i<g_moving_platform_count && n<58;++i) {
+    for (i=0;i<g_moving_platform_count && n<GAME_SPRITE_CAPACITY-6;++i) {
         MovingPlatform *mp=&g_moving_platforms[i];
         int sx,sy;
         if (mp->hidden) continue;   /* metasprite 0: parked out of the cycle */
@@ -4665,7 +4791,7 @@ static void draw_game_sprites(void)
             int cols=sh[1],rows=sh[2],cy2,cx2;
             u16 pal=(u16)((mp->kind==PLATFORM_KIND_FIREBALL)?
                           FIREBALL_SPR_PAL:LEVEL8_OBJ_SPR_PAL);
-            for(cy2=0;cy2<rows&&n<58;++cy2)for(cx2=0;cx2<cols&&n<58;cx2+=2){
+            for(cy2=0;cy2<rows&&n<GAME_SPRITE_CAPACITY-6;++cy2)for(cx2=0;cx2<cols&&n<GAME_SPRITE_CAPACITY-6;cx2+=2){
                 u16 addr=(u16)(base+(cy2*cols+cx2)*64);
                 set_sprite_entry(satb,n++,sx+cx2*16,sy+cy2*16,addr,
                     (u16)(VDC_SPR_PRIO_SP|((cols-cx2>=2)?VDC_SPR_X_WIDTH_2:0)|pal));
@@ -4673,43 +4799,43 @@ static void draw_game_sprites(void)
         }else if(mp->kind==PLATFORM_KIND_BRICK){
             set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,
                 (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
-            if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),
+            if(n<GAME_SPRITE_CAPACITY-6)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),
                 (u16)(VDC_SPR_PRIO_SP|LEVEL8_OBJ_SPR_PAL));
         }else if(mp->kind==PLATFORM_KIND_WEDGE_R){
             /* 48x64: four 32x16 strips plus the 16-wide right column. */
             int s;
-            for(s=0;s<4&&n<58;++s){
+            for(s=0;s<4&&n<GAME_SPRITE_CAPACITY-6;++s){
                 set_sprite_entry(satb,n++,sx,sy+s*16,(u16)(LEVEL8_WEDGE_R_BASE_WORD+s*128),
                     (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
-                if(n<58)set_sprite_entry(satb,n++,sx+32,sy+s*16,(u16)(LEVEL8_WEDGE_R_RIGHT_WORD+s*64),
+                if(n<GAME_SPRITE_CAPACITY-6)set_sprite_entry(satb,n++,sx+32,sy+s*16,(u16)(LEVEL8_WEDGE_R_RIGHT_WORD+s*64),
                     (u16)(VDC_SPR_PRIO_SP|LEVEL8_OBJ_SPR_PAL));
             }
         }else if(mp->kind==PLATFORM_KIND_WEDGE_L){
             int s;
-            for(s=0;s<3&&n<58;++s)
+            for(s=0;s<3&&n<GAME_SPRITE_CAPACITY-6;++s)
                 set_sprite_entry(satb,n++,sx,sy+s*16,(u16)(LEVEL8_WEDGE_L_BASE_WORD+s*128),
                     (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LEVEL8_OBJ_SPR_PAL));
         }else if(g_in_boss&&g_boss_class==3){
             set_sprite_entry(satb,n++,sx,sy,BOSS13_PLATFORM_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
-            if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(BOSS13_PLATFORM_BASE_WORD+256),(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
+            if(n<GAME_SPRITE_CAPACITY-6)set_sprite_entry(satb,n++,sx+32,sy,(u16)(BOSS13_PLATFORM_BASE_WORD+256),(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS13_PLATFORM_SPR_PAL));
         }else{
             set_sprite_entry(satb,n++,sx,sy,PLATFORM_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2));
-            if(n<58)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),VDC_SPR_PRIO_SP);
+            if(n<GAME_SPRITE_CAPACITY-6)set_sprite_entry(satb,n++,sx+32,sy,(u16)(PLATFORM_BASE_WORD+128),VDC_SPR_PRIO_SP);
         }
     }
 
     /* Projectiles are emitted ahead of the enemies: a screen full of stage
        objects can exhaust the 64-entry SATB, and dropping the thing that
        hurts the player is worse than dropping one enemy cell. */
-    for(i=0;i<4&&n<62;++i)if(g_enemy_shots[i].active){
+    for(i=0;i<4&&n<GAME_SPRITE_CAPACITY-2;++i)if(g_enemy_shots[i].active){
         int sx=(int)(g_enemy_shots[i].x>>FIX_SHIFT)-cam_x,sy=(int)(g_enemy_shots[i].y>>FIX_SHIFT)-cam_y;
         int c;
-        for(c=0;c<g_enemy_shots[i].cols&&n<62;++c)
+        for(c=0;c<g_enemy_shots[i].cols&&n<GAME_SPRITE_CAPACITY-2;++c)
             set_sprite_entry(satb,n++,sx+c*16,sy,(u16)(g_enemy_shots[i].base+c*64),
                 (u16)(VDC_SPR_PRIO_SP|g_enemy_shots[i].palette));
     }
 
-    for (i=0;i<MAX_ENEMIES && n<58;++i) {
+    for (i=0;i<MAX_ENEMIES && n<GAME_SPRITE_CAPACITY-6;++i) {
         int sx,sy,anim,li,gi,cx,cy,cols,rows,grid_cols,special_snake,special_monkey,special_crate,special_chip,special_frame,use_hit_frame,use_alt=0,use_atk=0,use_atk2=0; unsigned mask; u16 flip,base;
         Enemy *e=&g_enemies[i]; const EnemyVariantData *v;
         if(!e->active||!e->spawned)continue;
@@ -4856,7 +4982,7 @@ static void draw_game_sprites(void)
         flip=((e->kind==ENEMY_KIND_PTERODACTYL||e->kind==ENEMY_KIND_THROWER||
                e->kind==ENEMY_KIND_SPARKER||e->kind==ENEMY_KIND_HOPPER||
                (e->kind==ENEMY_KIND_SPEARMAN&&e->behavior_phase))?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
-        for(cy=0;cy<rows && n<61;++cy)for(cx=0;cx<cols && n<61;++cx){
+        for(cy=0;cy<rows && n<GAME_SPRITE_CAPACITY-3;++cy)for(cx=0;cx<cols && n<GAME_SPRITE_CAPACITY-3;++cx){
             int cell=cy*grid_cols+cx,dx;
             if(!(mask&(1u<<cell)))continue;dx=flip?(cols-1-cx)*16:cx*16;
             set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(base+cell*64),(u16)(VDC_SPR_PRIO_SP|flip|g_enemy_palette_line[li]));
@@ -4866,7 +4992,7 @@ static void draw_game_sprites(void)
     /* The frog's shockwaves and bomb, the mage's ring volley and bell, and
        the elephant's four hammers all live in the same array. */
     if(g_in_boss && g_boss_class>=3){
-        for(i=0;i<MAX_BOSS_SHOTS && n<63;++i){
+        for(i=0;i<MAX_BOSS_SHOTS && n<GAME_SPRITE_CAPACITY-1;++i){
             const BossShot *s=&g_boss_shots[i];
             int sx,sy;
             u16 addr,pal,ctrl;
@@ -4886,7 +5012,7 @@ static void draw_game_sprites(void)
         }
     }
 
-    if(g_in_boss && g_boss_shot_active && g_boss_class<3 && n<63){
+    if(g_in_boss && g_boss_shot_active && g_boss_class<3 && n<GAME_SPRITE_CAPACITY-1){
         int sx=(int)(g_boss_shot_x>>FIX_SHIFT),sy=(int)(g_boss_shot_y>>FIX_SHIFT),cx,cy;
         u16 flip=(g_boss_shot_vx<0)?VDC_SPR_X_INVERT:0;
         if(g_boss_class>0){
@@ -4894,7 +5020,7 @@ static void draw_game_sprites(void)
                 (u16)(VDC_SPR_PRIO_SP|BOSS_WATER_SPR_PAL));
             else if(g_boss_class==4||g_boss_class==5){
                 int count=(g_boss_class==4)?3:4,k;
-                for(k=0;k<count&&n<64;++k)set_sprite_entry(satb,n++,sx-(g_boss_shot_vx<0?-k*18:k*18),sy-k*22,BOSS_RING_BASE_WORD,
+                for(k=0;k<count&&n<GAME_SPRITE_CAPACITY;++k)set_sprite_entry(satb,n++,sx-(g_boss_shot_vx<0?-k*18:k*18),sy-k*22,BOSS_RING_BASE_WORD,
                     (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS_AUX_SPR_PAL|flip));
             }else set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,
                 (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|MARIO_BOSS_SPR_PAL|flip));
@@ -4902,7 +5028,7 @@ static void draw_game_sprites(void)
         /* The breath object's coordinates precede its visible metasprite by
            (+32,+13) when travelling right; mirror that offset to the left. */
         sx+=(g_boss_shot_vx<0)?-32:32;sy-=3;
-        for(cy=0;cy<2&&n<64;++cy)for(cx=0;cx<3&&n<64;++cx){
+        for(cy=0;cy<2&&n<GAME_SPRITE_CAPACITY;++cy)for(cx=0;cx<3&&n<GAME_SPRITE_CAPACITY;++cx){
             int cell=cy*3+cx,dx;if(!(g_bowser_flame_mask&(1u<<cell)))continue;
             dx=(g_boss_shot_vx<0)?(2-cx)*16:cx*16;
             set_sprite_entry(satb,n++,sx+dx,sy+cy*16,(u16)(BOWSER_FLAME_BASE_WORD+cell*64),(u16)(VDC_SPR_PRIO_SP|BOSS_SPR_PAL|flip));
@@ -4910,7 +5036,7 @@ static void draw_game_sprites(void)
         }
     }
 
-    for (i=0;i<MAX_FIREBALLS && n<64;++i) {
+    for (i=0;i<MAX_FIREBALLS && n<GAME_SPRITE_CAPACITY;++i) {
         int sx,sy;
         u16 ctrl=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|player_pal);
         if (!g_fireballs[i].active) continue;
@@ -4922,12 +5048,9 @@ static void draw_game_sprites(void)
     }
 
     if (level_front_scenery_over_sprites())
-        for (i=hud_entries;i<64;++i) satb[i*4+3]&=(u16)~VDC_SPR_PRIO_SP;
+        for (i=hud_entries;i<n;++i) satb[i*4+3]&=(u16)~VDC_SPR_PRIO_SP;
 
-    vdc_set_vram_write(FRONT_CHIP, base);
-    for (i = 0; i < 64 * 4; ++i) vdc_vram_write(FRONT_CHIP, satb[i]);
-    vdc_set_satb_address(FRONT_CHIP, base);
-    g_satb_page ^= 1;
+    submit_game_satbs(satb,n);
 }
 
 static void set_continue_palette_fade(int level)
@@ -5039,16 +5162,24 @@ static void start_boss(int fade_in)
     }
     upload_game_sprites();
     if(bv){
-        vdc_set_vram_write(FRONT_CHIP,BOSS_BASE_WORD);
-        for(i=0;i<bv->frame_count*bv->cols*bv->rows*64;++i)vdc_vram_write(FRONT_CHIP,bv->sprite_words[i]);
+        upload_world_sprite_words(BOSS_BASE_WORD,bv->sprite_words,
+            (unsigned)(bv->frame_count*bv->cols*bv->rows*64));
     }else{
         /* Every Bowser body pose comes from the canonical bowser/ bank. */
-        vdc_set_vram_write(FRONT_CHIP,BOWSER_FLAME_BASE_WORD);
-        for(i=0;i<384;++i)vdc_vram_write(FRONT_CHIP,g_bowser_flame_words[i]);
-        vdc_set_vram_write(FRONT_CHIP,BOWSER_ANIM_BASE_WORD);
-        for(i=0;i<BOWSER_SPECIAL_FRAME_WORDS*BOWSER_SPECIAL_FRAME_COUNT;++i)vdc_vram_write(FRONT_CHIP,g_bowser_special_words[i]);
+        upload_world_sprite_words(BOWSER_FLAME_BASE_WORD,g_bowser_flame_words,384);
+        upload_world_sprite_words(BOWSER_ANIM_BASE_WORD,g_bowser_special_words,
+            BOWSER_SPECIAL_FRAME_WORDS*BOWSER_SPECIAL_FRAME_COUNT);
     }
-    if(bv){vdc_set_vram_write(FRONT_CHIP,BOSS_AUX_BASE_WORD);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_ring_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_final_hammer_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_pot_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_bell_words[i]);for(i=0;i<512;++i)vdc_vram_write(FRONT_CHIP,g_boss_bomb_words[i]);for(i=0;i<256;++i)vdc_vram_write(FRONT_CHIP,g_boss_crate4_words[i]);if(g_boss_class==3)for(i=0;i<512;++i)vdc_vram_write(FRONT_CHIP,g_boss13_platform_words[i]);if(g_boss_class==1){vdc_set_vram_write(FRONT_CHIP,BOSS_WATER_BASE_WORD);for(i=0;i<64;++i)vdc_vram_write(FRONT_CHIP,g_boss_water_words[i]);}}
+    if(bv){
+        upload_world_sprite_words(BOSS_AUX_BASE_WORD,g_final_ring_words,256);
+        upload_world_sprite_words((u16)(BOSS_AUX_BASE_WORD+256),g_final_hammer_words,256);
+        upload_world_sprite_words((u16)(BOSS_AUX_BASE_WORD+512),g_boss_pot_words,256);
+        upload_world_sprite_words((u16)(BOSS_AUX_BASE_WORD+768),g_boss_bell_words,256);
+        upload_world_sprite_words((u16)(BOSS_AUX_BASE_WORD+1024),g_boss_bomb_words,512);
+        upload_world_sprite_words((u16)(BOSS_AUX_BASE_WORD+1536),g_boss_crate4_words,256);
+        if(g_boss_class==3)upload_world_sprite_words(BOSS13_PLATFORM_BASE_WORD,g_boss13_platform_words,512);
+        if(g_boss_class==1)upload_world_sprite_words(BOSS_WATER_BASE_WORD,g_boss_water_words,64);
+    }
     init_objects();
 
     /* Special-mode player spawn is the alternate table at ROM $1DC56.
@@ -6490,9 +6621,16 @@ static void submit_front_satb(u16 *satb)
 
 static void clear_front_sprites(void)
 {
-    static u16 satb[64*4];
+    static u16 satb[64*4],back[64*4];
+    u16 base;
     int i; for (i=0;i<64*4;++i) satb[i]=0;
     submit_front_satb(satb);
+    for (i=0;i<64*4;++i) back[i]=0;
+    base=(u16)(g_back_satb_page?BACK_SATB_BASE1:BACK_SATB_BASE0);
+    vdc_set_vram_write(BACK_CHIP,base);
+    for(i=0;i<64*4;++i)vdc_vram_write(BACK_CHIP,back[i]);
+    vdc_set_satb_address(BACK_CHIP,base);
+    g_back_satb_page^=1;
 }
 
 static void set_front_sprites_enabled(int enabled)
@@ -6503,6 +6641,7 @@ static void set_front_sprites_enabled(int enabled)
        available for its normal palette fade. */
     vdc_setreg(FRONT_CHIP, VDC_REG_CR,
                enabled ? (u16)(VDC_CR_BB | VDC_CR_SB) : VDC_CR_BB);
+    if(!enabled)vdc_setreg(BACK_CHIP,VDC_REG_CR,VDC_CR_BB);
 }
 
 static void add_front_player(u16 *satb, int *n, int x, int y, int frame, u16 baseword, int facing)
@@ -7264,7 +7403,7 @@ static void update_frontend(u16 pressed)
         /* CHR/BAT/SATB uploads can span a frame. Keep one additional complete
            black frame after they return before publishing both VDC planes. */
         if (g_state_frame>=2) {
-            vdc_setreg(BACK_CHIP,VDC_REG_CR,VDC_CR_BB);
+            vdc_setreg(BACK_CHIP,VDC_REG_CR,(u16)(VDC_CR_BB|VDC_CR_SB));
             vdc_setreg(FRONT_CHIP,VDC_REG_CR,(u16)(VDC_CR_BB|VDC_CR_SB));
             g_state=STATE_PLAY; g_state_frame=0;
             return;
@@ -7346,6 +7485,10 @@ int main(void)
     for (;;) {
         u16 btn, pressed, btn2=0, pressed2=0;
         wait_frame();
+        /* Publish queued ring rows at the same frame boundary as their scroll,
+           with the data write first.  This is the only safe ordering once the
+           dual-VDC SATB uploads make the preceding frame's workload variable. */
+        flush_level_rows();
         if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE) {
             commit_stage_camera();
             backdrop_parallax_splits();

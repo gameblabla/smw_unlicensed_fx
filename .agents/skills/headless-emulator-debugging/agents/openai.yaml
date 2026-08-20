@@ -1,0 +1,4 @@
+interface:
+  display_name: "Headless Emulator Debugging"
+  short_description: "Reproduce and diagnose emulator visual regressions"
+  default_prompt: "Reproduce this emulator-visible bug with scripted input, identify the smallest root cause, implement the fix, and verify frame-by-frame."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Frame-Safe Video Updates"
+  short_description: "Prevent tearing and corruption in hardware video updates"
+  default_prompt: "Inspect this graphics update for unsafe visible-memory writes, incomplete composition, or unsynchronized layers, then implement and verify a hardware-safe fix."
