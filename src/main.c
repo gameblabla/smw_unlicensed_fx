@@ -1230,9 +1230,10 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
     for(i=0;i<64*4;++i)front[i]=back[i]=0;
 
     for(i=0;i<logical_count;){
-        unsigned char add_count[240]={0};
-        unsigned short add_pixels[240]={0};
+        unsigned char add_count[240];
+        unsigned short add_pixels[240];
         int k,len=group_len[i]?group_len[i]:1;
+        int first=240,last=0;
         int use_front=(nf+len<=64),use_back=(nb+len<=64);
         if(i+len>logical_count)len=logical_count-i;
 
@@ -1243,12 +1244,28 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
         for(k=0;k<len;++k){
             const u16 *e=logical+(i+k)*4;
             int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
-            int width=(e[3]&VDC_SPR_X_WIDTH_2)?32:16;
-            int first=y<0?0:y,last=y+h;
-            if(last>240)last=240;
-            for(j=first;j<last;++j){++add_count[j];add_pixels[j]=(u16)(add_pixels[j]+width);}
+            int sprite_first=y<0?0:y,sprite_last=y+h;
+            if(sprite_last>240)sprite_last=240;
+            if(sprite_first<sprite_last){
+                if(sprite_first<first)first=sprite_first;
+                if(sprite_last>last)last=sprite_last;
+            }
         }
-        for(j=0;j<240;++j){
+        /* Only touch the scanlines covered by this group.  Clearing and
+           rescanning all 240 lines for every ordinary sprite exhausted a
+           field on the V810 even in single-player mode. */
+        for(j=first;j<last;++j){add_count[j]=0;add_pixels[j]=0;}
+        for(k=0;k<len;++k){
+            const u16 *e=logical+(i+k)*4;
+            int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
+            int width=(e[3]&VDC_SPR_X_WIDTH_2)?32:16;
+            int sprite_first=y<0?0:y,sprite_last=y+h;
+            if(sprite_last>240)sprite_last=240;
+            for(j=sprite_first;j<sprite_last;++j){
+                ++add_count[j];add_pixels[j]=(u16)(add_pixels[j]+width);
+            }
+        }
+        for(j=first;j<last;++j){
             if(back_used[j]||front_count[j]+add_count[j]>VDC_SPRITES_PER_LINE||
                front_pixels[j]+add_pixels[j]>VDC_SPRITE_PIXELS_PER_LINE)use_front=0;
             if(back_count[j]+add_count[j]>VDC_SPRITES_PER_LINE||
@@ -1257,11 +1274,11 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
         if(use_front){
             for(k=0;k<len;++k)for(j=0;j<4;++j)front[(nf+k)*4+j]=logical[(i+k)*4+j];
             nf+=len;
-            for(j=0;j<240;++j){front_count[j]=(unsigned char)(front_count[j]+add_count[j]);front_pixels[j]=(u16)(front_pixels[j]+add_pixels[j]);}
+            for(j=first;j<last;++j){front_count[j]=(unsigned char)(front_count[j]+add_count[j]);front_pixels[j]=(u16)(front_pixels[j]+add_pixels[j]);}
         }else if(use_back){
             for(k=0;k<len;++k)for(j=0;j<4;++j)back[(nb+k)*4+j]=logical[(i+k)*4+j];
             nb+=len;
-            for(j=0;j<240;++j){back_count[j]=(unsigned char)(back_count[j]+add_count[j]);back_pixels[j]=(u16)(back_pixels[j]+add_pixels[j]);if(add_count[j])back_used[j]=1;}
+            for(j=first;j<last;++j){back_count[j]=(unsigned char)(back_count[j]+add_count[j]);back_pixels[j]=(u16)(back_pixels[j]+add_pixels[j]);back_used[j]=1;}
         }
         i+=len;
     }
