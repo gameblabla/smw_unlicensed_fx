@@ -980,18 +980,28 @@ static u16 relocate_bat(u16 e, u16 base_index)
 
 static void load_menu_asset(void)
 {
-    int x,y;
+    int panel,x,y;
     /* By the time this runs the title has faded to black, so the title-only
        CHR region can be reused without exposing a transient tile mismatch.
        CHR and the matching BAT rows 32..61 must be written together: uploading
-       one without the other leaves the menu interpreting stale title cells. */
+       one without the other leaves the menu interpreting stale title cells.
+
+       The background BAT is 64 cells wide, exactly enough to keep the 1P and
+       2P panels next to each other.  Populate both while output is hidden so
+       menu navigation can select one with a scroll change instead of rewriting
+       the visible BAT during active display. */
     upload_tiles(BACK_CHIP,FRONT_TILE_BASE_WORD,&g_menu_combo_asset);
     for(y=0;y<30;++y){
         vdc_set_vram_write(BACK_CHIP,(u16)((32+y)*BG_BAT_W));
-        for(x=0;x<32;++x){
-            u16 e=g_menu_combo_asset.bat[y*g_menu_combo_asset.width_tiles+x];
-            vdc_vram_write(BACK_CHIP,relocate_bat(e,(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS)));
-        }
+        for(panel=0;panel<2;++panel)
+            for(x=0;x<32;++x){
+                u16 e=g_menu_combo_asset.bat[y*g_menu_combo_asset.width_tiles+panel*32+x];
+                /* The captured 2P panel is a sparse overlay on the complete
+                   1P/common scene; zero cells mean "keep the base". */
+                if(panel && !e)
+                    e=g_menu_combo_asset.bat[y*g_menu_combo_asset.width_tiles+x];
+                vdc_vram_write(BACK_CHIP,relocate_bat(e,(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS)));
+            }
     }
 }
 
@@ -6391,17 +6401,8 @@ static void draw_boot_motion(unsigned f)
 
 static void show_menu_back(int choice)
 {
-    int y,x;
     int panel=(choice==MENU_2P)?1:0;
-    u16 baseidx=(u16)(FRONT_TILE_BASE_WORD/TILE_WORDS);
-    for (y=0;y<30;++y) {
-        vdc_set_vram_write(BACK_CHIP,(u16)((32+y)*BG_BAT_W));
-        for (x=0;x<32;++x) {
-            u16 e=g_menu_combo_asset.bat[y*g_menu_combo_asset.width_tiles+panel*32+x];
-            vdc_vram_write(BACK_CHIP,relocate_bat(e,baseidx));
-        }
-    }
-    vdc_set_scroll(BACK_CHIP,0,256);
+    vdc_set_scroll(BACK_CHIP,(u16)(panel*SCREEN_W),256);
 }
 
 static void menu_overlay_prepare(void)
@@ -6995,6 +6996,12 @@ static void update_frontend(u16 pressed)
     } else if (g_state==STATE_MENU) {
         if (pressed&(JOY_UP|JOY_DOWN|JOY_LEFT|JOY_RIGHT)) {
             g_menu_choice^=1;
+            /* SATB DMA becomes visible at the next frame boundary.  Queue the
+               matching character list first, then switch the preloaded BAT
+               panel at that boundary so neither half of the choice changes
+               a frame before the other. */
+            draw_menu_people(0);
+            wait_frame();
             show_menu_back(g_menu_choice);
         }
         draw_menu_people(0);
