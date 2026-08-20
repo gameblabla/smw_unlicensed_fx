@@ -6786,7 +6786,10 @@ static void draw_menu_people(int walking)
     add_menu_32x48(satb,&n,mx,160,
         (u16)(MENU_MARIO_BASE_WORD+frame*PLAYER_FRAME_WORDS_LOCAL),1,15);
     if (g_menu_choice==MENU_2P)
-        add_menu_32x48(satb,&n,68,160,MENU_LUIGI_BASE_WORD,1,15);
+        /* Keep Luigi beside Mario during the confirmation walk.  His menu
+           art is a single standing cel, but the pair must share Mario's
+           moving X position so Luigi does not remain behind at the menu. */
+        add_menu_32x48(satb,&n,mx+30,160,MENU_LUIGI_BASE_WORD,1,15);
 
     /* Never scroll VDC1 during the menu. r5's scroll-based walk caused the
        brief centered/shifted frame during transitions. */
