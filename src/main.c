@@ -1222,63 +1222,93 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
                               int logical_count)
 {
     static u16 front[64*4],back[64*4];
-    unsigned char front_count[240]={0},back_count[240]={0},back_used[240]={0};
-    unsigned short front_pixels[240]={0},back_pixels[240]={0};
+    /* Pack sprite count in the low byte and fetched 16-pixel units in the
+       high byte.  Both hardware limits are 16, so this keeps all allocator
+       scratch state below one 2 KiB DRAM page. */
+    u16 front_line[240]={0},back_line[240]={0};
     int i,j,nf=0,nb=0;
     u16 front_base=(u16)(g_satb_page?SATB_BASE1:SATB_BASE0);
     u16 back_base=(u16)(g_back_satb_page?BACK_SATB_BASE1:BACK_SATB_BASE0);
     for(i=0;i<64*4;++i)front[i]=back[i]=0;
 
     for(i=0;i<logical_count;){
-        unsigned char add_count[240];
-        unsigned short add_pixels[240];
         int k,len=group_len[i]?group_len[i]:1;
-        int first=240,last=0;
         int use_front=(nf+len<=64),use_back=(nb+len<=64);
         if(i+len>logical_count)len=logical_count-i;
 
-        /* A moving platform is one visual object even when it occupies eight
-           SATB entries.  Measure the complete object before selecting a VDC;
-           assigning its strips independently lets them migrate across the
-           fixed VDC1-over-VDC0 mixer as scanline pressure changes. */
-        for(k=0;k<len;++k){
-            const u16 *e=logical+(i+k)*4;
+        /* Almost every logical object is one SATB entry.  Handle it directly
+           instead of building and clearing a 240-line temporary group map. */
+        if(len==1){
+            const u16 *e=logical+i*4;
             int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
-            int sprite_first=y<0?0:y,sprite_last=y+h;
-            if(sprite_last>240)sprite_last=240;
-            if(sprite_first<sprite_last){
-                if(sprite_first<first)first=sprite_first;
-                if(sprite_last>last)last=sprite_last;
+            int first=y<0?0:y,last=y+h;
+            u16 add=(u16)(1+(((e[3]&VDC_SPR_X_WIDTH_2)?2:1)<<8));
+            if(last>240)last=240;
+            for(j=first;j<last;++j){
+                u16 f=front_line[j],b=back_line[j];
+                if((b&0xff)||(f&0xff)>=VDC_SPRITES_PER_LINE||
+                   (f>>8)+(add>>8)>VDC_SPRITE_PIXELS_PER_LINE/16)use_front=0;
+                if((b&0xff)>=VDC_SPRITES_PER_LINE||
+                   (b>>8)+(add>>8)>VDC_SPRITE_PIXELS_PER_LINE/16)use_back=0;
             }
-        }
-        /* Only touch the scanlines covered by this group.  Clearing and
-           rescanning all 240 lines for every ordinary sprite exhausted a
-           field on the V810 even in single-player mode. */
-        for(j=first;j<last;++j){add_count[j]=0;add_pixels[j]=0;}
-        for(k=0;k<len;++k){
-            const u16 *e=logical+(i+k)*4;
-            int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
-            int width=(e[3]&VDC_SPR_X_WIDTH_2)?32:16;
-            int sprite_first=y<0?0:y,sprite_last=y+h;
-            if(sprite_last>240)sprite_last=240;
-            for(j=sprite_first;j<sprite_last;++j){
-                ++add_count[j];add_pixels[j]=(u16)(add_pixels[j]+width);
+            if(use_front){
+                for(j=0;j<4;++j)front[nf*4+j]=e[j];
+                ++nf;
+                for(j=first;j<last;++j)front_line[j]=(u16)(front_line[j]+add);
+            }else if(use_back){
+                for(j=0;j<4;++j)back[nb*4+j]=e[j];
+                ++nb;
+                for(j=first;j<last;++j)back_line[j]=(u16)(back_line[j]+add);
             }
+            ++i;
+            continue;
         }
-        for(j=first;j<last;++j){
-            if(back_used[j]||front_count[j]+add_count[j]>VDC_SPRITES_PER_LINE||
-               front_pixels[j]+add_pixels[j]>VDC_SPRITE_PIXELS_PER_LINE)use_front=0;
-            if(back_count[j]+add_count[j]>VDC_SPRITES_PER_LINE||
-               back_pixels[j]+add_pixels[j]>VDC_SPRITE_PIXELS_PER_LINE)use_back=0;
-        }
-        if(use_front){
-            for(k=0;k<len;++k)for(j=0;j<4;++j)front[(nf+k)*4+j]=logical[(i+k)*4+j];
-            nf+=len;
-            for(j=first;j<last;++j){front_count[j]=(unsigned char)(front_count[j]+add_count[j]);front_pixels[j]=(u16)(front_pixels[j]+add_pixels[j]);}
-        }else if(use_back){
-            for(k=0;k<len;++k)for(j=0;j<4;++j)back[(nb+k)*4+j]=logical[(i+k)*4+j];
-            nb+=len;
-            for(j=first;j<last;++j){back_count[j]=(unsigned char)(back_count[j]+add_count[j]);back_pixels[j]=(u16)(back_pixels[j]+add_pixels[j]);back_used[j]=1;}
+
+        {
+            u16 add_line[240];
+            int first=240,last=0;
+            /* A moving platform is one visual object even when it occupies
+               eight SATB entries.  Measure the complete object before
+               selecting a VDC; assigning its strips independently lets them
+               migrate across the fixed VDC1-over-VDC0 mixer as scanline
+               pressure changes. */
+            for(k=0;k<len;++k){
+                const u16 *e=logical+(i+k)*4;
+                int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
+                int sprite_first=y<0?0:y,sprite_last=y+h;
+                if(sprite_last>240)sprite_last=240;
+                if(sprite_first<sprite_last){
+                    if(sprite_first<first)first=sprite_first;
+                    if(sprite_last>last)last=sprite_last;
+                }
+            }
+            for(j=first;j<last;++j)add_line[j]=0;
+            for(k=0;k<len;++k){
+                const u16 *e=logical+(i+k)*4;
+                int y=(int)e[0]-SPR_ORIGIN_Y,h=sprite_height(e[3]);
+                u16 add=(u16)(1+(((e[3]&VDC_SPR_X_WIDTH_2)?2:1)<<8));
+                int sprite_first=y<0?0:y,sprite_last=y+h;
+                if(sprite_last>240)sprite_last=240;
+                for(j=sprite_first;j<sprite_last;++j)
+                    add_line[j]=(u16)(add_line[j]+add);
+            }
+            for(j=first;j<last;++j){
+                u16 add=add_line[j],f=front_line[j],b=back_line[j];
+                if((f&0xff)+(add&0xff)>VDC_SPRITES_PER_LINE||
+                   (f>>8)+(add>>8)>VDC_SPRITE_PIXELS_PER_LINE/16)use_front=0;
+                if((b&0xff)+(add&0xff)>VDC_SPRITES_PER_LINE||
+                   (b>>8)+(add>>8)>VDC_SPRITE_PIXELS_PER_LINE/16)use_back=0;
+                if(b&0xff)use_front=0;
+            }
+            if(use_front){
+                for(k=0;k<len;++k)for(j=0;j<4;++j)front[(nf+k)*4+j]=logical[(i+k)*4+j];
+                nf+=len;
+                for(j=first;j<last;++j)front_line[j]=(u16)(front_line[j]+add_line[j]);
+            }else if(use_back){
+                for(k=0;k<len;++k)for(j=0;j<4;++j)back[(nb+k)*4+j]=logical[(i+k)*4+j];
+                nb+=len;
+                for(j=first;j<last;++j)back_line[j]=(u16)(back_line[j]+add_line[j]);
+            }
         }
         i+=len;
     }
