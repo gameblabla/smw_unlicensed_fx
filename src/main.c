@@ -4684,9 +4684,9 @@ static void draw_game_sprites(void)
         if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,144,217+hud_yoff,
             (u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
         emit_hud_hearts(satb,&n,152,217+hud_yoff,g_luigi.hearts,LUIGI_SPR_PAL);
-        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,200,209+hud_yoff,
+        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,192,209+hud_yoff,
             HUD_FIRE_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
-        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,216,217+hud_yoff,
+        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,208,217+hud_yoff,
             (u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
     }
     /* Everything emitted from here on is world content and may be occluded by
