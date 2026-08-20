@@ -100,7 +100,8 @@ extern void pcfx_tetsu_wait_frame(void);
 #define BOSS_WATER_SPR_PAL 15
 #define BOSS_SPR_PAL_AUX 9
 #define BOSS_CROUCH_SPR_PAL 8
-#define PLAYER_SPR_PAL 13
+#define MARIO_BOSS_SPR_PAL 6
+#define LUIGI_SPR_PAL 13
 #define BOSS_SPR_PAL 14
 #define BOSS_HURT_FRAMES 30
 #define SPR_ORIGIN_X 0x20
@@ -242,6 +243,11 @@ extern void pcfx_tetsu_wait_frame(void);
 #define PMODE_DYING      1
 #define PMODE_FADE_OUT   2
 #define PMODE_FADE_IN    3
+#define PMODE_REENTRY    4
+#define PMODE_OUT        5
+
+#define MULTI_HOVER_FRAMES 60
+#define MULTI_INVULN_FRAMES 120
 
 #define CRATE_W 24
 #define CRATE_H 24
@@ -828,9 +834,30 @@ static int g_debug_mode;
 static int g_crate_hide;
 static int g_paused;
 
+/* Luigi reuses Mario's gameplay pattern bank and selects a green palette.
+   This costs no additional gameplay VRAM, which is already tightly packed. */
+typedef struct {
+    s32 x,y,vx,vy;
+    int grounded,facing,anim_clock,jump_active,jump_index,down;
+    int mode,death_timer,invuln,hearts,lives,out;
+    u16 prev_buttons;
+} SecondPlayer;
+static SecondPlayer g_luigi;
+
+/* Bank 1 changes Mario's red clothing indices 1/8/12 to Luigi's green
+   ramp 3/2/4.  Applying that index correspondence to Mario's shared patterns
+   keeps Luigi green without a second 7,680-word gameplay bank. */
+static const u16 g_luigi_reuse_palette[16]={
+    0x0088,0x5D63,0x7072,0x5D63,0x4574,0x93A6,0x5CB5,0x4696,
+    0x7072,0xD34A,0x784C,0xC75B,0x4574,0x957E,0x2488,0xFF88
+};
+
+static int multiplayer_active(void) { return g_menu_choice==MENU_2P; }
+
 static void enter_menu(void);
 static void enter_boot(void);
 static void start_boss(int fade_in);
+static void load_continue_hidden(void);
 
 /* Boss 3 (level 8 slot).  $80D8 selects animation $B=5 for every action from
    6 up, so the two spin paths (6/7) and the crate drop (8) all play the spin
@@ -858,6 +885,11 @@ static void wait_frame(void)
 static u16 read_buttons(void)
 {
     return (u16)(contrlr_pad_read(0) & 0xFFFFu);
+}
+
+static u16 read_buttons_2(void)
+{
+    return (u16)(contrlr_pad_read(1) & 0xFFFFu);
 }
 
 static int iabs_i(int v) { return v < 0 ? -v : v; }
@@ -1197,7 +1229,8 @@ static void upload_game_sprites(void)
     /* Keep a dedicated copy of the player palette for boss rooms. Normal
        stages use source palette line 0 directly; every generated level carries
        the same Mario/object colors there. */
-    for (i=0;i<16;++i) tetsu_set_palette((u16)(PLAYER_SPR_PAL*16+i),g_player_palette[i]);
+    for (i=0;i<16;++i) tetsu_set_palette((u16)(MARIO_BOSS_SPR_PAL*16+i),g_player_palette[i]);
+    for (i=0;i<16;++i) tetsu_set_palette((u16)(LUIGI_SPR_PAL*16+i),g_luigi_reuse_palette[i]);
     for (i=0;i<16;++i) tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),g_continue_player_palette[i]);
     if(g_in_boss)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_CROUCH_SPR_PAL*16+i),g_continue_player_palette[i]);
 
@@ -1349,7 +1382,9 @@ static void set_game_palette_fade(int level)
     const BossRoomData *br=(g_in_boss&&g_boss_class==0)?&g_bowser_rooms[(g_current_level==5)?1:0]:0;
     const unsigned short *pal = g_in_boss ? (bv?bv->bg_palette:br->palette) : g_level->palette;
     for(i=0;i<256;++i)tetsu_set_palette((u16)i,fade_yuv(pal[i],level));
-    for(i=0;i<16;++i)tetsu_set_palette((u16)(PLAYER_SPR_PAL*16+i),fade_yuv(g_player_palette[i],level));
+    for(i=0;i<16;++i)tetsu_set_palette((u16)(MARIO_BOSS_SPR_PAL*16+i),fade_yuv(g_player_palette[i],level));
+    if(multiplayer_active())for(i=0;i<16;++i)
+        tetsu_set_palette((u16)(LUIGI_SPR_PAL*16+i),fade_yuv(g_luigi_reuse_palette[i],level));
     for(i=0;i<16;++i)tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
     if(g_in_boss){
         if(bv){
@@ -1369,7 +1404,7 @@ static void set_game_palette_fade(int level)
     }
     if(g_in_boss&&g_boss_class==1)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_WATER_SPR_PAL*16+i),fade_yuv(g_boss_water_palette[i],level));
     if(g_in_boss&&g_boss_class==3)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS13_PLATFORM_SPR_PAL*16+i),fade_yuv(g_boss13_platform_palette[i],level));
-    else if(g_level){
+    else if(!g_in_boss&&g_level){
         for(i=0;i<g_level->variant_count;++i){
             const EnemyVariantData *v=&g_enemy_variants[g_level->variant_ids[i]]; int line=-1;
             for(j=0;j<uniq;++j)if(palettes_equal(seen[j],v->palette)){line=4+j;break;}
@@ -3213,8 +3248,99 @@ static void begin_player_death(void)
     g_vy=-(6*FIX_ONE+FIX_ONE/2);
     /* A retry must begin its level cue at index 00, never at the position the
        player died.  Start the fade while the death animation is still shown. */
-    music_stop_for_transition();
+    if(!multiplayer_active()) music_stop_for_transition();
     Play_Sound_Sample(SFX_PLAYER_DEATH,0,0);
+}
+
+static void multiplayer_all_out(void)
+{
+    music_stop_for_transition();
+    if(g_continues>0) load_continue_hidden();
+    else enter_boot();
+}
+
+static void finish_mario_multiplayer_death(void)
+{
+    if(g_lives>0)--g_lives;
+    if(g_lives<=0){
+        g_lives=0;g_player_mode=PMODE_OUT;
+        if(g_luigi.out)multiplayer_all_out();
+        return;
+    }
+    g_player_x=(s32)((int)(g_player_x>>FIX_SHIFT))<<FIX_SHIFT;
+    g_player_y=(s32)g_camera_y<<FIX_SHIFT;
+    g_vx=g_vy=0;g_death_timer=0;g_player_hearts=PLAYER_MAX_HEARTS;
+    g_player_mode=PMODE_REENTRY;
+}
+
+static void hurt_luigi(void)
+{
+    if(g_luigi.mode!=PMODE_NORMAL||g_luigi.invuln>0||g_luigi.out)return;
+    if(g_luigi.hearts>0)--g_luigi.hearts;
+    g_luigi.invuln=HURT_FRAMES;
+}
+
+static void begin_luigi_death(void)
+{
+    if(g_luigi.mode!=PMODE_NORMAL||g_luigi.out)return;
+    g_luigi.mode=PMODE_DYING;g_luigi.death_timer=0;g_luigi.invuln=0;
+    g_luigi.vx=0;g_luigi.vy=-(6*FIX_ONE+FIX_ONE/2);g_luigi.down=0;
+    Play_Sound_Sample(SFX_PLAYER_DEATH,0,0);
+}
+
+static void update_luigi(u16 btn,u16 pressed)
+{
+    s32 ox,oy,ovx,ovy;int og,of,oja,oji,opby,oop,odrop;
+    const s32 speed=2*FIX_ONE;
+    int i,px,py;
+    if(!multiplayer_active()||g_state!=STATE_PLAY)return;
+    if(g_luigi.out)return;
+    if(g_luigi.mode==PMODE_FADE_IN)g_luigi.mode=PMODE_NORMAL;
+    if(g_luigi.mode==PMODE_DYING){
+        g_luigi.y+=g_luigi.vy;g_luigi.vy+=64;
+        if(g_luigi.vy>7*FIX_ONE)g_luigi.vy=7*FIX_ONE;
+        ++g_luigi.death_timer;
+        if((int)(g_luigi.y>>FIX_SHIFT)>g_camera_y+256){
+            if(g_luigi.lives>0)--g_luigi.lives;
+            if(g_luigi.lives<=0){g_luigi.lives=0;g_luigi.out=1;g_luigi.mode=PMODE_OUT;if(g_player_mode==PMODE_OUT)multiplayer_all_out();return;}
+            g_luigi.y=(s32)g_camera_y<<FIX_SHIFT;g_luigi.vx=g_luigi.vy=0;g_luigi.down=0;
+            g_luigi.death_timer=0;g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.mode=PMODE_REENTRY;
+        }
+        return;
+    }
+    if(g_luigi.mode==PMODE_REENTRY){
+        if(btn&JOY_LEFT){g_luigi.x-=speed;g_luigi.facing=-1;}
+        else if(btn&JOY_RIGHT){g_luigi.x+=speed;g_luigi.facing=1;}
+        if((int)(g_luigi.x>>FIX_SHIFT)<g_camera_x)g_luigi.x=(s32)g_camera_x<<FIX_SHIFT;
+        if((int)(g_luigi.x>>FIX_SHIFT)>g_camera_x+224)g_luigi.x=(s32)(g_camera_x+224)<<FIX_SHIFT;
+        if(++g_luigi.death_timer>=MULTI_HOVER_FRAMES){g_luigi.mode=PMODE_NORMAL;g_luigi.invuln=MULTI_INVULN_FRAMES;g_luigi.vy=0;g_luigi.grounded=0;}
+        return;
+    }
+    if(g_luigi.invuln>0)--g_luigi.invuln;
+    if(g_luigi.hearts<=0&&g_luigi.invuln==0){begin_luigi_death();return;}
+
+    ox=g_player_x;oy=g_player_y;ovx=g_vx;ovy=g_vy;og=g_grounded;of=g_facing;
+    oja=g_jump_active;oji=g_jump_index;opby=g_prev_body_y;oop=g_on_moving_platform;odrop=g_drop_platform_timer;
+    g_player_x=g_luigi.x;g_player_y=g_luigi.y;g_vx=g_luigi.vx;g_vy=g_luigi.vy;
+    g_grounded=g_luigi.grounded;g_facing=g_luigi.facing;g_jump_active=g_luigi.jump_active;g_jump_index=g_luigi.jump_index;
+    g_prev_body_y=player_body_y();g_on_moving_platform=-1;g_drop_platform_timer=0;
+    g_luigi.down=(g_grounded&&(btn&JOY_DOWN))?1:0;
+    if(g_luigi.down&&!(pressed&JOY_I))g_vx=0;
+    else if(btn&JOY_LEFT){g_vx=-speed;g_facing=-1;}else if(btn&JOY_RIGHT){g_vx=speed;g_facing=1;}else g_vx=0;
+    if(g_grounded&&(pressed&JOY_I)){g_grounded=0;g_jump_active=1;g_jump_index=0;g_luigi.down=0;Play_Sound_Sample(SFX_JUMP,0,0);}
+    resolve_player_horizontal(g_player_x+g_vx);
+    if((int)(g_player_x>>FIX_SHIFT)<g_camera_x)g_player_x=(s32)g_camera_x<<FIX_SHIFT;
+    if(g_jump_active){int dy;if(g_jump_index<=19&&!(btn&JOY_I))g_jump_index=44-g_jump_index;if(g_jump_index>44)g_jump_index=44;dy=g_md_jump_dy[g_jump_index++];g_vy=(s32)dy*FIX_ONE;resolve_player_vertical(g_player_y+g_vy);if(g_jump_index>=45)g_jump_active=0;}
+    else{g_vy+=88;if(g_vy>5*FIX_ONE)g_vy=5*FIX_ONE;resolve_player_vertical(g_player_y+g_vy);}
+    g_luigi.x=g_player_x;g_luigi.y=g_player_y;g_luigi.vx=g_vx;g_luigi.vy=g_vy;g_luigi.grounded=g_grounded;g_luigi.facing=g_facing;g_luigi.jump_active=g_jump_active;g_luigi.jump_index=g_jump_index;++g_luigi.anim_clock;
+    if(g_player_mode==PMODE_OUT)update_camera();
+    g_player_x=ox;g_player_y=oy;g_vx=ovx;g_vy=ovy;g_grounded=og;g_facing=of;g_jump_active=oja;g_jump_index=oji;g_prev_body_y=opby;g_on_moving_platform=oop;g_drop_platform_timer=odrop;
+    if((int)(g_luigi.y>>FIX_SHIFT)>player_pit_floor()){begin_luigi_death();return;}
+    px=(int)(g_luigi.x>>FIX_SHIFT)+PLAYER_BODY_XOFF;py=(int)(g_luigi.y>>FIX_SHIFT)+PLAYER_BODY_YOFF;
+    if(g_luigi.invuln==0){
+        for(i=0;i<MAX_ENEMIES;++i)if(g_enemies[i].active&&!g_enemies[i].defeated&&aabb(px+4,py+5,8,PLAYER_BODY_H-10,(int)(g_enemies[i].x>>FIX_SHIFT),(int)(g_enemies[i].y>>FIX_SHIFT),g_enemies[i].width,g_enemies[i].height)){hurt_luigi();break;}
+        for(i=0;i<4;++i)if(g_enemy_shots[i].active&&aabb(px,py,PLAYER_BODY_W,PLAYER_BODY_H,(int)(g_enemy_shots[i].x>>FIX_SHIFT),(int)(g_enemy_shots[i].y>>FIX_SHIFT),g_enemy_shots[i].cols?g_enemy_shots[i].cols*16:16,16)){g_enemy_shots[i].active=0;hurt_luigi();break;}
+    }
 }
 
 static void hurt_player(void)
@@ -4230,7 +4356,7 @@ static int emit_crate_sprites(u16 *satb,int n,int limit,int cam_x,int cam_y)
         sx = (int)(g_crates[i].x >> FIX_SHIFT) - cam_x;
         sy = (int)(g_crates[i].y >> FIX_SHIFT) - cam_y + bowser_room_object_y_offset();
         if (sx < -32 || sx > 255 || sy < -32 || sy > 239) continue;
-        {u16 addr=CRATE_BASE_WORD,pal=(u16)(g_in_boss?PLAYER_SPR_PAL:0); int width=2,height=2;
+        {u16 addr=CRATE_BASE_WORD,pal=(u16)(g_in_boss?MARIO_BOSS_SPR_PAL:0); int width=2,height=2;
         if((!g_in_boss&&g_current_level>=6&&g_current_level<=8)||
            (g_in_boss&&g_boss_class==1)){
             addr=BOSS_POT_BASE_WORD;pal=BOSS_ITEM_SPR_PAL;
@@ -4272,11 +4398,13 @@ static void draw_game_sprites(void)
        normal sprites to line 13 and produced the observed yellow/green Mario
        regression.  Keep the separate line only for boss rooms, where the
        arena uses lines 0..2. */
-    u16 player_pal=(u16)(g_in_boss?PLAYER_SPR_PAL:0);
+    u16 player_pal=(u16)(g_in_boss?MARIO_BOSS_SPR_PAL:0);
     u16 pctrl = (u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 | player_pal);
     u16 paddr = (u16)(PLAYER_BASE_WORD + (frame-1) * PLAYER_FRAME_WORDS_LOCAL);
     if (g_player_down && g_grounded) {
-        paddr=(g_menu_choice==MENU_2P)?GAMEPLAY_DOWN_LUIGI_BASE_WORD:GAMEPLAY_DOWN_MARIO_BASE_WORD;
+        /* Participant count is not character identity: player one remains
+           Mario in both menu modes. */
+        paddr=GAMEPLAY_DOWN_MARIO_BASE_WORD;
         pctrl=(u16)(VDC_SPR_PRIO_SP | VDC_SPR_X_WIDTH_2 | VDC_SPR_Y_HEIGHT_1 |
                     (g_in_boss?BOSS_CROUCH_SPR_PAL:CONTINUE_PLAYER_SPR_PAL));
         py+=8;
@@ -4303,6 +4431,17 @@ static void draw_game_sprites(void)
         int digit=g_fireball_ammo;
         if (digit<0) digit=0; if (digit>9) digit=9;
         set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
+    }
+    if(multiplayer_active() && n<64){
+        int lives=g_luigi.lives;
+        if(lives<0)lives=0;if(lives>9)lives=9;
+        set_sprite_entry(satb,n++,136,209+hud_yoff,HUD_LIFE_BASE_WORD,
+            (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LUIGI_SPR_PAL));
+        if(n<64)set_sprite_entry(satb,n++,160,217+hud_yoff,
+            (u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
+        for(i=0;i<g_luigi.hearts&&i<PLAYER_MAX_HEARTS&&n<64;++i)
+            set_sprite_entry(satb,n++,168+i*8,217+hud_yoff,HUD_HEART_BASE_WORD,
+                (u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
     }
     /* Everything emitted from here on is world content and may be occluded by
        a front-plane scenery layer; the HUD above never is. */
@@ -4419,7 +4558,7 @@ static void draw_game_sprites(void)
         set_sprite_entry(satb,n++,px,py,da,dc);
         set_sprite_entry(satb,n++,px,py+16,(u16)(da+PLAYER_STRIP_WORDS),dc);
         set_sprite_entry(satb,n++,px,py+32,(u16)(da+PLAYER_STRIP_WORDS*2),dc);
-    } else if (g_player_mode!=PMODE_FADE_OUT && player_visible) {
+    } else if (g_player_mode!=PMODE_FADE_OUT && g_player_mode!=PMODE_OUT && player_visible) {
         if (g_throw_timer>0) {
             /* State 8 / gfx frame 13 is a true 48x32 metasprite. r4 used it
                for death and therefore lost the right-hand 16x32 block when
@@ -4438,6 +4577,37 @@ static void draw_game_sprites(void)
             set_sprite_entry(satb,n++,px,py,paddr,pctrl);
             set_sprite_entry(satb,n++,px,py+16,(u16)(paddr+PLAYER_STRIP_WORDS),pctrl);
             set_sprite_entry(satb,n++,px,py+32,(u16)(paddr+PLAYER_STRIP_WORDS*2),pctrl);
+        }
+    }
+
+    if (multiplayer_active() && !g_luigi.out && n<61) {
+        int lx=(int)(g_luigi.x>>FIX_SHIFT)-cam_x;
+        int ly=(int)(g_luigi.y>>FIX_SHIFT)-cam_y+bowser_room_object_y_offset();
+        int lf=3;
+        u16 la,lc=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|
+                        VDC_SPR_Y_HEIGHT_1|LUIGI_SPR_PAL);
+        int visible=(g_luigi.invuln<=0)||
+                    (((g_luigi.invuln/HURT_FLICKER_HALF_PERIOD)&1)!=0);
+        if (g_luigi.mode==PMODE_DYING) {
+            lf=((const unsigned char[]){4,5,6,5})[(g_luigi.death_timer/6)&3];
+            la=(u16)(PLAYER_BASE_WORD+(lf-1)*PLAYER_FRAME_WORDS_LOCAL);
+        } else if (g_luigi.down && g_luigi.grounded) {
+            /* The dedicated crouch art has its own Mario/Luigi indexed
+               palette, so it must not use the shared standing-frame line. */
+            la=GAMEPLAY_DOWN_LUIGI_BASE_WORD;
+            lc=(u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_1|
+                     (g_in_boss?BOSS_CROUCH_SPR_PAL:CONTINUE_PLAYER_SPR_PAL));
+            ly+=8;
+        } else {
+            if (!g_luigi.grounded) lf=4;
+            else if (g_luigi.vx) lf=((const unsigned char[]){1,2,1,3})[(g_luigi.anim_clock/7)&3];
+            la=(u16)(PLAYER_BASE_WORD+(lf-1)*PLAYER_FRAME_WORDS_LOCAL);
+        }
+        if(g_luigi.facing<0)lc|=VDC_SPR_X_INVERT;
+        if(visible || g_luigi.mode==PMODE_DYING || g_luigi.mode==PMODE_REENTRY){
+            set_sprite_entry(satb,n++,lx,ly,la,lc);
+            set_sprite_entry(satb,n++,lx,ly+16,(u16)(la+PLAYER_STRIP_WORDS),lc);
+            set_sprite_entry(satb,n++,lx,ly+32,(u16)(la+PLAYER_STRIP_WORDS*2),lc);
         }
     }
 
@@ -4727,7 +4897,7 @@ static void draw_game_sprites(void)
                 for(k=0;k<count&&n<64;++k)set_sprite_entry(satb,n++,sx-(g_boss_shot_vx<0?-k*18:k*18),sy-k*22,BOSS_RING_BASE_WORD,
                     (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|BOSS_AUX_SPR_PAL|flip));
             }else set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,
-                (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|PLAYER_SPR_PAL|flip));
+                (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|VDC_SPR_Y_HEIGHT_2|MARIO_BOSS_SPR_PAL|flip));
         }else{
         /* The breath object's coordinates precede its visible metasprite by
            (+32,+13) when travelling right; mirror that offset to the left. */
@@ -4941,6 +5111,13 @@ static void start_boss(int fade_in)
     if(g_boss_hp<=0)g_boss_hp=8;
     g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_boss_drop_rng=0xF2A74DE4u;g_boss_random_drop_timer=72;g_after_boss=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);
+    if(multiplayer_active()&&!g_luigi.out){
+        g_luigi.x=g_player_x+24*FIX_ONE;g_luigi.y=g_player_y;
+        g_luigi.vx=g_luigi.vy=0;g_luigi.grounded=g_grounded;g_luigi.facing=1;
+        g_luigi.anim_clock=0;g_luigi.jump_active=0;g_luigi.jump_index=0;g_luigi.down=0;
+        g_luigi.mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;g_luigi.death_timer=0;
+        g_luigi.invuln=0;g_luigi.hearts=PLAYER_MAX_HEARTS;
+    }
     music_start_at_black();
     draw_game_sprites();
     g_state=STATE_STAGE_LOAD;g_state_frame=0;
@@ -6019,6 +6196,13 @@ static void start_gameplay(int fade_in)
     g_throw_timer=0;
     g_death_timer=0;
     g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;
+    if(multiplayer_active()&&!g_luigi.out){
+        g_luigi.x=g_player_x+24*FIX_ONE;g_luigi.y=g_player_y;
+        g_luigi.vx=g_luigi.vy=0;g_luigi.grounded=1;g_luigi.facing=1;
+        g_luigi.anim_clock=0;g_luigi.jump_active=0;g_luigi.jump_index=0;g_luigi.down=0;
+        g_luigi.mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;g_luigi.death_timer=0;
+        g_luigi.invuln=0;g_luigi.hearts=PLAYER_MAX_HEARTS;
+    }
     {int c;for(c=0;c<PALETTE_CYCLE_COUNT;++c)g_palette_cycle_shift[c]=0;}
     set_game_palette_fade(fade_in?0:16);
     /* Both VDC outputs are disabled above and all palettes are now black. */
@@ -6056,13 +6240,31 @@ static void update_play(u16 btn, u16 pressed)
        jump input below clears it immediately when both buttons are pressed. */
     g_player_down=(g_carry_index<0&&g_grounded&&g_lift_timer==0&&g_throw_timer==0&&(btn&JOY_DOWN))?1:0;
     if (g_drop_platform_timer>0)--g_drop_platform_timer;
+    if (g_player_mode==PMODE_OUT) {
+        draw_game_sprites();
+        return;
+    }
+    if (g_player_mode==PMODE_REENTRY) {
+        if(btn&JOY_LEFT){g_player_x-=run_speed;g_facing=-1;}
+        else if(btn&JOY_RIGHT){g_player_x+=run_speed;g_facing=1;}
+        if((int)(g_player_x>>FIX_SHIFT)<g_camera_x)g_player_x=(s32)g_camera_x<<FIX_SHIFT;
+        if((int)(g_player_x>>FIX_SHIFT)>g_camera_x+224)g_player_x=(s32)(g_camera_x+224)<<FIX_SHIFT;
+        if(++g_death_timer>=MULTI_HOVER_FRAMES){
+            g_player_mode=PMODE_NORMAL;g_invuln=MULTI_INVULN_FRAMES;
+            g_grounded=0;g_vy=0;g_death_timer=0;
+        }
+        draw_game_sprites();
+        return;
+    }
     if (g_player_mode==PMODE_DYING) {
         g_player_y+=g_vy;
         g_vy+=64;
         if (g_vy>7*FIX_ONE) g_vy=7*FIX_ONE;
         ++g_death_timer;
         draw_game_sprites();
-        if ((int)(g_player_y>>FIX_SHIFT)>256) {
+        if (multiplayer_active() && (int)(g_player_y>>FIX_SHIFT)>g_camera_y+256) {
+            finish_mario_multiplayer_death();
+        } else if (!multiplayer_active() && (int)(g_player_y>>FIX_SHIFT)>256) {
             g_player_mode=PMODE_FADE_OUT;
             g_death_timer=0;
         }
@@ -7010,6 +7212,8 @@ static void update_frontend(u16 pressed)
             /* The HUD reserve begins at x4.  Continue credits are a separate
                pool; do not consume a reserve merely for entering gameplay. */
             g_lives=4; g_continues=5; g_current_level=0; g_in_boss=0;
+            g_luigi.lives=4;g_luigi.hearts=PLAYER_MAX_HEARTS;g_luigi.out=0;
+            g_luigi.mode=PMODE_NORMAL;g_luigi.prev_buttons=0;
 #ifdef FORCE_LEVEL
             g_current_level=FORCE_LEVEL;
 #endif
@@ -7083,6 +7287,7 @@ static void update_frontend(u16 pressed)
         if ((pressed&(JOY_RUN|JOY_I|JOY_II)) && elapsed>=24 && g_continues>0) {
             --g_continues;
             g_lives=4;
+            if(multiplayer_active()){g_luigi.lives=4;g_luigi.out=0;g_luigi.hearts=PLAYER_MAX_HEARTS;}
             Play_Sound_Sample(SFX_MENU_CONFIRM,0,0);
             music_stop_for_transition();
             g_continue_resume=1; g_state=STATE_CONTINUE_FADE; g_state_frame=0; return;
@@ -7128,6 +7333,7 @@ static void update_frontend(u16 pressed)
 int main(void)
 {
     contrlr_pad_init(0);
+    contrlr_pad_init(1);
     init_video();
     audio_init();
     music_init();
@@ -7138,7 +7344,7 @@ int main(void)
 #endif
 
     for (;;) {
-        u16 btn, pressed;
+        u16 btn, pressed, btn2=0, pressed2=0;
         wait_frame();
         if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE) {
             commit_stage_camera();
@@ -7150,7 +7356,16 @@ int main(void)
         pressed = (u16)(btn & (u16)~g_prev_buttons);
         g_prev_buttons = btn;
 
-        if (g_state == STATE_PLAY) update_play(btn, pressed);
+        if(multiplayer_active()){
+            btn2=read_buttons_2();
+            pressed2=(u16)(btn2&(u16)~g_luigi.prev_buttons);
+            g_luigi.prev_buttons=btn2;
+        }
+
+        if (g_state == STATE_PLAY) {
+            update_luigi(btn2,pressed2);
+            if(g_state==STATE_PLAY)update_play(btn, pressed);
+        }
         else update_frontend(pressed);
         music_update();
         ++g_parallax_clock;

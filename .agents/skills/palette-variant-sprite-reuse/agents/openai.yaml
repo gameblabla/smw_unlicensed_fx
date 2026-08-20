@@ -1,0 +1,4 @@
+interface:
+  display_name: "Palette Variant Sprite Reuse"
+  short_description: "Fit character variants into constrained sprite VRAM"
+  default_prompt: "Add a visually distinct character variant while respecting sprite VRAM and palette constraints."

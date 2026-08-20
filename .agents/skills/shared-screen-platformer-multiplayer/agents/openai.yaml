@@ -1,0 +1,4 @@
+interface:
+  display_name: "Shared-screen Platformer Multiplayer"
+  short_description: "Implement independent same-screen players and respawn rules"
+  default_prompt: "Implement or repair same-screen platformer multiplayer while preserving single-player behavior."
