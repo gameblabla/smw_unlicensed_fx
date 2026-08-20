@@ -530,8 +530,11 @@ def build_enemy_variants(r,levels):
     # Family 0's flier ($C748, state 1) writes 1 into that word too while it
     # bombs, but its attack cel and its bomb ride their own banks -- see
     # make_chip_attack() -- because the shared arenas are already full.
+    # Family 2's state-3 golfer ($C9B0) also selects state 1 for its complete
+    # swing: selector 3 for seven ticks, then selector 4 until its ball clears.
     atk_keys={(e[2],e[3],e[4]) for lev in levels for e in lev['enemies']
-              if e[5] in (8,11,13,14) or (e[2]==3 and e[5]==4)}
+              if e[5] in (8,11,13,14) or (e[2]==3 and e[5]==4)
+              or (e[2]==2 and e[5]==3)}
     # Which animation state each family's attack pose lives in.  Only the duck
     # differs from the shared state 1.
     atk_state={10:3}

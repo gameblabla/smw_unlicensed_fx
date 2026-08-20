@@ -3735,6 +3735,11 @@ static void update_enemies(void)
         if(e->kind==ENEMY_KIND_GENERIC && e->state==3){
             if(e->behavior_phase){
                 e->vx=0;
+                /* Family 2's state-1 script is selector 3 for seven ticks,
+                   followed by selector 4 until the ball slot clears.  Keep a
+                   local script clock so the renderer can use those actual
+                   golf-swing cels instead of substituting walk selector 1. */
+                if(e->behavior_timer<255)++e->behavior_timer;
                 if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
                     e->shot_slot=0;e->behavior_phase=0;
                     e->vx=e->face_right?FIX_ONE:-FIX_ONE;
@@ -4916,11 +4921,11 @@ static void draw_game_sprites(void)
                        e->behavior_timer<THROWER_RELEASE_TICKS*2)?4:3):
                      (int)((g_state_frame/8)&1);
         }
-        /* $CA20 writes 1 into the ball thrower's animation-state word and holds
-           it there for the whole throw.  Only two of this family's cels are
-           kept in VRAM, so that is selector 1 rather than the attack bank. */
+        /* Family 2's state-1 script at $D07C is selector 3 for seven ticks,
+           then selector 4 for the rest of the throw.  These are the golfer's
+           real swing/release poses, not either cel from its walk script. */
         else if(e->kind==ENEMY_KIND_GENERIC&&e->state==3&&e->behavior_phase)
-            anim=1;
+            anim=(e->behavior_timer<7)?3:4;
 #ifdef FORCE_ENEMY_HURT
         if(v->has_hit_frame){use_hit_frame=1;anim=2;}
 #endif
@@ -4981,7 +4986,9 @@ static void draw_game_sprites(void)
         else base=(u16)(g_enemy_vram[li]+(anim?enemy_frame_words(v):0));
         flip=((e->kind==ENEMY_KIND_PTERODACTYL||e->kind==ENEMY_KIND_THROWER||
                e->kind==ENEMY_KIND_SPARKER||e->kind==ENEMY_KIND_HOPPER||
-               (e->kind==ENEMY_KIND_SPEARMAN&&e->behavior_phase))?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
+               (e->kind==ENEMY_KIND_SPEARMAN&&e->behavior_phase)||
+               (e->kind==ENEMY_KIND_GENERIC&&e->state==3&&e->behavior_phase))
+              ?e->face_right:(e->vx>0))?VDC_SPR_X_INVERT:0;
         for(cy=0;cy<rows && n<GAME_SPRITE_CAPACITY-3;++cy)for(cx=0;cx<cols && n<GAME_SPRITE_CAPACITY-3;++cx){
             int cell=cy*grid_cols+cx,dx;
             if(!(mask&(1u<<cell)))continue;dx=flip?(cols-1-cx)*16:cx*16;
