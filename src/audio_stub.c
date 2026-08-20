@@ -6,10 +6,10 @@
 #include "sfx_adpcm_generated.h"
 
 /* The game does not use KING graphics, so its second KRAM page is a dedicated
- * 32 kHz ADPCM bank.  Each source sample is 256-word aligned because SAL is
+ * 16 kHz ADPCM bank.  Each source sample is 256-word aligned because SAL is
  * addressed in 256-word units. */
 #define SFX_KRAM_PAGE       0x80000000u
-#define SFX_ADPCM_RATE      ADPCM_RATE_32000
+#define SFX_ADPCM_RATE      ADPCM_RATE_16000
 #define ADPCM_CTRL          0x50u
 #define ADPCM_CHCFG         0x51u
 #define ADPCM_START         0x58u

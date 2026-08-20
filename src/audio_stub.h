@@ -13,6 +13,7 @@ enum {
     SFX_MENU_CONFIRM,
     SFX_BOSS_DEFEAT,
     SFX_JUMP_OVER_ENEMY,
+    SFX_ENEMY_DEAD,
     SFX_COUNT
 };
 

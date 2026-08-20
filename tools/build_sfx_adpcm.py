@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Filter Mega Drive captures and bake a PC-FX 32 kHz ADPCM bank."""
+"""Filter Mega Drive captures and bake a PC-FX 16 kHz ADPCM bank."""
 import math
 import pathlib
 import struct
 import wave
 
 
-RATE = 32000
+RATE = 16000
 ALIGN_WORDS = 256
 # Preserve the source effects' relative loudness while using the 14-bit KING
 # predictor's range.  The loudest selected capture peaks just below 0x2000.
@@ -27,6 +27,7 @@ SOURCES = {
     2: ('crate_throw', 'A8'),
     3: ('blue_crystal', '9E'),
     4: ('boss_hit', '90'),
+    5: ('player_death', 'AF'),
     6: ('fireball', '9D'),
     7: ('player_hurt', '99'),
     8: ('menu_confirm', '9C'),
@@ -35,6 +36,9 @@ SOURCES = {
     # mismatch), so command_B7.wav is the custom assets/jumpoverenemy.wav in the
     # same stereo 16-bit 48 kHz container as the driver renders.
     10: ('jump_over_enemy', 'B7'),
+    # The enemy-defeat pop (stomp, fireball, thrown crate) reuses the custom
+    # assets/jumpoverenemy.wav directly rather than any $9x driver capture.
+    11: ('enemy_dead', 'assets/jumpoverenemy.wav'),
 }
 
 
@@ -44,12 +48,22 @@ def clamp(value, lo, hi):
 
 def read_mono(path):
     with wave.open(str(path), 'rb') as wav:
-        if wav.getsampwidth() != 2 or wav.getnchannels() != 2:
-            raise ValueError('%s must be 16-bit stereo PCM' % path)
-        frames = struct.unpack('<%dh' % (wav.getnframes() * 2),
-                               wav.readframes(wav.getnframes()))
-        return [(frames[i] + frames[i + 1]) // 2
-                for i in range(0, len(frames), 2)], wav.getframerate()
+        width = wav.getsampwidth()
+        channels = wav.getnchannels()
+        raw = wav.readframes(wav.getnframes())
+        if width == 2:
+            data = struct.unpack('<%dh' % (len(raw) // 2), raw)
+        elif width == 1:
+            # Unsigned 8-bit PCM: expand to signed 16-bit about the center.
+            data = [((sample << 8) - 32768) for sample in raw]
+        else:
+            raise ValueError('%s must be 8- or 16-bit PCM' % path)
+        if channels == 2:
+            return [(data[i] + data[i + 1]) // 2
+                    for i in range(0, len(data), 2)], wav.getframerate()
+        if channels == 1:
+            return list(data), wav.getframerate()
+        raise ValueError('%s must be mono or stereo PCM' % path)
 
 
 def trim_silence(samples, source_rate):
@@ -77,11 +91,11 @@ def highpass(samples, source_rate, cutoff=20.0):
 
 
 def resample(samples, source_rate, lowpass_hz=None):
-    """Band-limited windowed-sinc resampling (48 kHz capture -> 32 kHz)."""
+    """Band-limited windowed-sinc resampling (48 kHz capture -> 16 kHz)."""
     if not samples:
         return [0]
     count = max(1, (len(samples) * RATE + source_rate // 2) // source_rate)
-    # Leave a transition band below the 16 kHz output Nyquist frequency.
+    # Leave a transition band below the 8 kHz output Nyquist frequency.
     cutoff = (min(0.46 * RATE / source_rate, 0.46) if lowpass_hz is None
               else min(lowpass_hz / source_rate, 0.46))
     half = FIR_TAPS // 2
@@ -136,12 +150,13 @@ def encode(samples):
         target = clamp(sample, -0x4000, 0x3fff)
         best = None
         for nibble in range(16):
-            # At 32 kHz the interpolation divider is one, so each nibble
-            # applies exactly one native SoundBox predictor delta.
+            # At 16 kHz the interpolation divider is two: the hardware
+            # applies the full native SoundBox delta across two output
+            # samples, so each sample sees only half of it.
             delta = STEP_SIZES[step_index] * ((nibble & 7) + 1)
             if nibble & 8:
                 delta = -delta
-            candidate = clamp(predictor + delta, -0x4000, 0x3fff)
+            candidate = clamp(predictor + delta // 2, -0x4000, 0x3fff)
             error = (target - candidate) ** 2
             if best is None or error < best[0]:
                 best = (error, nibble, candidate)
@@ -160,13 +175,17 @@ def main():
     source_dir = root / 'megadrive_sfx_wav_lowlevel'
     output = root / 'src' / 'sfx_adpcm_generated.h'
     bank = bytearray()
-    metas = [(0, 0)] * 11
-    labels = ['unused'] * 11
+    metas = [(0, 0)] * 12
+    labels = ['unused'] * 12
 
     for effect_id, (name, command) in SOURCES.items():
         while (len(bank) // 2) % ALIGN_WORDS:
             bank.extend(b'\0\0')
-        samples, source_rate = read_mono(source_dir / ('command_%s.wav' % command))
+        if command.startswith('assets/'):
+            source = root / command
+        else:
+            source = source_dir / ('command_%s.wav' % command)
+        samples, source_rate = read_mono(source)
         prepared = prepare(samples, source_rate, **command_tuning(command))
         encoded = encode(prepared)
         metas[effect_id] = (len(bank) // 2, len(encoded) // 2)

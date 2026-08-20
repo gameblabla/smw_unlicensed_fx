@@ -116,7 +116,7 @@ const StaffLine g_staff_lines[] = {
     BLANK,
     { "BUILT ON LIBPCFX", B, C, -1 },
     { "MUSIC AS RED BOOK CD-DA", B, C, -1 },
-    { "SOUND AS 32 KHZ ADPCM", B, C, -1 },
+    { "SOUND AS 16 KHZ ADPCM", B, C, -1 },
     BLANK,
     BLANK,
     BLANK,

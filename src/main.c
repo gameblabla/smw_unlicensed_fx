@@ -8,7 +8,7 @@
  *   TETSU  : 262-line, 5 MHz dot clock
  *   VDC0   : Mega Drive Plane B analogue (background/parallax)
  *   VDC1   : Mega Drive Plane A analogue + sprites/HUD
- *   KING/RAINBOW unused; KRAM page 1 holds 32 kHz ADPCM effects and music is
+ *   KING/RAINBOW unused; KRAM page 1 holds 16 kHz ADPCM effects and music is
  *   Red Book CD-DA.
  *
  * Source geometry is not vertically centered. The MD V28 active picture starts
@@ -3100,12 +3100,20 @@ static void fire_fireball(void)
     Play_Sound_Sample(SFX_FIREBALL,0,0);
 }
 
-static void defeat_enemy(Enemy *e)
+/* stomped is 1 when Mario landed on the enemy's head.  The pop is the
+   stomp sound: fireballs and thrown crates defeat silently, which is why
+   the flag arrives from the call site.  e->jumped_over cannot carry it --
+   that state machine only arms while the player is airborne above the
+   enemy, and the landing frame (bottom at or past the enemy's top) both
+   fails its arming test and clears a previously armed flag before the
+   stomp check below runs. */
+static void defeat_enemy(Enemy *e, int stomped)
 {
     if (!e->active || e->defeated) return;
     e->defeated=1;
     e->vx=0;
     e->vy=FIX_ONE;
+    if (stomped) Play_Sound_Sample(SFX_ENEMY_DEAD,0,0);
 }
 
 /* The rolling boulder is scenery with a hitbox, not a creature: $B844 never
@@ -3140,7 +3148,7 @@ static void update_fireballs(void)
             if (enemy_indestructible(e)) continue;
             if (aabb(x+4,y+5,16,14,ex+3,ey+3,18,eh-5)) {
                 /* Fire travels through a target after defeating it. */
-                defeat_enemy(e);
+                defeat_enemy(e,0);
             }
         }
     }
@@ -3890,7 +3898,7 @@ enemy_attack_checks:
                 if (!cr->active || cr->carried || !cr->thrown) continue;
                 cx=(int)(cr->x>>FIX_SHIFT); cy=(int)(cr->y>>FIX_SHIFT);
                 if (aabb(cx+3,cy+4,CRATE_W-6,CRATE_H-8,x+3,y+3,e->width-6,h-5)) {
-                    defeat_enemy(e);
+                    defeat_enemy(e,0);
                     cr->active=0;
                     cr->thrown=0;
                     break;
@@ -3902,14 +3910,15 @@ enemy_attack_checks:
         /* Jump-over bonus: while airborne over a living enemy, a player who
            clears its whole body horizontally earns the chime -- once per pass,
            and only for obstacle-free jumps, never for a landing stomp, which
-           defeats the enemy before this check can sound it. */
+           defeats the enemy before this check can sound it.  It runs on the
+           second ADPCM voice so it never has to wait for (or cut) the main
+           channel's sample, which is what delayed it behind the jump itself. */
         {
             int player_bottom = py + PLAYER_BODY_H - 1;
             int over = px + PLAYER_BODY_W > x + 2 && px < x + e->width - 2;
             int above = player_bottom < y && !g_grounded;
             if (e->jumped_over == 1) {
                 if (!over) {
-                    Play_Sound_Sample(SFX_JUMP_OVER_ENEMY, 0, 0);
                     e->jumped_over = 2;
                 } else if (!above) {
                     e->jumped_over = 0;
@@ -3933,7 +3942,7 @@ enemy_attack_checks:
             int stomp_x=aabb(px+3,py+PLAYER_BODY_H-6,10,8,x+2,y-2,e->width-4,8);
             if (g_vy>0 && stomp_x && old_bottom<=y+5 && new_bottom>=y &&
                 !enemy_indestructible(e)) {
-                defeat_enemy(e);
+                defeat_enemy(e,1);
                 g_jump_active=0;
                 g_bounce_active=1;
                 g_bounce_index=0;
