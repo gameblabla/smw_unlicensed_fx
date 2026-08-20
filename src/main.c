@@ -3726,12 +3726,13 @@ static void update_enemies(void)
 
         /* State 3, ROM $C9B0.  The other family sharing the fall-through kind:
            the ball thrower.  $CA72 walks it a pixel a frame and flips it every
-           $3F, and every $80th frame -- whenever it is standing at or below the
-           player -- $CAE8 stops it and $CA20 puts metasprite $1D1 in its child
-           slot eighteen pixels down, which $C9D8 then carries two pixels a
-           frame in the direction it faces until $130C6 retires it off the view.
-           The port ran the record through the plain Goomba solver, so it
-           patrolled and never threw anything at all. */
+           $3F.  $CA94 masks the frame counter with $7F and branches to $CAE8
+           when the result is *nonzero*: the one $80-frame boundary is merely
+           allowed to skip a throw while the golfer is above every player.  It
+           otherwise attacks again on the first update after its previous ball
+           clears.  $CA20 puts metasprite $1D1 in its child slot eighteen pixels
+           down, which $C9D8 then carries two pixels a frame in the direction it
+           faces until $130C6 retires it off the view. */
         if(e->kind==ENEMY_KIND_GENERIC && e->state==3){
             if(e->behavior_phase){
                 e->vx=0;
@@ -3748,7 +3749,13 @@ static void update_enemies(void)
                 goto enemy_attack_checks;
             }
             e->face_right=(unsigned char)(e->vx>0);
-            if((g_state_frame&0x7F)==0 && y>=py){
+            /* Genesis $CA9A is BNE, not BEQ.  On the exceptional zero frame,
+               $CAA2/$CAC6 still permit the throw when the golfer is at or
+               below either active player's object origin. */
+            if((g_state_frame&0x7F)!=0 ||
+               y>=(int)(g_player_y>>FIX_SHIFT) ||
+               (multiplayer_active()&&!g_luigi.out&&
+                y>=(int)(g_luigi.y>>FIX_SHIFT))){
                 e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
                 e->shot_slot=(unsigned char)
                     (throw_enemy_shot(e,18,0,BALL_THROW_SPEED,SHOT_MODE_SPEAR)+1);
