@@ -474,6 +474,9 @@ static u16 g_enemy_atk_vram[16],g_enemy_atk2_vram[16],g_enemy_shot_vram[16];
 #define SPARK_TRIGGER_DX 60
 /* $C9D8/$C9E0 carry the thrown ball two pixels a frame. */
 #define BALL_THROW_SPEED 2
+/* A short patrol gap after each ball: less than the former 0..127-frame wait,
+   without reproducing the ROM's near-immediate retry. */
+#define GOLFER_RETRY_TICKS 48
 /* Size of the ENEMY_ALT and ENEMY_SHOT banks in tools/vram_map.py. */
 #define ENEMY_ALT_WORDS 2880
 #define ENEMY_SHOT_WORDS 256
@@ -3726,13 +3729,12 @@ static void update_enemies(void)
 
         /* State 3, ROM $C9B0.  The other family sharing the fall-through kind:
            the ball thrower.  $CA72 walks it a pixel a frame and flips it every
-           $3F.  $CA94 masks the frame counter with $7F and branches to $CAE8
-           when the result is *nonzero*: the one $80-frame boundary is merely
-           allowed to skip a throw while the golfer is above every player.  It
-           otherwise attacks again on the first update after its previous ball
-           clears.  $CA20 puts metasprite $1D1 in its child slot eighteen pixels
-           down, which $C9D8 then carries two pixels a frame in the direction it
-           faces until $130C6 retires it off the view. */
+           $3F.  The ROM retries almost immediately after a ball clears; the
+           port deliberately leaves a short patrol gap so the golfer does not
+           lock into a continuous attack.  $CA20 puts metasprite $1D1 in its
+           child slot eighteen pixels down, which $C9D8 then carries two pixels
+           a frame in the direction it faces until $130C6 retires it off the
+           view. */
         if(e->kind==ENEMY_KIND_GENERIC && e->state==3){
             if(e->behavior_phase){
                 e->vx=0;
@@ -3742,20 +3744,18 @@ static void update_enemies(void)
                    golf-swing cels instead of substituting walk selector 1. */
                 if(e->behavior_timer<255)++e->behavior_timer;
                 if(!e->shot_slot||!g_enemy_shots[e->shot_slot-1].active){
-                    e->shot_slot=0;e->behavior_phase=0;
+                    e->shot_slot=0;e->behavior_phase=0;e->behavior_timer=0;
                     e->vx=e->face_right?FIX_ONE:-FIX_ONE;
                 }
                 y=(int)(e->y>>FIX_SHIFT);
                 goto enemy_attack_checks;
             }
             e->face_right=(unsigned char)(e->vx>0);
-            /* Genesis $CA9A is BNE, not BEQ.  On the exceptional zero frame,
-               $CAA2/$CAC6 still permit the throw when the golfer is at or
-               below either active player's object origin. */
-            if((g_state_frame&0x7F)!=0 ||
-               y>=(int)(g_player_y>>FIX_SHIFT) ||
-               (multiplayer_active()&&!g_luigi.out&&
-                y>=(int)(g_luigi.y>>FIX_SHIFT))){
+            if(e->behavior_timer<GOLFER_RETRY_TICKS)++e->behavior_timer;
+            if(e->behavior_timer>=GOLFER_RETRY_TICKS &&
+               (y>=(int)(g_player_y>>FIX_SHIFT) ||
+                (multiplayer_active()&&!g_luigi.out&&
+                 y>=(int)(g_luigi.y>>FIX_SHIFT)))){
                 e->behavior_phase=1;e->behavior_timer=0;e->vx=0;
                 e->shot_slot=(unsigned char)
                     (throw_enemy_shot(e,18,0,BALL_THROW_SPEED,SHOT_MODE_SPEAR)+1);
