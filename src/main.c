@@ -19,6 +19,7 @@
 #include <pcfx/vdc.h>
 #include <pcfx/tetsu.h>
 #include <pcfx/contrlr.h>
+#include <pcfx/v810.h>
 #include "assets_generated.h"
 #include "boot_exact.h"
 #include "boot_dual.h"
@@ -31,6 +32,9 @@
 #include "vram_map.h"
 
 extern void pcfx_tetsu_wait_frame(void);
+/* Present in libpcfx, but missing from the installed vdc.h.  The GMaker 7UP
+   notes require saving this selector when an IRQ can interrupt VDC accesses. */
+extern u16 vdc_get_last_regnum(int chip);
 
 #define BACK_CHIP VDC0
 #define FRONT_CHIP VDC1
@@ -2475,71 +2479,107 @@ static void update_camera(void)
 }
 
 /* Slot 9's fake parallax.  $14804 fills the Mega Drive's per-cell horizontal
-   scroll table for plane B from four free-running counters.  The counters
-   make the cloud bands drift while the player stands still; the camera base
-   below makes them follow the level when the player moves:
+   scroll table for plane B from four free-running counters.  Its level-9
+   dispatcher ($14A44) changes sources at d0=32,56,80,120:
 
-     rows   0..32   $FF008E   +1 every 8 frames   (drifts right)
-     rows  33..56   $FF0064   -1 every 4 frames   (drifts left)
-     rows  57..80   $FF008C   -1 every 8 frames   (drifts left)
-     rows  81..128  (skipped, so it stands still)
-     rows 129 down  $FF003A   half the camera step
+     lines   0..31   $FF008E   +1 every 8 video frames (drifts right)
+     lines  32..55   $FF0064   -1 every 4 video frames (drifts left)
+     lines  56..79   $FF008C   -1 every 8 video frames (drifts left)
+     lines 80..119   skipped, so it stands still
+     lines 120 down  $FF003A   half the camera step
 
-   The HuC6270 has one BXR per plane, so the bands have to be made by rewriting
-   it as the beam crosses each boundary.  Three splits are enough: the last band
-   is the half-rate scroll commit_stage_camera() has already published, and the
-   static one above it is a horizontally dithered fog band whose offset reads
-   the same either way, so it is folded into the half-rate band rather than
-   spending a fourth split -- and, more to the point, rather than spinning the
-   CPU another fifty lines into the picture. */
+   A 7UP latches BXR for the next line after horizontal blanking.  Its raster
+   compare IRQ is raised at the end of the compared line, specifically so BXR
+   can be changed before the following line's latch.  Arm the first comparison
+   at each frame boundary and chain the other three from the IRQ; polling the
+   TETSU raster here used to stall the entire game through line 120. */
 #define PARALLAX_LEVEL     8    /* g_current_level, i.e. ROM slot 9 */
 #define PARALLAX_SPLIT_B   32
 #define PARALLAX_SPLIT_C   56
 #define PARALLAX_SPLIT_END 80
-/* Screen line 0 in tetsu_get_raster()'s numbering: the counter starts at the
-   top of the blanking interval, twenty-two lines above the picture.  Measured
-   against the Mega Drive -- with a bias of zero every band came out one band
-   too fast, because each split was landing twenty-odd lines early. */
-#ifndef PARALLAX_RASTER_BIAS
-#define PARALLAX_RASTER_BIAS 22
-#endif
+#define PARALLAX_SPLIT_BUSH 120
+#define PARALLAX_VDC_IRQ_LEVEL 12 /* PC-FX interrupt input for HuC6270-A */
+#define PARALLAX_VDC_REG_PORT  0x400
+#define PARALLAX_RCR_BIAS      64
 
 static unsigned g_parallax_clock;
+static volatile u16 g_parallax_bxr[5];
+static volatile unsigned char g_parallax_irq_phase;
+static volatile unsigned char g_parallax_irq_active;
 
-/* Spin until the beam reaches a line, without ever being able to hang: if the
-   raster is already past it -- a frame we entered late -- the window test
-   fails all the way round and the bounded loop simply gives up, costing that
-   one frame its split rather than the whole game. */
-static void wait_raster(int line)
+/* Raster IRQs can land between a main-loop register-select write and its data
+   write.  Restore the interrupted selector exactly as the official GMaker
+   7UP notes prescribe; otherwise an apparently unrelated BAT/SATB transfer
+   can occasionally write its data to BXR or RCR. */
+__attribute__ ((interrupt_handler)) static void parallax_vdc_irq(void)
 {
-    int guard=6000;
-    line+=PARALLAX_RASTER_BIAS;
-    while(guard-->0){
-        int r=tetsu_get_raster();
-        if(r>=line && r<line+48) break;
+    u16 saved_reg=vdc_get_last_regnum(BACK_CHIP);
+    u16 status=vdc_status(BACK_CHIP); /* Reading status acknowledges the IRQ. */
+
+    if(status&VDC_STAT_RR){
+        unsigned phase=g_parallax_irq_phase;
+        if(g_parallax_irq_active && phase<4){
+            static const u16 next_raster[4]={
+                PARALLAX_SPLIT_C+PARALLAX_RCR_BIAS,
+                PARALLAX_SPLIT_END+PARALLAX_RCR_BIAS,
+                PARALLAX_SPLIT_BUSH+PARALLAX_RCR_BIAS,
+                0
+            };
+            ++phase;
+            g_parallax_irq_phase=(unsigned char)phase;
+            vdc_setreg(BACK_CHIP,VDC_REG_BXR,g_parallax_bxr[phase]);
+            vdc_set_raster(BACK_CHIP,next_raster[phase-1]);
+        }else{
+            /* RCR=0 cannot match the 7UP's visible counter (RCR-64). */
+            vdc_set_raster(BACK_CHIP,0);
+        }
     }
+
+    /* Selecting a register does not write it; it only restores the address
+       port that the interrupted libpcfx operation was about to use. */
+    out16(PARALLAX_VDC_REG_PORT,saved_reg);
 }
 
-static void backdrop_parallax_splits(void)
+static void init_parallax_irq(void)
 {
-    int chip,camera;
+    /* Mask ordinary sources while replacing the firmware vector, then expose
+       only HuC6270-A.  Level 15 is not represented by the mask register. */
+    irq_set_mask(0x7F);
+    irq_set_raw_handler(PARALLAX_VDC_IRQ_LEVEL,parallax_vdc_irq);
+    irq_set_level(8);
+    irq_level_enable(PARALLAX_VDC_IRQ_LEVEL);
+    irq_enable();
+}
+
+static void backdrop_parallax_arm(void)
+{
+    int camera;
     unsigned t;
-    if(g_in_boss || !g_level || g_current_level!=PARALLAX_LEVEL) return;
-    chip=level_backdrop_chip();
+    if(g_in_boss || !g_level || g_current_level!=PARALLAX_LEVEL){
+        g_parallax_irq_active=0;
+        vdc_set_raster(BACK_CHIP,0);
+        return;
+    }
     t=g_parallax_clock;
-    /* Use the camera target rather than the already-published camera.  The
-       target is what the next frame's BAT/scroll commit will use, so the
-       raster bands do not lag one frame behind the clouds' backdrop. */
-    camera=(int)((g_camera_target_x>>1)&0x1FF);
+    /* commit_stage_camera() published this frame's camera immediately before
+       this routine.  Keep its half-rate value for the forest-only final band. */
+    camera=(int)((g_camera_x>>1)&0x1FF);
     /* BXR counts the view rightwards, so a band that drifts right on screen
        needs a falling BXR.  The plane is 64 cells wide and wraps at 512. */
-    vdc_setreg(chip,VDC_REG_BXR,(camera-(int)(t>>3))&0x1FF);
-    wait_raster(PARALLAX_SPLIT_B);
-    vdc_setreg(chip,VDC_REG_BXR,(camera+(int)(t>>2))&0x1FF);
-    wait_raster(PARALLAX_SPLIT_C);
-    vdc_setreg(chip,VDC_REG_BXR,(camera+(int)(t>>3))&0x1FF);
-    wait_raster(PARALLAX_SPLIT_END);
-    vdc_setreg(chip,VDC_REG_BXR,camera);
+    g_parallax_bxr[0]=(u16)((0u-(t>>3))&0x1FFu);
+    g_parallax_bxr[1]=(u16)((t>>2)&0x1FFu);
+    g_parallax_bxr[2]=(u16)((t>>3)&0x1FFu);
+    g_parallax_bxr[3]=0;
+    g_parallax_bxr[4]=(u16)camera;
+    g_parallax_irq_phase=0;
+    g_parallax_irq_active=1;
+
+    /* Publish the top band before enabling the first comparison.  Gameplay
+       has complete SATBs resident on both VDCs, so retain both display bits. */
+    vdc_setreg(BACK_CHIP,VDC_REG_BXR,g_parallax_bxr[0]);
+    vdc_set_raster(BACK_CHIP,PARALLAX_SPLIT_B+PARALLAX_RCR_BIAS);
+    vdc_setreg(BACK_CHIP,VDC_REG_CR,
+               (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IRQ_RC));
 }
 
 static void commit_stage_camera(void)
@@ -6529,6 +6569,7 @@ static void start_gameplay(int fade_in)
     int ycrop;
     /* Every normal level is selected through the 19-entry reconstruction table. */
     g_in_boss=0; g_paused=0;
+    if(g_current_level==PARALLAX_LEVEL)g_parallax_clock=0;
     music_transition_to_level(g_current_level);
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
@@ -7727,6 +7768,7 @@ int main(void)
     contrlr_pad_init(0);
     contrlr_pad_init(1);
     init_video();
+    init_parallax_irq();
     audio_init();
     music_init();
     enter_boot();
@@ -7744,7 +7786,7 @@ int main(void)
         flush_level_rows();
         if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE) {
             commit_stage_camera();
-            backdrop_parallax_splits();
+            backdrop_parallax_arm();
         }
         else if (g_state==STATE_STAFF)
             commit_staff_scroll();
