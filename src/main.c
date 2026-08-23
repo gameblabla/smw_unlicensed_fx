@@ -160,14 +160,21 @@ extern u16 vdc_get_last_regnum(int chip);
 /* $F78E's shuttle runs 70 pixels left of its record and back. */
 #define SHUTTLE_RUN      70
 /* These shafts ask the player to cross between shuttles that can retreat from
-   him, which leaves too little time to make the jump.  Carry their run the
-   same distance again past the record so each carrier comes farther toward
-   him.  The adjustment is confined to the two requested late stages and the
-   earlier shaft that already had this accessibility fix. */
+   him, which leaves too little time to make the jump.  Carry their run past
+   the record so each carrier comes farther toward him.  The adjustment is
+   confined to the two requested late stages and the earlier shaft that
+   already had this accessibility fix.
+
+   Slot 12's shuttles carry that overrun a whole run again, which takes them
+   so far right of their record that a rider is walked past the ledge he is
+   aiming for and has to jump just to stay aboard.  Give that shaft a short
+   overrun instead: enough that the carrier still comes out to meet the
+   player, not so much that it runs away with him. */
 #define SHUTTLE_OVERRUN_LEVEL_12 11
 #define SHUTTLE_OVERRUN_LEVEL_13 12
 #define SHUTTLE_OVERRUN_LEVEL_19 18
 #define SHUTTLE_OVERRUN       70
+#define SHUTTLE_OVERRUN_SHORT 24
 #define PLATFORM_KIND_FALLER    6   /* handler 4  */
 #define PLATFORM_KIND_DESCEND   7   /* handler 5  */
 #define PLATFORM_KIND_ASCEND    8   /* handler 6  */
@@ -407,6 +414,9 @@ static int g_grounded;
 static int g_facing; /* -1 left, +1 right */
 static int g_camera_x;
 static int g_camera_target_x;
+/* Vertical camera held still for the length of a loop-carrier ride. */
+static int g_ride_camera_y;
+static int g_ride_camera_hold;
 static int g_camera_tile;
 /* Route steps whose mode is 2 or 3 stack the next screen above or below the
    current one instead of beside it ($145E2 drives VSRAM instead of HSCROLL).
@@ -2360,6 +2370,24 @@ static int level_exit_reached(void)
     return px>=(int)g_screen_col[g_room]*256+256-48;
 }
 
+/* World 5 is the nuclear-dump trio, slots 11..13 -- the levels music.c gives
+   CDDA_TRACK_NUCLEAR_DUMP. */
+#define WORLD5_FIRST_LEVEL 10
+#define WORLD5_LAST_LEVEL  12
+static int level_is_world5(void)
+{
+    return !g_in_boss && g_current_level>=WORLD5_FIRST_LEVEL &&
+           g_current_level<=WORLD5_LAST_LEVEL;
+}
+
+/* Whoever is riding one of the $F9C6 loop carriers, on a world that asks the
+   camera to sit still for it. */
+static int riding_loop_carrier(void)
+{
+    return level_is_world5() && g_on_moving_platform>=0 &&
+           g_moving_platforms[g_on_moving_platform].kind==PLATFORM_KIND_PATH;
+}
+
 static void update_camera(void)
 {
     if(g_in_boss){
@@ -2434,6 +2462,11 @@ static void update_camera(void)
         int home=(int)g_screen_row[g_room]*LEVEL_SCREEN_H;
         if(home<min_camera_y)home=min_camera_y;
         if(home>max_camera_y)home=max_camera_y;
+        /* Latch the picture the moment a ride starts, and let it go the
+           moment the player leaves the carrier. */
+        if(riding_loop_carrier()){
+            if(!g_ride_camera_hold){g_ride_camera_hold=1;g_ride_camera_y=target_y;}
+        }else g_ride_camera_hold=0;
         /* A spring launch is the one climb that does not wait on the room
            hand-over: $102B6 drives the scroll itself, a table step a frame,
            so the picture leaves with the player on the frame he is thrown and
@@ -2442,6 +2475,17 @@ static void update_camera(void)
             target_y-=(int)g_spring_camera_step;
             if(target_y<min_camera_y)target_y=min_camera_y;
             if(target_y>max_camera_y)target_y=max_camera_y;
+        }
+        else if(g_ride_camera_hold){
+            /* World 5's loop carriers dive 112 pixels and climb back every
+               160 frames.  Riding one, the follow band below hands the
+               picture down after the carrier and the storey drift walks it
+               back up again, so the ledge the player is aiming for moves
+               under him for the whole of the ride.  Hold the picture where
+               it stood when he stepped aboard: it is his own screen height
+               that is being spent, and the band underneath still rescues him
+               if the carrier really would take him out of the window. */
+            target_y=g_ride_camera_y;
         }
         else if(target_y<home){target_y+=8; if(target_y>home)target_y=home;}
         else if(target_y>home){target_y-=8; if(target_y<home)target_y=home;}
@@ -2455,10 +2499,18 @@ static void update_camera(void)
            that an ordinary jump inside a storey never moves the camera, which
            is what makes the storey the resting position rather than a target
            the follow keeps fighting. */
-        if(target_y>py-24)target_y=py-24;
-        if(target_y<py+48-232)target_y=py+48-232;
+        /* A held ride keeps the band, but only as the last resort it is:
+           eight pixels of margin instead of the resting 24, so the picture
+           gives way at the very edge of the window rather than following the
+           carrier down. */
+        {
+            int head=g_ride_camera_hold?8:24;
+            if(target_y>py-head)target_y=py-head;
+            if(target_y<py+48-232)target_y=py+48-232;
+        }
         if(target_y<min_camera_y)target_y=min_camera_y;
         if(target_y>max_camera_y)target_y=max_camera_y;
+        if(g_ride_camera_hold)g_ride_camera_y=target_y;
         new_row=target_y>>3;
         while(g_camera_row<new_row){++g_camera_row;queue_level_row(g_camera_row+30);}
         while(g_camera_row>new_row){--g_camera_row;queue_level_row(g_camera_row-1);}
@@ -2808,8 +2860,8 @@ static void update_stage_object(MovingPlatform *p, int index)
            counting frames, so the extra travel cannot walk the whole run a
            little further right on every cycle. */
         int hx=(int)(p->home_x>>FIX_SHIFT),x;
-        int overrun=(g_current_level==SHUTTLE_OVERRUN_LEVEL_12||
-                     g_current_level==SHUTTLE_OVERRUN_LEVEL_13||
+        int overrun=(g_current_level==SHUTTLE_OVERRUN_LEVEL_12)?SHUTTLE_OVERRUN_SHORT:
+                    (g_current_level==SHUTTLE_OVERRUN_LEVEL_13||
                      g_current_level==SHUTTLE_OVERRUN_LEVEL_19)?SHUTTLE_OVERRUN:0;
         p->x+=(s32)p->dir*FIX_ONE;
         x=(int)(p->x>>FIX_SHIFT);
@@ -6596,6 +6648,7 @@ static void start_gameplay(int fade_in)
             if(g_screen_col[k]==sc&&g_screen_row[k]==gr){g_room=k;break;}
         g_camera_y=g_camera_target_y=(int)g_screen_row[g_room]*LEVEL_SCREEN_H;
         g_camera_row=g_camera_y>>3;
+        g_ride_camera_hold=0;
     }
     g_vx=g_vy=0;
     g_grounded=1;

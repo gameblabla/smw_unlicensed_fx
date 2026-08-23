@@ -1295,6 +1295,17 @@ STAGE_OBJECT_PAL_LINE={9:3, 10:3, 11:2, 12:2, 13:2, 15:3, 17:3, 18:3, 19:3}
 # on the one line the whole bank shares.
 STAGE_OBJECT_ART={(9,121):'pillar.png'}
 
+# Records whose authored trigger tile does not put the object on the tiled
+# machinery it is drawn to ride.  Slot 12's rooms 5 and 21 are both segment 17,
+# so they carry the identical girder lattice: its bolts sit every 96 pixels
+# along a row and the diagonal rails run 45 degrees between them, which is
+# exactly the 48-pixel diamond handler 11 walks.  Room 5's two carriers are
+# authored at tile 3 and tile 15 -- 96 apart, both on the lattice -- while room
+# 21's is at tile 13, sixteen pixels off it, so that one trolley crosses the
+# open middle of the cell instead of following the rail.  Nudge it onto the
+# phase its sisters share; the key is (slot, segment, tile).
+STAGE_OBJECT_NUDGE={(12,21,13):(16,0)}
+
 def stage_object_path(r):
     """The 80 (dx,dy) steps handler 7 walks, from the byte table at $FA58."""
     out=[]
@@ -1471,6 +1482,8 @@ def make_stage_objects(r,routes,initdata):
             # handlers take the trigger-axis correction.
             if handler in (100,101): wx,wy=ba.world_x_for_trigger(seg,tile)+(x-0x180), y-128
             else: wx,wy=trigger_world(seg,tile,x,y,modes)
+            nx,ny=STAGE_OBJECT_NUDGE.get((slot,seg,tile),(0,0))
+            wx+=nx; wy+=ny
             out.append((wx, wy, ids.index(ms), STAGE_OBJECT_KINDS[handler]))
         for wx,wy,ms,handler in placed:
             out.append((wx, wy, ids.index(ms), STAGE_OBJECT_KINDS[handler]))
