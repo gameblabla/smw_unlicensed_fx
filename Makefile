@@ -9,6 +9,12 @@ TARGET := smb_pcfx
 BOSSREF ?= assets/reference/boss
 LEVEL_OVERRIDES ?= level_overrides
 LEVEL_DEFAULTS ?= level_defaults
+# The source ROM is supplied locally for development, while the reconstruction
+# kit is checked into this repository.  Keep both variables overridable for
+# users with a different ROM/kit, but make the documented `make assets` command
+# work from a fresh checkout without requiring an extra environment setup.
+KIT ?= Super_Mario_Bros_MD_reconstruction_kit
+ROM ?= Super Mario Bros. (Taiwan) (En) (Unl).md
 OBJDIR := build
 INCLUDES := -I. -Isrc -I$(V810GCC)/include -I$(V810GCC)/$(PREFIX)/include
 CFLAGS := -O2 -fomit-frame-pointer -fno-builtin -ffunction-sections -fdata-sections \
@@ -25,7 +31,10 @@ ELF := $(OBJDIR)/$(TARGET).elf
 PROGRAM_BIN := $(OBJDIR)/$(TARGET).bin
 MAP := $(OBJDIR)/$(TARGET).map
 
-.PHONY: all disc clean assets editor apply-level-edits vram-map
+.PHONY: all disc clean assets editor apply-level-edits vram-map dist
+DIST_DIR := build/dist
+DIST_ZIP := $(TARGET)_beta.zip
+RELEASE_README := docs/RELEASE_README.txt
 CDDA_TOOL := tools/build_cdda.py
 CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/finallevelsmusic.wav \
              NEWMUSIC/forest.wav NEWMUSIC/graveyard.wav NEWMUSIC/nuclear\ dump.wav \
@@ -43,17 +52,17 @@ SFX_WAVS := megadrive_sfx_wav_lowlevel/command_90.wav \
             megadrive_sfx_wav_lowlevel/command_B7.wav
 all: disc
 assets:
-	KIT=$(KIT) python3 tools/prepare_boot_frames.py
-	python3 tools/build_assets.py --kit $(KIT) --rom $(ROM) --project .
+	KIT="$(KIT)" python3 tools/prepare_boot_frames.py
+	python3 tools/build_assets.py --kit "$(KIT)" --rom "$(ROM)" --project .
 	python3 tools/build_boot_exact.py --frames assets/derived/boot_exact_fixed --project . --first 12 --last 600
 	python3 tools/build_boot_dual.py
-	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) LEVEL_DEFAULTS=$(LEVEL_DEFAULTS) LEVEL_OVERRIDES=$(LEVEL_OVERRIDES) python3 tools/build_full_game.py
+	KIT="$(KIT)" ROM="$(ROM)" BOSSREF="$(BOSSREF)" LEVEL_DEFAULTS="$(LEVEL_DEFAULTS)" LEVEL_OVERRIDES="$(LEVEL_OVERRIDES)" python3 tools/build_full_game.py
 vram-map:
 	python3 tools/vram_map.py --report
 editor:
 	python3 tools/level_editor.py --kit $(if $(KIT),$(KIT),Super_Mario_Bros_MD_reconstruction_kit) --defaults $(LEVEL_DEFAULTS) --overrides $(LEVEL_OVERRIDES)
 apply-level-edits:
-	KIT=$(KIT) ROM=$(ROM) BOSSREF=$(BOSSREF) LEVEL_DEFAULTS=$(LEVEL_DEFAULTS) LEVEL_OVERRIDES=$(LEVEL_OVERRIDES) python3 tools/build_full_game.py
+	KIT="$(KIT)" ROM="$(ROM)" BOSSREF="$(BOSSREF)" LEVEL_DEFAULTS="$(LEVEL_DEFAULTS)" LEVEL_OVERRIDES="$(LEVEL_OVERRIDES)" python3 tools/build_full_game.py
 $(OBJDIR)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -83,3 +92,11 @@ disc: out_ram.bin cdlink.txt $(CDDA_TOOL) $(CDDA_WAVS)
 	python3 $(CDDA_TOOL) --music-dir NEWMUSIC --output $(TARGET) --cue $(TARGET).cue --header src/cdda_tracks.h
 clean:
 	rm -rf $(OBJDIR) out_ram.bin $(TARGET).cue $(TARGET).bin $(TARGET)_*.bin
+
+dist: disc
+	rm -rf $(DIST_DIR)
+	mkdir -p $(DIST_DIR)
+	cp $(TARGET).cue $(TARGET).bin $(TARGET)_*.bin $(DIST_DIR)/
+	cp $(RELEASE_README) $(DIST_DIR)/README.txt
+	cd $(DIST_DIR) && zip -9 ../$(DIST_ZIP) *
+	@echo "Packaged disc: $(DIST_ZIP)"

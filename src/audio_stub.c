@@ -6,10 +6,10 @@
 #include "sfx_adpcm_generated.h"
 
 /* The game does not use KING graphics, so its second KRAM page is a dedicated
- * 16 kHz ADPCM bank.  Each source sample is 256-word aligned because SAL is
+ * 32 kHz ADPCM bank.  Each source sample is 256-word aligned because SAL is
  * addressed in 256-word units. */
 #define SFX_KRAM_PAGE       0x80000000u
-#define SFX_ADPCM_RATE      ADPCM_RATE_16000
+#define SFX_ADPCM_RATE      ADPCM_RATE_32000
 #define ADPCM_CTRL          0x50u
 #define ADPCM_CHCFG         0x51u
 #define ADPCM_START         0x58u
@@ -28,9 +28,9 @@ static void king_reg32(u16 reg, u32 value)
                       : : "r"(reg), "r"(value));
 }
 
-static void select_sample_channel(int channel, u16 start_word, u16 word_count)
+static void select_sample_channel(int channel, u32 start_word, u32 word_count)
 {
-    u16 end_word = (u16)(start_word + word_count - 1u);
+    u32 end_word = start_word + word_count - 1u;
 
     /* Stop before reprogramming: CTRL play bits are edge-triggered. */
     king_reg16(ADPCM_CTRL, (u16)(SFX_ADPCM_RATE << 2));
@@ -38,6 +38,8 @@ static void select_sample_channel(int channel, u16 start_word, u16 word_count)
     adpcm_set_control(SFX_ADPCM_RATE, 1, 1, channel == 0, channel == 1);
     adpcm_set_control(SFX_ADPCM_RATE, 1, 1, 0, 0);
     king_reg16((u16)(ADPCM_CHCFG + channel), ADPCM_ONESHOT);
+    /* SAL is the 18-bit word address divided by 256; the end register keeps
+       the full word address. */
     king_reg16((u16)(ADPCM_START + channel * 4), (u16)(start_word >> 8));
     king_reg32((u16)(ADPCM_END + channel * 4), end_word);
     adpcm_set_volume((u8)channel, 63, 63);

@@ -44,7 +44,7 @@
 #define HUD_DIGIT_BASE_WORD 0x7040
 /* 0x7300..0x73C0 [play] level 2/6/8 carrier, 48x16 */
 #define PLATFORM_BASE_WORD 0x7300
-/* 0x7400..0xA580 [play] per-level enemy variant banks */
+/* 0x7400..0xA700 [play] per-level enemy variant banks */
 #define ENEMY_BASE_WORD 0x7400
 /* 0x7400..0xBD80 [boss] boss body poses (Bowser uses the ten-pose bank) */
 #define BOSS_BASE_WORD 0x7400
@@ -66,14 +66,12 @@
 #define LEVEL8_WEDGE_L_BASE_WORD 0xBC00
 /* 0xBD80..0xC8C0 [play] extra live cels: pterodactyl/floor-attacker third pose plus every variant attack pose */
 #define ENEMY_ALT_BASE_WORD 0xBD80
-/* 0xC900..0xE1C0 [play] per-variant hit frame */
+/* 0xC900..0xE280 [play] per-variant hit frame */
 #define ENEMY_HIT_BASE_WORD 0xC900
 /* 0xDD00..0xDE80 [boss] Bowser flame */
 #define BOWSER_FLAME_BASE_WORD 0xDD00
 /* 0xE000..0xE900 [boss] ring/hammer/pot/bell/bomb/crate4/platform */
 #define BOSS_AUX_BASE_WORD 0xE000
-/* 0xE200..0xE300 [play] pot object, also uploaded by every normal stage */
-#define BOSS_POT_BASE_WORD 0xE200
 /* 0xE300..0xE400 [play] thrown rock/spear/spark for the $C0C6, $BAD6 and $BCC8 throwers */
 #define ENEMY_SHOT_BASE_WORD 0xE300
 /* 0xE400..0xE440 [play] thrown banana (levels with monkeys) */
@@ -90,6 +88,8 @@
 #define CHIP_BOMB_BASE_WORD 0xEC80
 /* 0xECC0..0xEDC0 [play] flier bombing pose, 24x24 (levels with CHIP) */
 #define CHIP_ATTACK_BASE_WORD 0xECC0
+/* 0xEF00..0xF000 [play,boss] pot object, also uploaded by every normal stage */
+#define BOSS_POT_BASE_WORD 0xEF00
 /* 0xF000..0xF100 [boot,title,menu,play,boss,continue] sprite attribute table, page 0 */
 #define SATB_BASE0 0xF000
 /* 0xF200..0xF300 [boot,title,menu,play,boss,continue] sprite attribute table, page 1 */
@@ -104,10 +104,10 @@
 #define BG_TILE_BASE_WORD 0x1000
 /* 0x2000..0x3AF0 [continue] continue room tile set */
 #define CONTINUE_TILE_BASE_WORD 0x2000
-/* 0x5000..0x6000 [boot] opening dual-plane streaming buffer */
-#define BOOT_DUAL_BACK_BASE_WORD 0x5000
 /* 0x4E80..0x5780 [play,boss] auxiliary player frames 1..6 */
 #define BACK_MIRROR_PLAYER_WORD 0x4E80
+/* 0x5000..0x6000 [boot] opening dual-plane streaming buffer */
+#define BOOT_DUAL_BACK_BASE_WORD 0x5000
 /* 0x5780..0x6080 [play,boss] auxiliary player frames 10..15 */
 #define BACK_MIRROR_PLAYER_CARRY_WORD 0x5780
 /* 0x6080..0x6240 [play,boss] auxiliary death/throw pose */
@@ -132,7 +132,7 @@
 #define BACK_MIRROR_HUD_DIGIT_WORD 0x7040
 /* 0x7300..0x73C0 [play] auxiliary carrier mirror */
 #define BACK_MIRROR_PLATFORM_WORD 0x7300
-/* 0x7400..0xA580 [play] auxiliary enemy bank mirror */
+/* 0x7400..0xA700 [play] auxiliary enemy bank mirror */
 #define BACK_MIRROR_ENEMY_WORD 0x7400
 /* 0x7400..0xBD80 [boss] auxiliary boss body mirror */
 #define BACK_MIRROR_BOSS_WORD 0x7400
@@ -146,7 +146,7 @@
 #define BACK_MIRROR_WEDGE_L_WORD 0xBC00
 /* 0xBD80..0xC8C0 [play] auxiliary enemy attack mirror */
 #define BACK_MIRROR_ENEMY_ALT_WORD 0xBD80
-/* 0xC900..0xE1C0 [play] auxiliary enemy hit mirror */
+/* 0xC900..0xE280 [play] auxiliary enemy hit mirror */
 #define BACK_MIRROR_ENEMY_HIT_WORD 0xC900
 /* 0xD000..0xE560 [title,menu] menu/transition tile set on VDC0 */
 #define FRONT_TILE_BASE_WORD 0xD000
@@ -154,8 +154,6 @@
 #define BACK_MIRROR_BOWSER_FLAME_WORD 0xDD00
 /* 0xE000..0xE900 [boss] auxiliary boss item mirror */
 #define BACK_MIRROR_BOSS_AUX_WORD 0xE000
-/* 0xE200..0xE300 [play] auxiliary stage pot mirror */
-#define BACK_MIRROR_POT_WORD 0xE200
 /* 0xE300..0xE400 [play] auxiliary enemy shot mirror */
 #define BACK_MIRROR_ENEMY_SHOT_WORD 0xE300
 /* 0xE400..0xE440 [play] auxiliary banana mirror */
@@ -168,6 +166,8 @@
 #define BACK_MIRROR_CHIP_BOMB_WORD 0xEC80
 /* 0xECC0..0xEDC0 [play] auxiliary flier attack mirror */
 #define BACK_MIRROR_CHIP_ATTACK_WORD 0xECC0
+/* 0xEF00..0xF000 [play,boss] auxiliary stage pot mirror */
+#define BACK_MIRROR_POT_WORD 0xEF00
 /* 0xF000..0xF100 [boot,title,menu,play,boss,continue] auxiliary sprite attribute table, page 0 */
 #define BACK_SATB_BASE0 0xF000
 /* 0xF200..0xF300 [boot,title,menu,play,boss,continue] auxiliary sprite attribute table, page 1 */

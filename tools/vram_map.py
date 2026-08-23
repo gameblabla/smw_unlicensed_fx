@@ -3,9 +3,15 @@
 
 Every sprite/tile bank the game uploads is declared once in BANKS below.  The
 tool checks that no two banks that can be resident at the same time overlap,
-that each bank fits its chip, and that 32-pixel-wide sprite banks keep the
-128-word alignment the VDC requires, then writes src/vram_map.h with the
-addresses.  main.c includes that header instead of defining addresses itself,
+that each bank fits its chip, and that each bank keeps the alignment the VDC
+requires, then writes src/vram_map.h with the addresses.
+
+Alignment is the per-bank trailing field, and it is a property of the sprite
+size the bank is drawn at, not of the art: the VDC masks low bits of the
+pattern number rather than honouring them, so a bank drawn at 32 pixels wide
+needs 128, one drawn 32 pixels tall needs 128, both at once needs 256, and a
+32x64 sprite needs 512.  A misaligned bank does not fail loudly -- the VDC just
+fetches a lower address and draws whatever bank happens to live there.  main.c includes that header instead of defining addresses itself,
 so a layout mistake fails the build rather than the screen.
 
 Banks whose size depends on the level (the stage tile set, the per-level enemy
@@ -91,8 +97,15 @@ BANKS = [
     ('CHIP_ATTACK_BASE_WORD',       FRONT, 0xECC0, 256,    (PLAY,), 'flier bombing pose, 24x24 (levels with CHIP)'),
     ('BOWSER_FLAME_BASE_WORD',      FRONT, 0xDD00, 384,    (BOSS,), 'Bowser flame'),
     ('BOSS_AUX_BASE_WORD',          FRONT, 0xE000, 2304,   (BOSS,), 'ring/hammer/pot/bell/bomb/crate4/platform'),
-    ('BOSS_POT_BASE_WORD',          FRONT, 0xE200, 256,    (PLAY,), 'pot object, also uploaded by every normal stage',
-     None, ['BOSS_AUX_BASE_WORD:the pot lives inside the boss aux bank at the same address']),
+    # The pot used to sit at 0xE200, inside the boss aux bank, and relied on
+    # that bank holding the same art at the same offset.  Level 17's hit bank
+    # grew into it once the golfer got its attack cels, so the pot moved to the
+    # clear run above the flier banks, where no scene has anything else.
+    # It is drawn as a single 32x32 sprite, and the VDC masks bits 0 and 1 of
+    # the pattern number for those (CGX clears bit 0, CGY=1 clears bit 1), so
+    # the bank has to start on a 256-word boundary.  At 0xEDC0 the fetch was
+    # folded back to 0xED00 and the pot rendered as the flier's attack pose.
+    ('BOSS_POT_BASE_WORD',          FRONT, 0xEF00, 256,    (PLAY, BOSS), 'pot object, also uploaded by every normal stage', 256),
     ('BOSS_WATER_BASE_WORD',        FRONT, 0xE900, 64,     (BOSS,), 'boss 1 water'),
     ('GAMEPLAY_DOWN_MARIO_BASE_WORD', FRONT, 0xE980, PLAYER_FRAME_WORDS, (PLAY, BOSS), 'crouch Mario', 128),
     ('GAMEPLAY_DOWN_LUIGI_BASE_WORD', FRONT, 0xEB00, PLAYER_FRAME_WORDS, (PLAY, BOSS), 'crouch Luigi', 128),
@@ -131,7 +144,7 @@ BANKS = [
     ('BACK_MIRROR_ENEMY_HIT_WORD',  BACK,  0xC900, 'sized:enemy_hit', (PLAY,), 'auxiliary enemy hit mirror'),
     ('BACK_MIRROR_BOWSER_FLAME_WORD',BACK, 0xDD00, 384,    (BOSS,), 'auxiliary Bowser flame mirror'),
     ('BACK_MIRROR_BOSS_AUX_WORD',   BACK,  0xE000, 2304,   (BOSS,), 'auxiliary boss item mirror'),
-    ('BACK_MIRROR_POT_WORD',        BACK,  0xE200, 256,    (PLAY,), 'auxiliary stage pot mirror'),
+    ('BACK_MIRROR_POT_WORD',        BACK,  0xEF00, 256,    (PLAY, BOSS), 'auxiliary stage pot mirror', 256),
     ('BACK_MIRROR_ENEMY_SHOT_WORD', BACK,  0xE300, 256,    (PLAY,), 'auxiliary enemy shot mirror'),
     ('BACK_MIRROR_BANANA_WORD',     BACK,  0xE400, 64,     (PLAY,), 'auxiliary banana mirror'),
     ('BACK_MIRROR_CRATE_WALK_WORD', BACK,  0xE500, 1152,   (PLAY,), 'auxiliary crate-walk mirror'),

@@ -8,7 +8,7 @@
  *   TETSU  : 262-line, 5 MHz dot clock
  *   VDC0   : Mega Drive Plane B analogue (background/parallax)
  *   VDC1   : Mega Drive Plane A analogue + sprites/HUD
- *   KING/RAINBOW unused; KRAM page 1 holds 16 kHz ADPCM effects and music is
+ *   KING/RAINBOW unused; KRAM page 1 holds 32 kHz ADPCM effects and music is
  *   Red Book CD-DA.
  *
  * Source geometry is not vertically centered. The MD V28 active picture starts
@@ -2480,13 +2480,13 @@ static void update_camera(void)
 
 /* Slot 9's fake parallax.  $14804 fills the Mega Drive's per-cell horizontal
    scroll table for plane B from four free-running counters.  Its level-9
-   dispatcher ($14A44) changes sources at d0=32,56,80,120:
+   dispatcher ($14A44) changes sources at d0=32,56,80,119:
 
      lines   0..31   $FF008E   +1 every 8 video frames (drifts right)
      lines  32..55   $FF0064   -1 every 4 video frames (drifts left)
      lines  56..79   $FF008C   -1 every 8 video frames (drifts left)
-     lines 80..119   skipped, so it stands still
-     lines 120 down  $FF003A   half the camera step
+     lines 80..118   skipped, so it stands still
+     lines 119 down  $FF003A   half the camera step
 
    A 7UP latches BXR for the next line after horizontal blanking.  Its raster
    compare IRQ is raised at the end of the compared line, specifically so BXR
@@ -2497,7 +2497,7 @@ static void update_camera(void)
 #define PARALLAX_SPLIT_B   32
 #define PARALLAX_SPLIT_C   56
 #define PARALLAX_SPLIT_END 80
-#define PARALLAX_SPLIT_BUSH 120
+#define PARALLAX_SPLIT_BUSH 119
 #define PARALLAX_VDC_IRQ_LEVEL 12 /* PC-FX interrupt input for HuC6270-A */
 #define PARALLAX_VDC_REG_PORT  0x400
 #define PARALLAX_RCR_BIAS      64
@@ -3745,9 +3745,10 @@ static void apply_item(unsigned char kind, int player2)
 
    The drop is the port's own: a freed item pops out of the crate and falls
    under the same gravity a loose crate uses until it rests on the floor.  It
-   is only collectable once it has landed, so the pickup always plays out on
-   screen instead of being swallowed on its first frame, and an item that
-   lands away from the player waits there to be walked into. */
+   becomes collectable as soon as the initial pop reaches its apex and starts
+   falling.  Keeping the upward half of the pop non-collectable prevents the
+   item from being swallowed on its first frame, while no longer forcing the
+   player to wait for it to land. */
 static void update_items(void)
 {
     int i;
@@ -3770,7 +3771,8 @@ static void update_items(void)
                 it->vy = 0;
                 it->grounded = 1;
             }
-            continue;
+            /* Let either player collect the item during its descent. */
+            if (!it->grounded && it->vy <= 0) continue;
         }
         {
             int player2=0;
