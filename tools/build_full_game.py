@@ -1026,9 +1026,14 @@ def make_later_boss_assets():
                 if xbase<=x<xbase+112:canvas.putpixel((x-xbase,y+8),strip.getpixel((x,y)))
             frames.append(canvas)
         return frames
+    # Boss 4's captured arena still carried the HUD and a stray player cel in
+    # its left half; the hand-cleaned PC-FX repaint is sprite-free and uses
+    # only the eleven colours the room actually draws.
+    arena_sources={10:PROJECT/'boss4_area_pcfx.png'}
     for slot in (8,10,13,16,19):
         root=BOSSREF/'later'
-        bg=packed_with_transparent_zero(ba.pack_bg_rgb(Image.open(root/f'boss{slot}_arena.png').convert('RGB')))
+        arena=arena_sources.get(slot,root/f'boss{slot}_arena.png')
+        bg=packed_with_transparent_zero(ba.pack_bg_rgb(Image.open(arena).convert('RGB')))
         # Boss maps use a 32-row BAT so vertically scrolling rooms wrap on
         # complete source data.  Captured 240-line rooms have two blank rows;
         # slot 13 is a clean 256x256 arena and fills all of them, and slot 19
