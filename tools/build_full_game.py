@@ -6,6 +6,7 @@ sys.path.insert(0,str(Path(__file__).parent))
 import build_assets as ba
 from level_extension import foreground_words_240, MAP_WIDTH
 import level_overlay
+import level_sheet
 
 import os
 PROJECT=Path(__file__).resolve().parent.parent
@@ -24,6 +25,14 @@ CLOUD_BG_Y16_SLOTS={1,2,4}
 # translucency on the Mega Drive.  The PC-FX blends for real, so the
 # checkerboard is lifted out into a KING BG0 cellophane layer.
 TRANSLUCENT_BACKDROP_SETS={7}
+
+# World 3's planes are authored, not extracted: these sheets are the plane as
+# it should look, dither resolved and hand edits included, and level_sheet.py
+# splits them back into the VDC layer and the KING one.  They cover all 240
+# lines, including the rows the Mega Drive's 224-line picture never showed.
+BACKDROP_SHEETS={7:'world3/md_w3_level1_foreground_planeA_flat_v2.png',
+                 8:'world3/md_w3_level2_foreground_planeA_flat_v2.png'}
+SHEET_DIR=Path(os.environ.get('SHEET_DIR',str(PROJECT/'assets/reference')))
 
 # The Mega Drive background plane is 64 cells wide and is loaded as two 32x32
 # maps: the descriptor writing to ...000 fills columns 0..31, the one writing
@@ -263,6 +272,37 @@ def opaque_backdrop_bat(cells,region,tiles,lookup):
     return bat
 
 
+def sheet_backdrop_bat(back,palette,rom_cells,tiles,lookup):
+    """Build the VDC plane from a sheet's opaque layer.
+
+    A cell carries one palette line, so each one takes the line that holds
+    every colour it uses -- the line the Mega Drive gave it wherever that
+    still works, since several colours sit in more than one line.
+    """
+    bat=[]
+    index={}
+    for e,rgb in palette.items():
+        if e%16: index.setdefault(rgb,{})[e//16]=e%16
+    for cy in range(30):
+        for cx in range(level_overlay.PLANE_W):
+            want={palette[e] for j in range(8) for i in range(8)
+                  for e in (back[cy*8+j][cx*8+i],) if e is not None}
+            lines=[rom_cells[(cy,cx)][0]]+[l for l in range(4) if l!=rom_cells[(cy,cx)][0]]
+            line=next((l for l in lines if all(l in index.get(c,{}) for c in want)),None)
+            if line is None:
+                raise SystemExit(f'sheet cell {cy},{cx} needs colours no palette line holds: {sorted(want)}')
+            pix=[0]*64
+            for j in range(8):
+                for i in range(8):
+                    e=back[cy*8+j][cx*8+i]
+                    if e is not None: pix[j*8+i]=index[palette[e]][line]
+            key=(line,tuple(pix))
+            if key not in lookup:
+                lookup[key]=len(tiles); tiles.append(key[1])
+            bat.append((line<<12)|lookup[key])
+    return bat
+
+
 def build_sets(stage_manifest):
     sets=[]; overlay_tiles={}
     for sx in stage_manifest:
@@ -317,7 +357,7 @@ def build_sets(stage_manifest):
                 if sx['set_id'] in TRANSLUCENT_BACKDROP_SETS:
                     # Deferred: the dither colours are pooled across the whole
                     # family so both levels can share one cell dictionary.
-                    bb=None; pending[slot]=backdrop_pixel_plane(src,vv)
+                    bb=None; pending[slot]=backdrop_pixel_plane(src,vv)+(slot in BACKDROP_SHEETS,)
                 else:
                     bb=[ba.append_genesis_word(word,vv,tiles,lookup) for word in src]
             else: bb=[0]*(BG_PLANE_W*30)
@@ -329,11 +369,22 @@ def build_sets(stage_manifest):
                 bb=[ba.append_genesis_word(word,vv,tiles,lookup) for word in raw_bg]
             bgs[slot]=bb
         if pending:
-            # The strict pass finds the pattern, the completion pass takes the
-            # rest of the cells it started, so no dither speckle is left behind
-            # in the VDC plane for the trunks and the flower bed to show.
-            regions={slot:level_overlay.complete_region(plane,level_overlay.translucent_region(plane))
-                     for slot,(plane,_) in pending.items()}
+            # A slot with a sheet takes its split from the sheet.  For the rest
+            # the strict pass finds the dither and the completion pass takes
+            # the rest of the cells it started, so no speckle is left behind in
+            # the VDC plane for the trunks and the flower bed to show.
+            regions={}; sheets={}
+            for slot,(plane,cells,has_sheet) in pending.items():
+                if has_sheet:
+                    rgb=level_sheet.sheet_palette(KIT/f'graphics/levels/level_{slot:02d}/palette.csv')
+                    img=Image.open(SHEET_DIR/BACKDROP_SHEETS[slot])
+                    back,front,unresolved=level_sheet.resolve_sheet(img,rgb)
+                    for colour in unresolved:
+                        print(f'  sheet {slot}: {colour} is not a colour the palette can mix; shaded to the nearest')
+                    sheets[slot]=(back,rgb)
+                    regions[slot]=level_sheet.entry_pairs(front)
+                else:
+                    regions[slot]=level_overlay.complete_region(plane,level_overlay.translucent_region(plane))
             counts={}
             for region in regions.values():
                 for line in region:
@@ -342,12 +393,16 @@ def build_sets(stage_manifest):
             colors=[c for c,_ in sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))[:level_overlay.MAX_OVERLAY_COLORS]]
             keep=set(colors)
             pool={}
-            for slot,(plane,cells) in pending.items():
+            for slot,(plane,cells,has_sheet) in pending.items():
                 region=regions[slot]
                 for line in region:
                     for x,c in enumerate(line):
                         if c is not None and c not in keep: line[x]=None
-                bgs[slot]=opaque_backdrop_bat(cells,region,tiles,lookup)
+                if has_sheet:
+                    back,rgb=sheets[slot]
+                    bgs[slot]=sheet_backdrop_bat(back,rgb,cells,tiles,lookup)
+                else:
+                    bgs[slot]=opaque_backdrop_bat(cells,region,tiles,lookup)
                 rows=level_overlay.pack_overlay_cells(region,colors,pool)
                 palette=palette_for_level(slot)
                 overlays[slot]=dict(rows=[r for r,_ in rows],
@@ -1758,11 +1813,20 @@ def main():
     hs=hs.replace('#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 9\n','')
     hs=hs.replace('#define BOWSER_SPECIAL_FRAME_COUNT 7','#define BOWSER_SPECIAL_FRAME_COUNT 10')
     h.write_text(hs)
+    # Several stages hand the same background plane to every level in the
+    # family, and the later slots load one 32-cell map for both halves, so a
+    # dozen of these 1920-word planes are byte-identical to another.  Emit each
+    # distinct one once and let the rest point at it.
+    bg_name={}; bg_seen={}
+    for s in sets:
+        for slot,bb in s['bgs'].items():
+            bg_name[slot]=bg_seen.setdefault(tuple(bb),f'level{slot:02d}_bg')
     with out.open('w') as f:
         f.write('#include "game_levels_generated.h"\n\n')
         for s in sets:
             q=f'set{s["set_id"]:02d}'; emit_u16(f,q+'_tiles',s['tiles'],static=True); emit_u16(f,q+'_bat',s['bat'],static=True); emit_u8(f,q+'_col',s['collision'],static=True)
-            for slot,bb in s['bgs'].items(): emit_u16(f,f'level{slot:02d}_bg',bb,static=True)
+            for slot,bb in s['bgs'].items():
+                if bg_name[slot]==f'level{slot:02d}_bg': emit_u16(f,bg_name[slot],bb,static=True)
             if s.get('overlay_tiles'): emit_u16(f,q+'_ovtiles',s['overlay_tiles'],static=True)
             for slot,ov in s.get('overlays',{}).items():
                 emit_u8(f,f'level{slot:02d}_ovrows',ov['rows'],static=True)
@@ -1826,7 +1890,7 @@ def main():
         f.write('};\n\n')
         f.write('const GameLevelData g_game_levels[19] = {\n')
         for slot in range(1,20):
-            lev=levels[slot-1]; route=routes[slot][0]; s=sets[set_index[slot]]; bg=f'level{slot:02d}_bg';
+            lev=levels[slot-1]; route=routes[slot][0]; s=sets[set_index[slot]]; bg=bg_name[slot];
             f.write(f'  {{{set_index[slot]},{len(route)},level{slot:02d}_route,level{slot:02d}_modes,level{slot:02d}_quads,level{slot:02d}_pal,{bg},{lev["spawn"][0]},{lev["spawn"][1]},{len(lev["crates"])},{len(lev["gems"])},{len(lev["enemy_records"])},level{slot:02d}_crates,level{slot:02d}_gems,level{slot:02d}_enemies,{len(lev["variant_ids"])},level{slot:02d}_variants}},\n')
         f.write('};\n\n')
         overlays={}

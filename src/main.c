@@ -1823,52 +1823,6 @@ static int level_front_scenery_over_sprites(void)
     return !g_in_boss && g_current_level==6;
 }
 
-/* Tile rows 28 and 29 sit below the Mega Drive's 224-line V28 picture.  The
-   source has no art there, so the generator continues the row-27 texture into
-   them; behind the HUD that reads as a band of repeated scenery.  Cover the
-   band with a solid black cell instead.  It has to be a real opaque cell: a
-   blank one leaves colour index 0, which the VDC treats as transparent, so the
-   other chip's plane would simply show through it. */
-#define HUD_BAND_FIRST_ROW 28
-static u16 g_hud_band_cell;
-
-/* Named for what the band shows, not for how: the stage plane keeps its own
-   cells there and is simply covered. */
-static int level_blank_hud_band(void)
-{
-    return !g_in_boss && g_current_level==6;
-}
-
-/* Palette entry for the band, as a BAT palette line in 0..3 plus a colour
-   index in 1..15.  Only the level's own four background lines are searched:
-   lines 4 and up are handed to the enemy variants by set_game_palette_fade().
-   Colour 0 of any line is the transparent one, so it cannot be used. */
-static int level_black_palette_entry(void)
-{
-    int i;
-    if(!g_level)return 0;
-    for(i=1;i<64;++i)
-        if((i&15)&&g_level->palette[i]==YUV_BLACK)return i;
-    return 0;
-}
-
-/* Build the band cell and upload its pattern.  The cell is one flat colour, so
-   every bitplane row is either all ones or all zeros.  Levels that blank the
-   band are exactly the ones whose backdrop is on VDC1 (level 6), which is
-   where HUD_BAND_BLACK_TILE_WORD is reserved. */
-static void prepare_hud_band_cell(void)
-{
-    int entry=level_black_palette_entry(),i;
-    g_hud_band_cell=0;
-    if(!entry||level_backdrop_chip()!=FRONT_CHIP)return;
-    vdc_set_vram_write(FRONT_CHIP,HUD_BAND_BLACK_TILE_WORD);
-    for(i=0;i<8;++i)
-        vdc_vram_write(FRONT_CHIP,(u16)(((entry&1)?0x00FFu:0)|((entry&2)?0xFF00u:0)));
-    for(i=0;i<8;++i)
-        vdc_vram_write(FRONT_CHIP,(u16)(((entry&4)?0x00FFu:0)|((entry&8)?0xFF00u:0)));
-    g_hud_band_cell=(u16)(((entry>>4)<<12)|(HUD_BAND_BLACK_TILE_WORD/TILE_WORDS));
-}
-
 /* --- Screen grid -------------------------------------------------------
    $14370 walks the route one record at a time; the record's mode selects
    where the incoming screen is pasted relative to the outgoing one (table
@@ -2134,18 +2088,17 @@ static int level_backdrop_chip(void)
 static void upload_level_backdrop(void)
 {
     int x,y,chip=level_backdrop_chip();
-    prepare_hud_band_cell();
     vdc_set_vram_write(chip,FG_TILE_BASE_WORD);
     for(x=0;x<g_stage_set->tile_count*TILE_WORDS;++x)vdc_vram_write(chip,g_stage_set->tile_words[x]);
     for(y=0;y<30;++y){
         vdc_set_vram_write(chip,(u16)(y*BG_BAT_W));
         /* The background plane is the Mega Drive's full 64-cell width; it
-           wraps every 512 pixels, not every 256. */
-        int band=(y>=HUD_BAND_FIRST_ROW)&&level_blank_hud_band()&&g_hud_band_cell;
-        for(x=0;x<64;++x){
-            if(band)vdc_vram_write(chip,g_hud_band_cell);
-            else vdc_vram_write(chip,relocate_bat(g_level->bg_bat[y*BG_BAT_W+x],FG_TILE_BASE_INDEX));
-        }
+           wraps every 512 pixels, not every 256.  All 30 rows are real art:
+           rows 28 and 29 sit below the Mega Drive's 224-line picture, and the
+           world 3 sheets paint them (see tools/level_sheet.py) rather than
+           leaving the row-27 texture repeating behind the HUD. */
+        for(x=0;x<64;++x)
+            vdc_vram_write(chip,relocate_bat(g_level->bg_bat[y*BG_BAT_W+x],FG_TILE_BASE_INDEX));
     }
 }
 
@@ -2240,10 +2193,9 @@ static void overlay_upload(void)
     const LevelOverlayData *ov=level_overlay();
     signed char rowmap[LEVEL_OVERLAY_ROWS];
     u16 mprog[16];
-    int y,x,i,hud;
+    int y,x,i;
 
     if(!ov){overlay_disable();return;}
-    hud=level_blank_hud_band();
     for(i=0;i<LEVEL_OVERLAY_ROWS;++i)rowmap[i]=-1;
     for(i=0;i<ov->row_count;++i)rowmap[ov->rows[i]]=(signed char)i;
 
@@ -2253,7 +2205,7 @@ static void overlay_upload(void)
     king_set_kram_write(0,1);
     for(y=0;y<OVERLAY_KRAM_LINES;++y){
         const unsigned char *cells=0;
-        if(y<LEVEL_OVERLAY_ROWS*8&&!(hud&&y>=HUD_BAND_FIRST_ROW*8)){
+        if(y<LEVEL_OVERLAY_ROWS*8){
             int band=rowmap[y>>3];
             if(band>=0)cells=ov->cells+band*LEVEL_OVERLAY_CELLS;
         }
