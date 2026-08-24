@@ -5,6 +5,7 @@ from PIL import Image
 sys.path.insert(0,str(Path(__file__).parent))
 import build_assets as ba
 from level_extension import foreground_words_240, MAP_WIDTH
+import level_overlay
 
 import os
 PROJECT=Path(__file__).resolve().parent.parent
@@ -18,6 +19,11 @@ LEVEL_DEFAULTS=Path(os.environ.get('LEVEL_DEFAULTS',str(PROJECT/'level_defaults'
 # source is a 224-line composition; on PC-FX it is placed at Y+16 rather than
 # fabricating extra bottom rows to reach 240 lines.
 CLOUD_BG_Y16_SLOTS={1,2,4}
+
+# World 3's foreground plane is dithered against the stage plane to fake
+# translucency on the Mega Drive.  The PC-FX blends for real, so the
+# checkerboard is lifted out into a KING BG0 cellophane layer.
+TRANSLUCENT_BACKDROP_SETS={7}
 
 # The Mega Drive background plane is 64 cells wide and is loaded as two 32x32
 # maps: the descriptor writing to ...000 fills columns 0..31, the one writing
@@ -222,8 +228,43 @@ def parse_routes(r,stage_manifest):
         bylevel[slot]=(route,modes,quadrants)
     return bylevel
 
+
+def backdrop_pixel_plane(src,vram):
+    """Expand a 64x30 Mega Drive plane into per-pixel (palette,index) cells."""
+    plane=[[None]*level_overlay.OVERLAY_W for _ in range(30*8)]
+    cells={}
+    for cy in range(30):
+        for cx in range(level_overlay.PLANE_W):
+            word=src[cy*level_overlay.PLANE_W+cx]
+            pal=(word>>13)&3
+            pix=ba.tilepix(vram,word&0x7FF,bool(word&0x0800),bool(word&0x1000))
+            cells[(cy,cx)]=(pal,pix)
+            for j in range(8):
+                for i in range(8):
+                    v=pix[j*8+i]
+                    if v: plane[cy*8+j][cx*8+i]=(pal,v)
+    return plane,cells
+
+
+def opaque_backdrop_bat(cells,region,tiles,lookup):
+    """Rebuild the VDC plane with every translucent pixel taken out of it."""
+    bat=[]
+    for cy in range(30):
+        for cx in range(level_overlay.PLANE_W):
+            pal,pix=cells[(cy,cx)]
+            out=list(pix)
+            for j in range(8):
+                for i in range(8):
+                    if region[cy*8+j][cx*8+i] is not None: out[j*8+i]=0
+            key=(pal,tuple(out))
+            if key not in lookup:
+                lookup[key]=len(tiles); tiles.append(key[1])
+            bat.append((pal<<12)|lookup[key])
+    return bat
+
+
 def build_sets(stage_manifest):
-    sets=[]
+    sets=[]; overlay_tiles={}
     for sx in stage_manifest:
         root=find_set_root(sx['set_id']); first=sx['level_slots'][0]
         vram=apply_tile_overrides((KIT/f'graphics/levels/level_{first:02d}/assembled_vram.bin').read_bytes(),f'set_{sx["set_id"]:02d}_tiles.json')
@@ -252,12 +293,12 @@ def build_sets(stage_manifest):
             cf=apply_collision_overrides(f'set_{sx["set_id"]:02d}_segment_{seg:02d}_collision.json',cf)
             collisions.extend(cf)
         # Level-specific background layers are converted into this set's shared tile dictionary.
-        bgs={}
+        bgs={}; overlays={}; pending={}
         for slot in sx['level_slots']:
             ld=KIT/f'graphics/levels/level_{slot:02d}'; vv=apply_tile_overrides((ld/'assembled_vram.bin').read_bytes(),f'level_{slot:02d}_background_tiles.json')
             halves=background_plane_halves(ld)
             if halves:
-                left,right=halves; bb=[]
+                left,right=halves; bb=[]; src=[]
                 src_h=max(1,len(left)//32)
                 for y in range(30):
                     if slot in CLOUD_BG_Y16_SLOTS and src_h>=28:
@@ -272,15 +313,48 @@ def build_sets(stage_manifest):
                         else:
                             sy=min(y+crop,src_h-1)
                     for half in (left,right):
-                        for x in range(32): bb.append(ba.append_genesis_word(half[sy*32+x],vv,tiles,lookup))
+                        for x in range(32): src.append(half[sy*32+x])
+                if sx['set_id'] in TRANSLUCENT_BACKDROP_SETS:
+                    # Deferred: the dither colours are pooled across the whole
+                    # family so both levels can share one cell dictionary.
+                    bb=None; pending[slot]=backdrop_pixel_plane(src,vv)
+                else:
+                    bb=[ba.append_genesis_word(word,vv,tiles,lookup) for word in src]
             else: bb=[0]*(BG_PLANE_W*30)
             raw_bg=override_words(f'level_{slot:02d}_background.json',None,BG_PLANE_W*30)
             if raw_bg is not None:
+                # An authored plane replaces the extraction outright, dither
+                # included; leave it alone rather than second-guessing it.
+                pending.pop(slot,None)
                 bb=[ba.append_genesis_word(word,vv,tiles,lookup) for word in raw_bg]
             bgs[slot]=bb
+        if pending:
+            regions={slot:level_overlay.translucent_region(plane) for slot,(plane,_) in pending.items()}
+            counts={}
+            for region in regions.values():
+                for line in region:
+                    for c in line:
+                        if c is not None: counts[c]=counts.get(c,0)+1
+            colors=[c for c,_ in sorted(counts.items(),key=lambda kv:(-kv[1],kv[0]))[:level_overlay.MAX_OVERLAY_COLORS]]
+            keep=set(colors)
+            pool={}
+            for slot,(plane,cells) in pending.items():
+                region=regions[slot]
+                for line in region:
+                    for x,c in enumerate(line):
+                        if c is not None and c not in keep: line[x]=None
+                bgs[slot]=opaque_backdrop_bat(cells,region,tiles,lookup)
+                rows=level_overlay.pack_overlay_cells(region,colors,pool)
+                palette=palette_for_level(slot)
+                overlays[slot]=dict(rows=[r for r,_ in rows],
+                                    cells=[v for _,c in rows for v in c],
+                                    palette=[0]+[palette[c[0]*16+c[1]] for c in colors]+[0]*(3-len(colors)))
+            tilewords=[0]*(len(pool)*8)
+            for cell,index in pool.items(): tilewords[(index-1)*8:index*8]=list(cell)
+            overlay_tiles[sx['set_id']]=tilewords
         tw=[]
         for t in tiles: tw.extend(ba.encode_bg_tile(t))
-        sets.append(dict(set_id=sx['set_id'],slots=sx['level_slots'],segment_count=sx['segment_count'],tiles=tw,tile_count=len(tiles),bat=bat,collision=collisions,bgs=bgs))
+        sets.append(dict(set_id=sx['set_id'],slots=sx['level_slots'],segment_count=sx['segment_count'],tiles=tw,tile_count=len(tiles),bat=bat,collision=collisions,bgs=bgs,overlays=overlays,overlay_tiles=overlay_tiles.get(sx['set_id'])))
         print('set',sx['set_id'],'tiles',len(tiles),'segments',sx['segment_count'])
     return sets
 
@@ -1649,7 +1723,7 @@ def main():
     bowserrooms=[make_boss_background(slot) for slot in (3,6)]; bosspal,bossflamewords,bossflamemask,bowserspecialwords,bowserspecialmasks=make_bowser_sprite();laterboss=make_later_boss_assets();level6platform=make_level6_platform_words();l8brick,l8wedger,l8wedgel,l8objpal=make_level8_platform_words(r);l8carriers=make_level8_carriers(r);stageobjs=make_stage_objects(r,routes,init);objpath=stage_object_path(r);boss13platform,boss13platformpal=make_boss13_platform_words();finalring,finalhammer,finalauxpal=make_final_boss_aux_words();potwords,potpal,bombwords,bombpal,crate4words,crate4pal,bellwords,bellpal=make_boss_item_words();waterwords,waterpal=make_boss_water_words();bananawords=make_monkey_banana(r);monkeyspecial,monkeyspecialmasks=make_monkey_special_frames(r);cratewalk,cratewalkmasks=make_crate_walk_frames(r);chipatk,chipatkmask,chipbomb=make_chip_attack(r);snakewords,snakemasks,snakepal=make_level8_snake(r)
     bosshp1,bosshp2,bossparams,bossoffsets,bossaltspawn,bosshandlers,bosscollision=boss_tables(r)
     out=PROJECT/'src/game_levels_generated.c'; h=out.with_suffix('.h')
-    h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')
+    h.write_text('''#ifndef SMB_PCFX_GAME_LEVELS_GENERATED_H\n#define SMB_PCFX_GAME_LEVELS_GENERATED_H\n\ntypedef struct { const unsigned short *tile_words; const unsigned short *segment_bat; const unsigned char *collision; unsigned short tile_count; unsigned char segment_count; } StageSetData;\ntypedef struct { const unsigned short *words; const unsigned short *palette; unsigned short mask0,mask1; unsigned char width,height; } EnemyVariantData;\ntypedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;\n/* World 3's translucent foreground band, drawn by KING BG0 with cellophane.\n   Only the plane rows that carry anything are stored: `rows[i]` is the row and\n   `cells[i*64+x]` picks one of the stage family's shared 8x8 four-colour\n   `tiles` (8 words each, one-based; zero is the empty cell). */\ntypedef struct { const unsigned char *rows,*cells; const unsigned short *tiles,*palette; unsigned char row_count; } LevelOverlayData;\nextern const LevelOverlayData g_level_overlays[19];\n#define LEVEL_OVERLAY_CELLS 64\n#define LEVEL_OVERLAY_ROWS 30\nextern const StageSetData g_stage_sets[12];\nextern const GameLevelData g_game_levels[19];\nextern const EnemyVariantData g_enemy_variants[];\nextern const unsigned short g_enemy_variant_count;\nextern const unsigned char g_boss_level_flags[19];\nextern const unsigned short g_boss_bg_palette[256],g_boss_bg_tile_words[] ,g_boss_bg_bat[];\nextern const unsigned short g_boss_bg_tile_count;\nextern const unsigned short g_bowser_words[],g_bowser_palette[16];\nextern const unsigned long long g_bowser_masks[5];\nextern const unsigned short g_boss_hp_1p[19],g_boss_hp_2p[19];\nextern const unsigned short g_boss_params[57],g_boss_alt_spawn[38];\nextern const short g_boss_hit_offsets[38];\nextern const unsigned long g_boss_handler_address[19];\n#define ENEMY_FRAME_WORDS 576\n#define ENEMY_VARIANT_VRAM_WORDS 1152\n#define BOWSER_FRAME_WORDS 2304\n#define BOWSER_FRAME_COUNT 5\n#define BOWSER_SPECIAL_FRAME_COUNT 7\n#endif\n''')
     # Keep the generated declarations tied to the actual captured pose count.
     # Extend the legacy generated declaration block for the complete captured
     # boss-1 bank and its detached flame metasprite.
@@ -1683,6 +1757,11 @@ def main():
         for s in sets:
             q=f'set{s["set_id"]:02d}'; emit_u16(f,q+'_tiles',s['tiles'],static=True); emit_u16(f,q+'_bat',s['bat'],static=True); emit_u8(f,q+'_col',s['collision'],static=True)
             for slot,bb in s['bgs'].items(): emit_u16(f,f'level{slot:02d}_bg',bb,static=True)
+            if s.get('overlay_tiles'): emit_u16(f,q+'_ovtiles',s['overlay_tiles'],static=True)
+            for slot,ov in s.get('overlays',{}).items():
+                emit_u8(f,f'level{slot:02d}_ovrows',ov['rows'],static=True)
+                emit_u8(f,f'level{slot:02d}_ovcells',ov['cells'],static=True)
+                emit_u16(f,f'level{slot:02d}_ovpal',ov['palette'],static=True)
         for slot in range(1,20):
             route,modes,quads=routes[slot]; emit_u8(f,f'level{slot:02d}_route',route,static=True);emit_u8(f,f'level{slot:02d}_modes',modes,static=True);emit_u8(f,f'level{slot:02d}_quads',quads,static=True);emit_u16(f,f'level{slot:02d}_pal',palettes[slot],static=True)
             lev=levels[slot-1];emit_s16(f,f'level{slot:02d}_crates',lev['crates'],static=True);emit_s16(f,f'level{slot:02d}_gems',lev['gems'],static=True);emit_s16(f,f'level{slot:02d}_enemies',lev['enemy_records'],static=True);emit_u8(f,f'level{slot:02d}_variants',lev['variant_ids'],static=True)
@@ -1743,6 +1822,17 @@ def main():
         for slot in range(1,20):
             lev=levels[slot-1]; route=routes[slot][0]; s=sets[set_index[slot]]; bg=f'level{slot:02d}_bg';
             f.write(f'  {{{set_index[slot]},{len(route)},level{slot:02d}_route,level{slot:02d}_modes,level{slot:02d}_quads,level{slot:02d}_pal,{bg},{lev["spawn"][0]},{lev["spawn"][1]},{len(lev["crates"])},{len(lev["gems"])},{len(lev["enemy_records"])},level{slot:02d}_crates,level{slot:02d}_gems,level{slot:02d}_enemies,{len(lev["variant_ids"])},level{slot:02d}_variants}},\n')
+        f.write('};\n\n')
+        overlays={}
+        for st in sets:
+            for slot,ov in st.get('overlays',{}).items(): overlays[slot]=(st['set_id'],ov)
+        f.write('const LevelOverlayData g_level_overlays[19] = {\n')
+        for slot in range(1,20):
+            if slot in overlays:
+                set_id,ov=overlays[slot]; q=f'level{slot:02d}'
+                f.write(f'  {{{q}_ovrows,{q}_ovcells,set{set_id:02d}_ovtiles,{q}_ovpal,{len(ov["rows"])}}},\n')
+            else:
+                f.write('  {0,0,0,0,0},\n')
         f.write('};\n\n')
         flags=[1 if s in (3,6,8,10,13,16,19) else 0 for s in range(1,20)]; emit_u8(f,'g_boss_level_flags',flags)
         for ri,(room,fg) in enumerate(bowserrooms):

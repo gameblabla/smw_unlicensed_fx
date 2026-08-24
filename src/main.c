@@ -18,6 +18,7 @@
 #include <pcfx/types.h>
 #include <pcfx/vdc.h>
 #include <pcfx/tetsu.h>
+#include <pcfx/king.h>
 #include <pcfx/contrlr.h>
 #include <pcfx/v810.h>
 #include "assets_generated.h"
@@ -35,6 +36,9 @@ extern void pcfx_tetsu_wait_frame(void);
 /* Present in libpcfx, but missing from the installed vdc.h.  The GMaker 7UP
    notes require saving this selector when an IRQ can interrupt VDC accesses. */
 extern u16 vdc_get_last_regnum(int chip);
+
+/* Defined with the rest of the World 3 cellophane layer, below. */
+static void overlay_disable(void);
 
 #define BACK_CHIP VDC0
 #define FRONT_CHIP VDC1
@@ -242,6 +246,20 @@ extern u16 vdc_get_last_regnum(int chip);
 /* MODE1 toggles this at runtime.  It deliberately lives in the release build:
    the requested debug mode is a testing aid, not a forced gameplay rule. */
 #define DEBUG_AMMO_DISPLAY 9
+
+/* Fade levels are 0..FADE_FULL rather than 0..16.  The Mega Drive could only
+   step its CRAM through eight brightnesses, so its fades visibly staircase;
+   the HuC6261 carries a full 8-bit Y, and a 16-step ramp spread over an
+   80-frame fade holds each step for five or six frames, which reads as judder
+   rather than as a fade.  At 256 levels every frame of every fade lands on a
+   distinct luma. */
+#define FADE_FULL 256
+
+/* Title -> menu handoff, in frames from the START press.  See the comment in
+   update_frontend() for the Mega Drive capture these come from. */
+#define TITLE_FADE_OUT      80
+#define TITLE_FADE_IN_START 115
+#define TITLE_FADE_DONE     178
 
 #define STATE_BOOT       0
 #define STATE_TITLE_FADE 1
@@ -459,7 +477,7 @@ static unsigned char g_spring_camera_step;
 static int g_death_timer;
 static int g_game_fade_level;
 static s32 g_menu_mario_x;
-static int g_menu_sprite_fade=16;
+static int g_menu_sprite_fade=FADE_FULL;
 static int g_throw_timer;
 static int g_camera_hold;
 static int g_prev_body_y;
@@ -902,6 +920,88 @@ static void hurt_player(void);
 static void set_front_sprites_enabled(int enabled);
 static void set_sprite_entry(u16 *satb, int index, int x, int y, u16 addr, u16 ctrl);
 
+/* ---------------------------------------------------------------------------
+   Colour palette publishing.
+
+   HuC6261 doc 2.2.2(5) and 2.2.2 note: "writing data to the colour palette RAM
+   while the picture is being displayed shows noise on the screen ... therefore
+   read and write the colour palette RAM during the blanking interval".  The
+   fades rewrite the whole 256-entry palette every frame, which is far more
+   work than one blanking interval could ever be asked to compute, so the game
+   never wrote it there: the burst ran wherever the state machine happened to
+   be, i.e. mostly over the visible picture.  Emulators do not model the
+   conflict, but real hardware scatters dark specks over the screen for as long
+   as a fade is running -- exactly the "black dots that clear up" reported for
+   the transitions.
+
+   So the writes go to a RAM shadow instead, at whatever point in the frame the
+   fade wants to compute them, and only the publish is held back to blanking.
+   The shadow also collapses redundant work: a fade step that lands on the same
+   YUV value as the last one costs nothing, and the dirty range keeps a
+   four-entry overlay tweak from republishing all 256 entries.
+
+   The burst itself follows the documented fast path: CPA (R01) auto-increments
+   on every CPW (R02) access, so the address is set once, and a 32-bit I/O
+   write "accesses the same register twice, low half then high half, which can
+   be used to write two palette addresses in one instruction" (doc 2.1.1), so
+   256 entries cost 128 stores and comfortably fit in the 22-line interval. */
+#define VCE_REG_PORT   0x300
+#define VCE_DATA_PORT  0x304
+#define VCE_REG_CPA    1   /* colour palette address */
+#define VCE_REG_CPW    2   /* colour palette data, write */
+
+/* The status word at the address port carries the raster in bits 13..5.  The
+   262-line mode this port programs blanks lines 0..21; stop short of the end
+   of that window so a full 256-entry burst still lands inside it. */
+#define VCE_RASTER_MASK   0x3FE0
+#define VCE_LAST_BLANK_RASTER 16
+
+static u16 g_pal_shadow[256];
+static int g_pal_dirty_lo=256, g_pal_dirty_hi=-1;
+
+/* Deliberately not inlined: it is called from three dozen sites, several of
+   them 256-entry loops, and the image has only a few kilobytes of headroom
+   under the 2004992-byte ceiling. */
+static __attribute__((noinline)) void pal_set(u16 index, u16 color)
+{
+    if (g_pal_shadow[index]==color) return;
+    g_pal_shadow[index]=color;
+    if ((int)index<g_pal_dirty_lo) g_pal_dirty_lo=(int)index;
+    if ((int)index>g_pal_dirty_hi) g_pal_dirty_hi=(int)index;
+}
+
+/* Wait until the raster is inside the vertical blanking interval.  A single
+   read of the status port can return a transitional raster (the same HuC6261
+   erratum pcfx_tetsu_wait_frame() works around), so two reads must agree. */
+static void pal_wait_blank(void)
+{
+    for (;;) {
+        u16 a=in16(VCE_REG_PORT), b=in16(VCE_REG_PORT);
+        if (((a^b)&VCE_RASTER_MASK)!=0) continue;
+        if (((a&VCE_RASTER_MASK)>>5)<VCE_LAST_BLANK_RASTER) return;
+    }
+}
+
+/* Publish everything pal_set() has changed since the last call.  Safe to call
+   from anywhere: it parks on blanking first, and costs nothing when the caller
+   has just returned from wait_frame(). */
+static void pal_publish(void)
+{
+    int lo=g_pal_dirty_lo, hi=g_pal_dirty_hi, i;
+    if (hi<lo) return;
+    g_pal_dirty_lo=256; g_pal_dirty_hi=-1;
+    pal_wait_blank();
+    out16(VCE_REG_PORT,VCE_REG_CPA);
+    out16(VCE_DATA_PORT,(u16)lo);
+    out16(VCE_REG_PORT,VCE_REG_CPW);
+    /* The raster IRQ can land inside this burst, but it saves and restores the
+       address port, and CPA is left alone by it, so the run continues. */
+    for (i=lo;i+1<=hi;i+=2)
+        out32(VCE_DATA_PORT,
+              (u32)g_pal_shadow[i]|((u32)g_pal_shadow[i+1]<<16));
+    if (i==hi) out16(VCE_DATA_PORT,g_pal_shadow[hi]);
+}
+
 static void wait_frame(void)
 {
     /* The HuC6261 can return a transitional raster value on a single read.
@@ -973,14 +1073,29 @@ static void show_black(void)
     clear_bat(BACK_CHIP, BG_BAT_WORDS);
     clear_bat(FRONT_CHIP, FG_BAT_WORDS);
     set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
-    for (i = 0; i < 256; ++i) tetsu_set_palette((u16)i, 0x0088);
+    for (i = 0; i < 256; ++i) pal_set((u16)i, 0x0088);
+    /* This is the "the screen is black now" primitive, and its callers go on
+       to load for many frames without returning to the main loop, so the
+       blackout cannot wait for the loop's own publish. */
+    pal_publish();
     vdc_set_scroll(BACK_CHIP, 0, 0);
     vdc_set_scroll(FRONT_CHIP, 0, 0);
     clear_satb();
+    overlay_disable();
+}
+
+/* The HuC6261 picture-mode register also carries the KING BG0 display bit, so
+   turning the cellophane layer on and off means rewriting the whole mode. */
+static void set_display_layers(int king_bg0)
+{
+    tetsu_set_video_mode(TETSU_LINES_262, 0, TETSU_DOTCLOCK_5MHz,
+                         TETSU_COLORS_16, TETSU_COLORS_16,
+                         1, 1, king_bg0, 0, 0, 0, 0);
 }
 
 static void init_video(void)
 {
+    int i;
     vdc_init_5MHz(BACK_CHIP);
     vdc_init_5MHz(FRONT_CHIP);
     vdc_setreg(BACK_CHIP, VDC_REG_MWR, VDC_MWR_SCREEN_64x64);
@@ -1001,35 +1116,48 @@ static void init_video(void)
     tetsu_set_rainbow_palette(0);
     tetsu_set_priorities(1, 2, 0, 0, 0, 0, 0);
     tetsu_set_chroma_key(0, 1, 0, 1, 0, 1);
-    tetsu_set_video_mode(TETSU_LINES_262, 0, TETSU_DOTCLOCK_5MHz,
-                         TETSU_COLORS_16, TETSU_COLORS_16,
-                         1, 1, 0, 0, 0, 0, 0);
+    set_display_layers(0);
     clear_satb();
+    /* The shadow has to start out matching nothing the hardware holds, or the
+       first pal_set() of a value it already believes is live would be dropped.
+       Seed it with the black the first show_black() wants and mark the whole
+       range dirty so that publish is unconditional. */
+    for (i = 0; i < 256; ++i) g_pal_shadow[i]=0x0088;
+    g_pal_dirty_lo=0; g_pal_dirty_hi=255;
 }
 
 static u16 fade_yuv(u16 c, int level)
 {
     int y=(c>>8)&255, u=(c>>4)&15, v=c&15;
     if (level < 0) level=0;
-    if (level > 16) level=16;
-    y=(y*level)/16;
-    u=8+((u-8)*level)/16;
-    v=8+((v-8)*level)/16;
+    if (level > FADE_FULL) level=FADE_FULL;
+    y=(y*level)/FADE_FULL;
+    u=8+((u-8)*level)/FADE_FULL;
+    v=8+((v-8)*level)/FADE_FULL;
     return (u16)((y<<8)|((u&15)<<4)|(v&15));
 }
 
 
+/* Sixteen entries of one palette line at one fade level.  Kept out of line and
+   shared by every caller: the fade paths would otherwise expand this loop two
+   dozen times, and the image has very little room under its size ceiling. */
+static __attribute__((noinline)) void pal_set_line(int line,const unsigned short *src,int level)
+{
+    int i;
+    for (i=0;i<16;++i) pal_set((u16)(line*16+i),fade_yuv(src[i],level));
+}
+
 static void set_asset_palette_fade(const BgAsset *a, int level)
 {
     int i;
-    for (i=0;i<256;++i) tetsu_set_palette((u16)i,fade_yuv(a->palette[i],level));
+    for (i=0;i<256;++i) pal_set((u16)i,fade_yuv(a->palette[i],level));
 }
 
 static void set_title_exact_palette_fade(int level)
 {
     int i;
     for (i=0;i<256;++i)
-        tetsu_set_palette((u16)i,fade_yuv(g_title_exact_palette[i],level));
+        pal_set((u16)i,fade_yuv(g_title_exact_palette[i],level));
 }
 
 static void upload_tiles(int chip, u16 base, const BgAsset *a)
@@ -1174,7 +1302,7 @@ static void boot_exact_apply(unsigned frame)
     n=*p++;
     for (i=0;i<n;++i) {
         u16 pi=*p++, value=*p++;
-        tetsu_set_palette(pi,value);
+        pal_set(pi,value);
         g_title_exact_palette[pi]=value;
     }
     n=*p++;
@@ -1448,10 +1576,10 @@ static void upload_game_sprites(void)
     /* Keep a dedicated copy of the player palette for boss rooms. Normal
        stages use source palette line 0 directly; every generated level carries
        the same Mario/object colors there. */
-    for (i=0;i<16;++i) tetsu_set_palette((u16)(MARIO_BOSS_SPR_PAL*16+i),g_player_palette[i]);
-    for (i=0;i<16;++i) tetsu_set_palette((u16)(LUIGI_SPR_PAL*16+i),g_luigi_reuse_palette[i]);
-    for (i=0;i<16;++i) tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),g_continue_player_palette[i]);
-    if(g_in_boss)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_CROUCH_SPR_PAL*16+i),g_continue_player_palette[i]);
+    for (i=0;i<16;++i) pal_set((u16)(MARIO_BOSS_SPR_PAL*16+i),g_player_palette[i]);
+    for (i=0;i<16;++i) pal_set((u16)(LUIGI_SPR_PAL*16+i),g_luigi_reuse_palette[i]);
+    for (i=0;i<16;++i) pal_set((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),g_continue_player_palette[i]);
+    if(g_in_boss)for(i=0;i<16;++i)pal_set((u16)(BOSS_CROUCH_SPR_PAL*16+i),g_continue_player_palette[i]);
 
     upload_sprite_words(FRONT_CHIP,PLAYER_BASE_WORD,g_player_frame_words,
                         PLAYER_FRAME_COUNT*PLAYER_FRAME_WORDS_LOCAL);
@@ -1497,7 +1625,7 @@ static void upload_game_sprites(void)
         const StageObjectData *so=stage_objects();
         if (so->word_count) {
             upload_world_sprite_words(STAGE_OBJECT_BASE_WORD,so->words,so->word_count);
-            for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),so->palette[i]);
+            for(i=0;i<16;++i)pal_set((u16)(LEVEL8_OBJ_SPR_PAL*16+i),so->palette[i]);
         }
     }
 
@@ -1525,7 +1653,7 @@ static void upload_game_sprites(void)
             int gi=g_level->variant_ids[i]; const EnemyVariantData *v=&g_enemy_variants[gi]; int line=-1;
             int fw=enemy_frame_words(v);
             for(j=0;j<uniq;++j) if(palettes_equal(seen[j],v->palette)){ line=4+j; break; }
-            if(line<0){ seen[uniq]=v->palette; line=4+uniq; for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),v->palette[j]); ++uniq; }
+            if(line<0){ seen[uniq]=v->palette; line=4+uniq; for(j=0;j<16;++j)pal_set((u16)(line*16+j),v->palette[j]); ++uniq; }
             g_enemy_palette_line[i]=(unsigned char)line;
             g_enemy_vram[i]=(u16)walk_top;
             upload_world_sprite_words((u16)walk_top,v->words,(unsigned)(fw*2));
@@ -1587,58 +1715,59 @@ static void upload_game_sprites(void)
     }
 }
 
+static void overlay_set_palette(int level);
+
 static void set_game_palette_fade(int level)
 {
     int i,j,uniq=0; const unsigned short *seen[12];
     const BossVisualData *bv=(g_in_boss&&g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;
     const BossRoomData *br=(g_in_boss&&g_boss_class==0)?&g_bowser_rooms[(g_current_level==5)?1:0]:0;
     const unsigned short *pal = g_in_boss ? (bv?bv->bg_palette:br->palette) : g_level->palette;
-    for(i=0;i<256;++i)tetsu_set_palette((u16)i,fade_yuv(pal[i],level));
-    for(i=0;i<16;++i)tetsu_set_palette((u16)(MARIO_BOSS_SPR_PAL*16+i),fade_yuv(g_player_palette[i],level));
-    if(multiplayer_active())for(i=0;i<16;++i)
-        tetsu_set_palette((u16)(LUIGI_SPR_PAL*16+i),fade_yuv(g_luigi_reuse_palette[i],level));
-    for(i=0;i<16;++i)tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
+    for(i=0;i<256;++i)pal_set((u16)i,fade_yuv(pal[i],level));
+    pal_set_line(MARIO_BOSS_SPR_PAL,g_player_palette,level);
+    if(multiplayer_active())pal_set_line(LUIGI_SPR_PAL,g_luigi_reuse_palette,level);
+    pal_set_line(CONTINUE_PLAYER_SPR_PAL,g_continue_player_palette,level);
     if(g_in_boss){
         if(bv){
             for(j=0;j<bv->palette_count;++j){
                 int line=j?BOSS_SPR_PAL_AUX:BOSS_SPR_PAL;
-                for(i=0;i<16;++i)tetsu_set_palette((u16)(line*16+i),fade_yuv(bv->sprite_palettes[j*16+i],level));
+                pal_set_line(line,bv->sprite_palettes+j*16,level);
             }
-        }else for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_SPR_PAL*16+i),fade_yuv(g_bowser_palette[i],level));
+        }else pal_set_line(BOSS_SPR_PAL,g_bowser_palette,level);
     }
-    if(g_in_boss&&g_boss_class>0)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_AUX_SPR_PAL*16+i),fade_yuv(g_final_aux_palette[i],level));
+    if(g_in_boss&&g_boss_class>0)pal_set_line(BOSS_AUX_SPR_PAL,g_final_aux_palette,level);
     if(g_in_boss&&g_boss_class>0){
         const unsigned short *item_pal=g_boss_pot_palette;
         if(g_boss_class==3)item_pal=g_boss_bomb_palette;
         else if(g_boss_class==2)item_pal=g_boss_crate4_palette;
         else if(g_boss_class==4)item_pal=g_boss_bell_palette;
-        for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(item_pal[i],level));
+        pal_set_line(BOSS_ITEM_SPR_PAL,item_pal,level);
     }
-    if(g_in_boss&&g_boss_class==1)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_WATER_SPR_PAL*16+i),fade_yuv(g_boss_water_palette[i],level));
-    if(g_in_boss&&g_boss_class==3)for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS13_PLATFORM_SPR_PAL*16+i),fade_yuv(g_boss13_platform_palette[i],level));
+    if(g_in_boss&&g_boss_class==1)pal_set_line(BOSS_WATER_SPR_PAL,g_boss_water_palette,level);
+    if(g_in_boss&&g_boss_class==3)pal_set_line(BOSS13_PLATFORM_SPR_PAL,g_boss13_platform_palette,level);
     else if(!g_in_boss&&g_level){
         for(i=0;i<g_level->variant_count;++i){
             const EnemyVariantData *v=&g_enemy_variants[g_level->variant_ids[i]]; int line=-1;
             for(j=0;j<uniq;++j)if(palettes_equal(seen[j],v->palette)){line=4+j;break;}
             if(line<0){seen[uniq]=v->palette;line=4+uniq;++uniq;}
             g_enemy_palette_line[i]=(unsigned char)line;
-            for(j=0;j<16;++j)tetsu_set_palette((u16)(line*16+j),fade_yuv(v->palette[j],level));
+            pal_set_line(line,v->palette,level);
         }
     }
     /* Boss 3's stage object is the supplied pot.  Normal stages, including
        World 3 and all later worlds, keep the ordinary crate palette. */
     if(g_in_boss&&g_boss_class==1)
-        for(i=0;i<16;++i)tetsu_set_palette((u16)(BOSS_ITEM_SPR_PAL*16+i),fade_yuv(g_boss_pot_palette[i],level));
+        pal_set_line(BOSS_ITEM_SPR_PAL,g_boss_pot_palette,level);
     /* Level 8's carriers and wedges are all on source palette line 2. */
     if(!g_in_boss&&g_current_level==7)
-        for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),fade_yuv(g_level8_object_palette[i],level));
+        pal_set_line(LEVEL8_OBJ_SPR_PAL,g_level8_object_palette,level);
     else if(stage_objects()->palette)
-        for(i=0;i<16;++i)tetsu_set_palette((u16)(LEVEL8_OBJ_SPR_PAL*16+i),fade_yuv(stage_objects()->palette[i],level));
+        pal_set_line(LEVEL8_OBJ_SPR_PAL,stage_objects()->palette,level);
     /* Boss bodies own palette line 14, which the continue room normally uses
        for the separately indexed crouch art. Keep an independent boss-room
        copy after every boss/background palette update. */
-    if(g_in_boss)for(i=0;i<16;++i)
-        tetsu_set_palette((u16)(BOSS_CROUCH_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
+    if(g_in_boss)pal_set_line(BOSS_CROUCH_SPR_PAL,g_continue_player_palette,level);
+    overlay_set_palette(level);
     g_game_fade_level=level;
 }
 
@@ -1671,14 +1800,14 @@ static unsigned char g_palette_cycle_shift[PALETTE_CYCLE_COUNT];
 static void update_gear_palette(void)
 {
     int c,i;
-    if (g_in_boss||!g_level||g_game_fade_level!=16) return;
+    if (g_in_boss||!g_level||g_game_fade_level!=FADE_FULL) return;
     for (c=0;c<PALETTE_CYCLE_COUNT;++c) {
         const PaletteCycle *p=&g_palette_cycles[c];
         if (g_current_level<p->level_lo||g_current_level>p->level_hi) continue;
         if ((g_state_frame%p->period)!=0) continue;
         g_palette_cycle_shift[c]=(unsigned char)((g_palette_cycle_shift[c]+2)%3);
         for (i=0;i<3;++i)
-            tetsu_set_palette((u16)(p->first+i),
+            pal_set((u16)(p->first+i),
                 g_level->palette[p->first+(i+g_palette_cycle_shift[c])%3]);
     }
 }
@@ -2020,6 +2149,158 @@ static void upload_level_backdrop(void)
     }
 }
 
+/* ---- World 3's cellophane layer ---------------------------------------
+   The Mega Drive fakes translucency in this stage family by dithering the
+   foreground plane against the stage plane behind it: the canopy shadow and
+   level 8's water are 1-pixel checkerboards of a single colour.  The PC-FX
+   blends for real, so tools/level_overlay.py lifts those regions out of the
+   VDC plane and stores them as a solid 4-colour image, which KING BG0 draws
+   here.  The HuC6261 mixes BG0 with the layer behind it using coefficient 1,
+   set to 4/8 on both sides for an even 50% blend.  On the Mega Drive the
+   dithered plane is in front of the sprites, so BG0 outranks the VDC sprites
+   too and the band tints the player and the enemies under it -- except across
+   the HUD's own scanlines, where a raster split drops BG0 back between the two
+   VDC layers so the score row reads at full contrast.
+
+   The overlay shares the backdrop plane's geometry: 512 pixels wide, wrapping
+   with it, and is stored as 8x8 cells that the whole stage family pools.
+   Palette bank 15 is free during gameplay (only the boss rooms use it), so
+   BG0's four colours live there. */
+#define OVERLAY_PAL_BASE 240
+#define OVERLAY_KRAM_LINES 256
+
+/* Only the priority word is written from outside libpcfx, and only from the
+   raster IRQ, so the address port has to be restored the way the VDC selector
+   is.  The port constants themselves sit with the palette publisher above. */
+#define VCE_REG_PRIO_KING 9  /* BG0..BG3 priority, four bits each */
+
+/* BG0's priority field, with the VDC background on 1 and the VDC sprites on
+   3: 4 puts the band in front of everything the VDCs draw, 2 puts it back
+   between the two so the sprites win.  The other three KING planes are not
+   displayed, so their fields stay zero. */
+#define OVERLAY_PRIO_OVER_SPRITES  4
+#define OVERLAY_PRIO_UNDER_SPRITES 2
+
+/* The HUD's sprites run from the life icon's top row to the bottom of the
+   digit/heart row; emit_game_sprites() places them at 209 and 217 with no
+   vertical offset in the levels that carry an overlay. */
+#define OVERLAY_HUD_FIRST_LINE 209
+#define OVERLAY_HUD_LAST_LINE  232
+
+static int g_overlay_active;
+static volatile unsigned char g_overlay_split_active;
+static volatile unsigned char g_overlay_split_phase;
+
+/* The VCE latches its priority register at each hblank, so writing it from a
+   raster IRQ changes the ordering from the following line onwards. */
+static void overlay_set_king_priority(u16 prio)
+{
+    out16(VCE_REG_PORT,VCE_REG_PRIO_KING);
+    out16(VCE_DATA_PORT,prio);
+}
+
+static const LevelOverlayData *level_overlay(void)
+{
+    const LevelOverlayData *ov;
+    if(g_in_boss||!g_level||g_current_level<0||g_current_level>=19)return 0;
+    ov=&g_level_overlays[g_current_level];
+    return ov->rows?ov:0;
+}
+
+static void overlay_set_palette(int level)
+{
+    const LevelOverlayData *ov=level_overlay();
+    int i;
+    if(!ov)return;
+    for(i=0;i<4;++i)
+        pal_set((u16)(OVERLAY_PAL_BASE+i),fade_yuv(ov->palette[i],level));
+}
+
+static void overlay_disable(void)
+{
+    if(!g_overlay_active)return;
+    g_overlay_active=0;
+    g_overlay_split_active=0;
+    g_overlay_split_phase=0;
+    vdc_set_raster(BACK_CHIP,0);
+    king_disable_microprogram();
+    king_set_bg_prio(KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,
+                     KING_BGPRIO_HIDE,0);
+    tetsu_set_cellophane_control(0,0,TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_NO_COEFF,
+                                 TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_NO_COEFF,
+                                 TETSU_NO_COEFF);
+    tetsu_set_priorities(1,2,0,0,0,0,0);
+    set_display_layers(0);
+}
+
+static void overlay_upload(void)
+{
+    const LevelOverlayData *ov=level_overlay();
+    signed char rowmap[LEVEL_OVERLAY_ROWS];
+    u16 mprog[16];
+    int y,x,i,hud;
+
+    if(!ov){overlay_disable();return;}
+    hud=level_blank_hud_band();
+    for(i=0;i<LEVEL_OVERLAY_ROWS;++i)rowmap[i]=-1;
+    for(i=0;i<ov->row_count;++i)rowmap[ov->rows[i]]=(signed char)i;
+
+    /* The ADPCM bank owns KRAM page 1; the overlay image is the only user of
+       page 0, so it starts at word zero and is written as one linear run. */
+    king_set_kram_pages(0,0,0,1);
+    king_set_kram_write(0,1);
+    for(y=0;y<OVERLAY_KRAM_LINES;++y){
+        const unsigned char *cells=0;
+        if(y<LEVEL_OVERLAY_ROWS*8&&!(hud&&y>=HUD_BAND_FIRST_ROW*8)){
+            int band=rowmap[y>>3];
+            if(band>=0)cells=ov->cells+band*LEVEL_OVERLAY_CELLS;
+        }
+        if(!cells){
+            for(x=0;x<LEVEL_OVERLAY_CELLS;++x)king_kram_write(0);
+            continue;
+        }
+        for(x=0;x<LEVEL_OVERLAY_CELLS;++x){
+            int tile=cells[x];
+            king_kram_write(tile?ov->tiles[(tile-1)*8+(y&7)]:0);
+        }
+    }
+
+    king_set_bg_mode(KING_BGMODE_4_PAL,0,0,0);
+    king_set_bg_size(KING_BG0,KING_BGSIZE_256,KING_BGSIZE_512,
+                     KING_BGSIZE_256,KING_BGSIZE_512);
+    king_set_bat_cg_addr(KING_BG0,0,0);
+    king_set_bat_cg_addr(KING_BG0SUB,0,0);
+    king_set_scroll(KING_BG0,0,0);
+    king_set_bg_prio(KING_BGPRIO_0,KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,
+                     KING_BGPRIO_HIDE,0);
+    /* One CG fetch covers eight 4-colour pixels; the rest of the slots idle. */
+    mprog[0]=KING_CODE_BG0_CG_0;
+    for(i=1;i<16;++i)mprog[i]=KING_CODE_NOP;
+    king_disable_microprogram();
+    king_write_microprogram(mprog,0,16);
+    king_enable_microprogram();
+
+    tetsu_set_king_palette(OVERLAY_PAL_BASE,0,0,0);
+    /* KING BG0 is published by the HuC6261 picture mode, not by either VDC's
+       display bit, so blanking both VDC outputs for a level load does not
+       blank the band.  Bring it up black and let the caller's fade raise it,
+       or the freshly uploaded band flashes at full colour over the black
+       screen for the frames the rest of the load takes. */
+    overlay_set_palette(0);
+    /* The frame opens with the band in front of the sprites; overlay_split_arm()
+       re-publishes this every frame and the raster IRQ lowers it for the HUD. */
+    tetsu_set_priorities(1,3,OVERLAY_PRIO_OVER_SPRITES,0,0,0,0);
+    tetsu_set_cellophane_coeffs(1,4,4,4,4,4,4);
+    /* Neither front nor back cellophane: those replace the hindmost layer with
+       a constant colour, while plain per-layer cellophane blends BG0 with the
+       VDC picture underneath, which is what the dither stood in for. */
+    tetsu_set_cellophane_control(0,0,TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_COEFF_1,
+                                 TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_NO_COEFF,
+                                 TETSU_NO_COEFF);
+    set_display_layers(1);
+    g_overlay_active=1;
+}
+
 static void init_level_ring(void)
 {
     int col,i,chip;
@@ -2042,7 +2323,11 @@ static void init_level_ring(void)
     vdc_set_scroll(BACK_CHIP,0,0);
     vdc_set_scroll(FRONT_CHIP,0,0);
     vdc_set_scroll(level_stage_chip(),0,(u16)(g_camera_y&0x00FF));
-    upload_game_sprites(); set_game_palette_fade(16);
+    overlay_upload();
+    /* Publish every palette black: start_gameplay() re-publishes at the level
+       the caller asked for once the whole load has finished, and the KING
+       overlay band is visible during the load even with both VDCs blanked. */
+    upload_game_sprites(); set_game_palette_fade(0); pal_publish();
 }
 
 static unsigned char collision_at(int x,int y)
@@ -2581,6 +2866,17 @@ __attribute__ ((interrupt_handler)) static void parallax_vdc_irq(void)
             g_parallax_irq_phase=(unsigned char)phase;
             vdc_setreg(BACK_CHIP,VDC_REG_BXR,g_parallax_bxr[phase]);
             vdc_set_raster(BACK_CHIP,next_raster[phase-1]);
+        }else if(g_overlay_split_active && g_overlay_split_phase<2){
+            /* The main loop can be part-way through its own VCE access, so the
+               address port is saved and restored exactly like the VDC's. */
+            u16 saved_vce=(u16)(in16(VCE_REG_PORT)&0x1F);
+            unsigned ophase=(unsigned)g_overlay_split_phase+1;
+            g_overlay_split_phase=(unsigned char)ophase;
+            overlay_set_king_priority((ophase==1)?OVERLAY_PRIO_UNDER_SPRITES
+                                                :OVERLAY_PRIO_OVER_SPRITES);
+            out16(VCE_REG_PORT,saved_vce);
+            vdc_set_raster(BACK_CHIP,(ophase==1)
+                           ?(OVERLAY_HUD_LAST_LINE+PARALLAX_RCR_BIAS):0);
         }else{
             /* RCR=0 cannot match the 7UP's visible counter (RCR-64). */
             vdc_set_raster(BACK_CHIP,0);
@@ -2634,6 +2930,30 @@ static void backdrop_parallax_arm(void)
                (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IRQ_RC));
 }
 
+/* Arm the HUD priority split for the levels whose cellophane band is in front
+   of the sprites.  The band is re-published at full priority here, in the
+   frame boundary the main loop has just waited for, so a frame that misses its
+   second IRQ still opens correctly. */
+static void overlay_split_arm(void)
+{
+    if(!g_overlay_active){
+        if(g_overlay_split_active){
+            g_overlay_split_active=0;
+            /* Slot 9 owns the raster compare on its own levels. */
+            if(!g_parallax_irq_active)vdc_set_raster(BACK_CHIP,0);
+        }
+        return;
+    }
+    g_overlay_split_phase=0;
+    g_overlay_split_active=1;
+    overlay_set_king_priority(OVERLAY_PRIO_OVER_SPRITES);
+    /* The compare is raised at the end of the matched line, so match the line
+       above the first the HUD covers. */
+    vdc_set_raster(BACK_CHIP,OVERLAY_HUD_FIRST_LINE-1+PARALLAX_RCR_BIAS);
+    vdc_setreg(BACK_CHIP,VDC_REG_CR,
+               (u16)(VDC_CR_BB|VDC_CR_SB|VDC_CR_IRQ_RC));
+}
+
 static void commit_stage_camera(void)
 {
     int stage_chip,backdrop_chip;
@@ -2658,6 +2978,8 @@ static void commit_stage_camera(void)
        colour as the level scrolls.  Lock it to the stage rate. */
     vdc_set_scroll(backdrop_chip,
                    (u16)((level_uses_front_backdrop()?g_camera_x:(g_camera_x>>1))&0x01FF),0);
+    /* The cellophane layer is part of that same plane, so it takes its scroll. */
+    if(g_overlay_active)king_set_scroll(KING_BG0,(s16)(g_camera_x&0x01FF),0);
 }
 
 
@@ -5393,12 +5715,12 @@ static void set_continue_palette_fade(int level)
 {
     int i;
     for (i=0;i<256;++i)
-        tetsu_set_palette((u16)i,fade_yuv(g_continue_base_asset.palette[i],level));
+        pal_set((u16)i,fade_yuv(g_continue_base_asset.palette[i],level));
     for (i=0;i<16;++i)
-        tetsu_set_palette((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
+        pal_set((u16)(CONTINUE_PLAYER_SPR_PAL*16+i),fade_yuv(g_continue_player_palette[i],level));
     /* Large countdown digit uses dedicated sprite palette line 15. */
     for (i=0;i<16;++i)
-        tetsu_set_palette((u16)(240+i),fade_yuv(g_continue_digit_palette[i],level));
+        pal_set((u16)(240+i),fade_yuv(g_continue_digit_palette[i],level));
 }
 
 static void draw_continue_digit(void)
@@ -5469,6 +5791,7 @@ static void start_boss(int fade_in)
     const BossVisualData *bv;
     const BossRoomData *br;
     g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32; g_level_rows=1;
+    overlay_disable();
     music_transition_to_boss();
     g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
@@ -5577,7 +5900,7 @@ static void start_boss(int fade_in)
     g_boss_hp=(int)g_boss_hp_1p[g_current_level];
     if(g_boss_hp<=0)g_boss_hp=8;
     g_boss_timer=0;g_boss_invuln=0;g_boss_defeated=0;g_boss_shot_active=0;g_boss_shot_vy=0;g_boss_drop_rng=0xF2A74DE4u;g_boss_random_drop_timer=72;g_after_boss=0;
-    g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:16);
+    g_player_mode=fade_in?PMODE_FADE_IN:PMODE_NORMAL;set_game_palette_fade(fade_in?0:FADE_FULL);
     if(multiplayer_active()&&!g_luigi.out){
         g_luigi.x=g_player_x+24*FIX_ONE;g_luigi.y=g_player_y;
         g_luigi.vx=g_luigi.vy=0;g_luigi.grounded=g_grounded;g_luigi.facing=1;
@@ -6675,7 +6998,7 @@ static void start_gameplay(int fade_in)
         g_luigi.carry_index=-1;g_luigi.lift_timer=0;g_luigi.throw_timer=0;g_luigi.crate_hide=0;
     }
     {int c;for(c=0;c<PALETTE_CYCLE_COUNT;++c)g_palette_cycle_shift[c]=0;}
-    set_game_palette_fade(fade_in?0:16);
+    set_game_palette_fade(fade_in?0:FADE_FULL);
     /* Both VDC outputs are disabled above and all palettes are now black. */
     music_start_at_black();
     update_camera();
@@ -6745,7 +7068,7 @@ static void update_play(u16 btn, u16 pressed)
     if (g_player_mode==PMODE_FADE_OUT) {
         int level;
         ++g_death_timer;
-        level=16-(g_death_timer*16/48);
+        level=FADE_FULL-(g_death_timer*FADE_FULL/48);
         if (level<0) level=0;
         set_game_palette_fade(level);
         draw_game_sprites();
@@ -6766,12 +7089,12 @@ static void update_play(u16 btn, u16 pressed)
     if (g_player_mode==PMODE_FADE_IN) {
         int level;
         ++g_death_timer;
-        level=g_death_timer*16/48;
-        if (level>16) level=16;
+        level=g_death_timer*FADE_FULL/48;
+        if (level>FADE_FULL) level=FADE_FULL;
         set_game_palette_fade(level);
         draw_game_sprites();
         if (g_death_timer>=48) {
-            set_game_palette_fade(16);
+            set_game_palette_fade(FADE_FULL);
             g_player_mode=PMODE_NORMAL;
             g_death_timer=0;
         }
@@ -6928,6 +7251,17 @@ static void update_play(u16 btn, u16 pressed)
     /* $16928-$1699A in the 68000 program advances ordinary stages, but for
        level slots 3,6,8,10,13,16,19 it sets FF00A8=1 and re-enters the level
        loader in boss mode. The PC-FX port keeps exactly that boss-bearing list. */
+#ifdef FORCE_EXIT_AFTER
+    /* Build with EXTRA_CFLAGS=-DFORCE_EXIT_AFTER=<frames> to end the stage on a
+       timer instead of at its exit, so a headless capture can reach a
+       level-to-level transition without playing the level. */
+    if(!g_in_boss && g_state_frame>=(unsigned)FORCE_EXIT_AFTER){
+        g_after_boss=0;
+        if(g_boss_level_flags[g_current_level]) music_stop_for_transition();
+        else music_prepare_level_transition(g_current_level+1);
+        g_state=STATE_LEVEL_FADE; g_state_frame=0; return;
+    }
+#endif
     /* $143EA ends the stage when the route walk runs off its $8888 terminator,
        i.e. on leaving the last screen of the route -- not the right edge of the
        grid's bounding box, which a climbing level never reaches. */
@@ -7003,8 +7337,8 @@ static void set_front_sprite_fade(int level)
     /* Keep opening sprites completely separate from the exact-title BG
        palettes: line 15 = Mario/Luigi, line 14 = moon/coin. */
     for (i=0;i<16;++i) {
-        tetsu_set_palette((u16)(240+i),fade_yuv(g_player_palette[i],level));
-        tetsu_set_palette((u16)(224+i),fade_yuv(g_coin_palette[i],level));
+        pal_set((u16)(240+i),fade_yuv(g_player_palette[i],level));
+        pal_set((u16)(224+i),fade_yuv(g_coin_palette[i],level));
     }
 }
 
@@ -7055,8 +7389,8 @@ static void draw_boot_motion(unsigned f)
         mx=96; lx=132; py=153; walk=1;
     }
 
-    fade=(sf<108)?(int)((sf-60)*16/48):16;
-    if (fade<0) fade=0; if (fade>16) fade=16;
+    fade=(sf<108)?(int)((sf-60)*FADE_FULL/48):FADE_FULL;
+    if (fade<0) fade=0; if (fade>FADE_FULL) fade=FADE_FULL;
     set_front_sprite_fade(fade);
 
     add_front_player(satb,&n,mx,py,walk,BOOT_MARIO_BASE_WORD,1);
@@ -7124,8 +7458,8 @@ static void draw_menu_people(int walking)
     /* The menu pair shares Mario's indexed patterns, as it does in gameplay;
        palette selection alone distinguishes Luigi. */
     for (i=0;i<16;++i) {
-        tetsu_set_palette((u16)(240+i),fade_yuv(g_menu_mario_palette[i],g_menu_sprite_fade));
-        tetsu_set_palette((u16)(LUIGI_SPR_PAL*16+i),
+        pal_set((u16)(240+i),fade_yuv(g_menu_mario_palette[i],g_menu_sprite_fade));
+        pal_set((u16)(LUIGI_SPR_PAL*16+i),
                           fade_yuv(g_luigi_reuse_palette[i],g_menu_sprite_fade));
     }
 
@@ -7383,7 +7717,7 @@ static void staff_build_palette(void)
 static void set_staff_palette_fade(int level)
 {
     int i;
-    for (i=0;i<256;++i) tetsu_set_palette((u16)i,fade_yuv(g_staff_palette[i],level));
+    for (i=0;i<256;++i) pal_set((u16)i,fade_yuv(g_staff_palette[i],level));
 }
 
 /* Twinkle by rotating the three star brightnesses through palette 1..3 rather
@@ -7393,7 +7727,7 @@ static void staff_twinkle(int level)
     static const u16 ramp[3]={0x6298,0xB298,0xFF88};
     int phase=(int)((g_state_frame/20)%3),i;
     for (i=0;i<3;++i)
-        tetsu_set_palette((u16)(1+i),fade_yuv(ramp[(i+phase)%3],level));
+        pal_set((u16)(1+i),fade_yuv(ramp[(i+phase)%3],level));
 }
 
 static void staff_fill_row(int abs_row)
@@ -7481,7 +7815,7 @@ static void enter_staff(void)
        uploads below span more than one frame. */
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
     vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
-    for (i=0;i<256;++i) tetsu_set_palette((u16)i,YUV_BLACK);
+    for (i=0;i<256;++i) pal_set((u16)i,YUV_BLACK);
     clear_satb();
     clear_bat(FRONT_CHIP,FG_BAT_WORDS);
     /* VDC0 keeps its full 64x64 map for the star drift; VDC1 wraps every 256
@@ -7528,7 +7862,7 @@ static void update_staff(u16 pressed)
         return;
     }
     if (g_state==STATE_STAFF_OUT) {
-        level=16-(int)(g_state_frame*16/STAFF_FADE_FRAMES);
+        level=FADE_FULL-(int)(g_state_frame*FADE_FULL/STAFF_FADE_FRAMES);
         if (level<0) level=0;
         set_staff_palette_fade(level);
         if (g_state_frame>=(unsigned)STAFF_FADE_FRAMES) {
@@ -7541,7 +7875,7 @@ static void update_staff(u16 pressed)
     }
 
     if (g_state_frame<(unsigned)STAFF_FADE_FRAMES) {
-        level=(int)(g_state_frame*16/STAFF_FADE_FRAMES);
+        level=(int)(g_state_frame*FADE_FULL/STAFF_FADE_FRAMES);
         set_staff_palette_fade(level);
     } else {
         /* Past the fade the palette is static, so only the three star entries
@@ -7609,10 +7943,10 @@ static void enter_title_fade(void)
 static void enter_menu(void)
 {
     g_menu_choice=MENU_1P;
-    g_menu_sprite_fade=16;
+    g_menu_sprite_fade=FADE_FULL;
     show_menu_back(g_menu_choice);
     menu_overlay_prepare();
-    set_asset_palette_fade(&g_menu_combo_asset,16);
+    set_asset_palette_fade(&g_menu_combo_asset,FADE_FULL);
     menu_overlay_enable();
     g_state=STATE_MENU;
     g_state_frame=0;
@@ -7641,42 +7975,46 @@ static void update_frontend(u16 pressed)
             }
         }
     } else if (g_state==STATE_TITLE_FADE) {
-        /* Captured MD timing from START at frame 650: black by ~740, menu
-           begins returning after ~760 and is fully bright at ~840. */
-        if (g_state_frame<90) {
-            int level=16-(int)(g_state_frame*16/90);
+        /* Timings measured off the Mega Drive in BlastEm, START at frame 650:
+           the title is black 80 frames later, holds black for 35, and the menu
+           is fully bright 178 frames after START.  The port used to spend 90
+           and 80 frames on the two ramps with only a 20-frame gap between
+           them, which is where the transition read as sluggish. */
+        if (g_state_frame<TITLE_FADE_OUT) {
+            int level=FADE_FULL-(int)(g_state_frame*FADE_FULL/TITLE_FADE_OUT);
             set_title_exact_palette_fade(level);
             clear_front_sprites();
             set_front_sprites_enabled(0);
-        } else if (g_state_frame<110) {
-            if (g_state_frame==90) {
+        } else if (g_state_frame<TITLE_FADE_IN_START) {
+            if (g_state_frame==TITLE_FADE_OUT) {
                 /* Give the output-disable write a complete frame to latch.
                    Starting the long upload here can otherwise retain one
                    bright scanline from the old screen at the frame boundary. */
                 vdc_setreg(BACK_CHIP,VDC_REG_CR,0);
                 vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
                 set_title_exact_palette_fade(0);
-            } else if (g_state_frame==91) {
+            } else if (g_state_frame==TITLE_FADE_OUT+1) {
                 load_menu_asset();
                 g_menu_choice=MENU_1P;
                 g_menu_sprite_fade=0;
                 vdc_set_scroll(BACK_CHIP,0,256);
                 menu_overlay_prepare();
                 set_asset_palette_fade(&g_menu_combo_asset,0);
-            } else if (g_state_frame==92) {
+            } else if (g_state_frame==TITLE_FADE_OUT+2) {
                 menu_overlay_enable();
             }
             clear_front_sprites();
-        } else if (g_state_frame<190) {
-            int level=(int)((g_state_frame-110)*16/80);
-            if (level>16) level=16;
+        } else if (g_state_frame<TITLE_FADE_DONE) {
+            int level=(int)((g_state_frame-TITLE_FADE_IN_START)*FADE_FULL/
+                            (TITLE_FADE_DONE-TITLE_FADE_IN_START));
+            if (level>FADE_FULL) level=FADE_FULL;
             g_menu_sprite_fade=level;
             set_asset_palette_fade(&g_menu_combo_asset,level);
             draw_menu_people(0);
         } else {
             g_menu_choice=MENU_1P;
-            g_menu_sprite_fade=16;
-            set_asset_palette_fade(&g_menu_combo_asset,16);
+            g_menu_sprite_fade=FADE_FULL;
+            set_asset_palette_fade(&g_menu_combo_asset,FADE_FULL);
             g_state=STATE_MENU;
             g_state_frame=0;
             draw_menu_people(0);
@@ -7725,7 +8063,7 @@ static void update_frontend(u16 pressed)
             /* Include both endpoints: frame 156 is fully bright and frame
                203 is fully black. The old /48 interpolation stopped at
                level 1, leaving a dim menu frame during the stage handoff. */
-            int level=16-(int)((g_state_frame-156)*16/47);
+            int level=FADE_FULL-(int)((g_state_frame-156)*FADE_FULL/47);
             if (level<0) level=0;
             set_asset_palette_fade(&g_menu_combo_asset,level);
             clear_front_sprites();
@@ -7766,7 +8104,7 @@ static void update_frontend(u16 pressed)
         }
     } else if (g_state==STATE_CONTINUE) {
         unsigned elapsed=g_state_frame;
-        int level=(elapsed<24)?(int)(elapsed*16/24):16;
+        int level=(elapsed<24)?(int)(elapsed*FADE_FULL/24):FADE_FULL;
         int d=9-(int)((elapsed>24?(elapsed-24):0)/64);
         if (d<0) d=0;
         if (d!=g_continue_digit) g_continue_digit=d;
@@ -7785,7 +8123,7 @@ static void update_frontend(u16 pressed)
             g_continue_resume=0; g_state=STATE_CONTINUE_FADE; g_state_frame=0; return;
         }
     } else if (g_state==STATE_CONTINUE_FADE) {
-        int level=16-(int)(g_state_frame*16/32); if (level<0) level=0;
+        int level=FADE_FULL-(int)(g_state_frame*FADE_FULL/32); if (level<0) level=0;
         set_continue_palette_fade(level); clear_front_sprites(); set_front_sprites_enabled(0);
         if (g_state_frame>=32) {
             Stop_Sound_Sample(SFX_MENU_CONFIRM,0);
@@ -7797,7 +8135,7 @@ static void update_frontend(u16 pressed)
             return;
         }
     } else if (g_state==STATE_LEVEL_FADE) {
-        int level=16-(int)(g_state_frame*16/32); if(level<0)level=0;
+        int level=FADE_FULL-(int)(g_state_frame*FADE_FULL/32); if(level<0)level=0;
         set_game_palette_fade(level); draw_game_sprites();
         if(g_state_frame>=32){
             /* Keep the live SATB visible through the fade.  Once both the
@@ -7835,6 +8173,10 @@ int main(void)
     for (;;) {
         u16 btn, pressed, btn2=0, pressed2=0;
         wait_frame();
+        /* First thing in the blanking interval, before the VRAM traffic: the
+           colour palette RAM is the one target the HuC6261 forbids touching
+           while the picture is being displayed. */
+        pal_publish();
         /* Publish queued ring rows at the same frame boundary as their scroll,
            with the data write first.  This is the only safe ordering once the
            dual-VDC SATB uploads make the preceding frame's workload variable. */
@@ -7842,9 +8184,15 @@ int main(void)
         if (g_state==STATE_PLAY || g_state==STATE_LEVEL_FADE) {
             commit_stage_camera();
             backdrop_parallax_arm();
+            overlay_split_arm();
         }
         else if (g_state==STATE_STAFF)
             commit_staff_scroll();
+        /* Every other screen owns the whole picture, and the cellophane layer
+           is anchored to the stage's rasters, so retire it on the way out. */
+        if (g_state!=STATE_PLAY && g_state!=STATE_LEVEL_FADE &&
+            g_state!=STATE_STAGE_PREP && g_state!=STATE_STAGE_LOAD)
+            overlay_disable();
         btn = read_buttons();
         pressed = (u16)(btn & (u16)~g_prev_buttons);
         g_prev_buttons = btn;

@@ -6,6 +6,14 @@ typedef struct { const unsigned short *words,*palette,*alt_words,*atk_words,*atk
 typedef struct { const unsigned short *palette,*tile_words,*bg_bat,*fg_bat; unsigned short tile_count; } BossRoomData;
 typedef struct { const unsigned short *bg_palette,*bg_tile_words,*bg_bat,*fg_tile_words,*fg_bat,*sprite_words,*sprite_palettes; const unsigned long long *sprite_masks; const unsigned char *sprite_cell_palettes; unsigned short bg_tile_count,fg_tile_count; unsigned char palette_count,frame_count,cols,rows; short spawn_x,spawn_y; } BossVisualData;
 typedef struct { unsigned char set_index, route_len; const unsigned char *route,*route_modes,*route_quadrants; const unsigned short *palette,*bg_bat; short spawn_x,spawn_y; unsigned short crate_count,gem_count,enemy_count; const short *crates,*gems,*enemies; unsigned char variant_count; const unsigned char *variant_ids; } GameLevelData;
+/* World 3's translucent foreground band, drawn by KING BG0 with cellophane.
+   Only the plane rows that carry anything are stored: `rows[i]` is the row and
+   `cells[i*64+x]` picks one of the stage family's shared 8x8 four-colour
+   `tiles` (8 words each, one-based; zero is the empty cell). */
+typedef struct { const unsigned char *rows,*cells; const unsigned short *tiles,*palette; unsigned char row_count; } LevelOverlayData;
+extern const LevelOverlayData g_level_overlays[19];
+#define LEVEL_OVERLAY_CELLS 64
+#define LEVEL_OVERLAY_ROWS 30
 extern const StageSetData g_stage_sets[12];
 extern const GameLevelData g_game_levels[19];
 extern const EnemyVariantData g_enemy_variants[];
