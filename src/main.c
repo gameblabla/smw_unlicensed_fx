@@ -2165,7 +2165,9 @@ static void upload_level_backdrop(void)
    The overlay shares the backdrop plane's geometry: 512 pixels wide, wrapping
    with it, and is stored as 8x8 cells that the whole stage family pools.
    Palette bank 15 is free during gameplay (only the boss rooms use it), so
-   BG0's four colours live there. */
+   BG0's sixteen colours live there -- world 3-1's band alone needs six, which
+   is why the layer is 4bpp; 4bpp is also the smallest KING mode that carries
+   them, at half the KRAM of the 256-colour one. */
 #define OVERLAY_PAL_BASE 240
 #define OVERLAY_KRAM_LINES 256
 
@@ -2212,7 +2214,7 @@ static void overlay_set_palette(int level)
     const LevelOverlayData *ov=level_overlay();
     int i;
     if(!ov)return;
-    for(i=0;i<4;++i)
+    for(i=0;i<LEVEL_OVERLAY_COLORS;++i)
         pal_set((u16)(OVERLAY_PAL_BASE+i),fade_yuv(ov->palette[i],level));
 }
 
@@ -2256,16 +2258,18 @@ static void overlay_upload(void)
             if(band>=0)cells=ov->cells+band*LEVEL_OVERLAY_CELLS;
         }
         if(!cells){
-            for(x=0;x<LEVEL_OVERLAY_CELLS;++x)king_kram_write(0);
+            for(x=0;x<LEVEL_OVERLAY_CELLS*2;++x)king_kram_write(0);
             continue;
         }
         for(x=0;x<LEVEL_OVERLAY_CELLS;++x){
             int tile=cells[x];
-            king_kram_write(tile?ov->tiles[(tile-1)*8+(y&7)]:0);
+            const unsigned short *w=tile?ov->tiles+(tile-1)*LEVEL_OVERLAY_CELL_WORDS+(y&7)*2:0;
+            king_kram_write(w?w[0]:0);
+            king_kram_write(w?w[1]:0);
         }
     }
 
-    king_set_bg_mode(KING_BGMODE_4_PAL,0,0,0);
+    king_set_bg_mode(KING_BGMODE_16_PAL,0,0,0);
     king_set_bg_size(KING_BG0,KING_BGSIZE_256,KING_BGSIZE_512,
                      KING_BGSIZE_256,KING_BGSIZE_512);
     king_set_bat_cg_addr(KING_BG0,0,0);
@@ -2273,9 +2277,12 @@ static void overlay_upload(void)
     king_set_scroll(KING_BG0,0,0);
     king_set_bg_prio(KING_BGPRIO_0,KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,
                      KING_BGPRIO_HIDE,0);
-    /* One CG fetch covers eight 4-colour pixels; the rest of the slots idle. */
+    /* Two CG fetches cover eight 16-colour pixels -- the doc (3.6.7.4) fixes
+       the count at the number of words the eight dots occupy and requires the
+       offsets to ascend within the eight-cycle bank.  The rest idle. */
     mprog[0]=KING_CODE_BG0_CG_0;
-    for(i=1;i<16;++i)mprog[i]=KING_CODE_NOP;
+    mprog[1]=KING_CODE_BG0_CG_1;
+    for(i=2;i<16;++i)mprog[i]=KING_CODE_NOP;
     king_disable_microprogram();
     king_write_microprogram(mprog,0,16);
     king_enable_microprogram();
