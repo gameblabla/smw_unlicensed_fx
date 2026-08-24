@@ -3844,8 +3844,10 @@ static void update_fireballs(void)
         if (!f->active) continue;
         f->x+=f->vx;
         x=(int)(f->x>>FIX_SHIFT); y=(int)(f->y>>FIX_SHIFT);
-        if ((f->vx>0 && solid_h(x+23,y+12)) || (f->vx<0 && solid_h(x,y+12)) ||
-            x<g_camera_x-32 || x>g_camera_x+288 || f->life==0) {
+        /* Fire is not stopped by the stage: it passes through ledges, walls
+           and everything else the map is made of, and only ends when it runs
+           out of life or leaves the camera's reach. */
+        if (x<g_camera_x-32 || x>g_camera_x+288 || f->life==0) {
             f->active=0; continue;
         }
         --f->life;
