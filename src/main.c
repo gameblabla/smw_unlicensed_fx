@@ -1126,6 +1126,41 @@ static void init_video(void)
     g_pal_dirty_lo=0; g_pal_dirty_hi=255;
 }
 
+/* ---- World 3's forest glare ------------------------------------------
+   Levels 6 and 7 are the only screens in the game that pair a full-intensity
+   white sky -- nearly a quarter of the picture -- with a near-black canopy
+   lattice drawn over it, and the port scrolls that pair at 2 pixels a frame
+   where the Mega Drive's 30 Hz main loop moved it about 1.15.  A high-contrast
+   grating in fast motion is exactly the pattern the eye cannot settle on, and
+   it is why these two levels read as harsh when nothing else in the port does.
+
+   The layers themselves are innocent: measured across 95 consecutive scrolling
+   frames, every 8-line band of the picture -- both VDC planes and the KING BG0
+   band -- moves by the identical step, so there is no split and no one-frame
+   lag between KING and the VDCs to fix.
+
+   What is left is the contrast itself.  Pull the two extremes of the level's
+   own palette towards the middle with a cubic shoulder: a colour already in
+   the mid range is left where the artist put it (Y=170 moves by one step),
+   while pure white and pure black each give up FOREST_GLARE_TENTHS/10 of their
+   distance from mid grey.  The sprite lines are republished after this, so
+   Mario and the cast keep their full range and stay legible against the
+   softened scenery. */
+#define FOREST_GLARE_TENTHS 3      /* 0 disables; 3 takes white 255 -> 217 */
+
+static int level_softens_glare(void)
+{
+    return !g_in_boss && (g_current_level==6 || g_current_level==7);
+}
+
+static u16 soften_yuv(u16 c)
+{
+    int y=(c>>8)&255, d=y-128;
+    y=128+d-(FOREST_GLARE_TENTHS*d*d*d)/(10*128*128);
+    if(y<0)y=0; if(y>255)y=255;
+    return (u16)((y<<8)|(c&0x00FF));
+}
+
 static u16 fade_yuv(u16 c, int level)
 {
     int y=(c>>8)&255, u=(c>>4)&15, v=c&15;
@@ -1723,7 +1758,10 @@ static void set_game_palette_fade(int level)
     const BossVisualData *bv=(g_in_boss&&g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;
     const BossRoomData *br=(g_in_boss&&g_boss_class==0)?&g_bowser_rooms[(g_current_level==5)?1:0]:0;
     const unsigned short *pal = g_in_boss ? (bv?bv->bg_palette:br->palette) : g_level->palette;
-    for(i=0;i<256;++i)pal_set((u16)i,fade_yuv(pal[i],level));
+    if(level_softens_glare())
+        for(i=0;i<256;++i)pal_set((u16)i,fade_yuv(soften_yuv(pal[i]),level));
+    else
+        for(i=0;i<256;++i)pal_set((u16)i,fade_yuv(pal[i],level));
     pal_set_line(MARIO_BOSS_SPR_PAL,g_player_palette,level);
     if(multiplayer_active())pal_set_line(LUIGI_SPR_PAL,g_luigi_reuse_palette,level);
     pal_set_line(CONTINUE_PLAYER_SPR_PAL,g_continue_player_palette,level);
@@ -2207,8 +2245,13 @@ static void overlay_set_palette(int level)
     const LevelOverlayData *ov=level_overlay();
     int i;
     if(!ov)return;
+    /* The band is mixed with the softened scenery underneath it, so it takes
+       the same shoulder or its tint would pull away from the plane it belongs
+       to as the level fades in. */
     for(i=0;i<LEVEL_OVERLAY_COLORS;++i)
-        pal_set((u16)(OVERLAY_PAL_BASE+i),fade_yuv(ov->palette[i],level));
+        pal_set((u16)(OVERLAY_PAL_BASE+i),
+                fade_yuv(level_softens_glare()?soften_yuv(ov->palette[i])
+                                              :ov->palette[i],level));
 }
 
 static void overlay_disable(void)
