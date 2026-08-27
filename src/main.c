@@ -4077,11 +4077,17 @@ static void hurt_player(void)
     if (g_crate_hide && g_carry_index>=0) return;
     if (g_player_mode!=PMODE_NORMAL || g_invuln>0) return;
     if (g_player_hearts>0) --g_player_hearts;
-    g_invuln=HURT_FRAMES;
-    g_hurt_pending_death=(g_player_hearts<=0);
-    /* Source behavior is a one-second hurt interval rather than immediate
-       death. */
     Play_Sound_Sample(SFX_PLAYER_HURT,0,0);
+    /* A killing blow (last heart spent) skips the one-second hurt interval
+       and goes straight into the death animation.  The non-killing case still
+       gets the 60-frame flicker so the player can recover from a near miss
+       and so the source visual cue remains visible. */
+    if (g_player_hearts<=0) {
+        begin_player_death();
+    } else {
+        g_invuln=HURT_FRAMES;
+        g_hurt_pending_death=0;
+    }
 }
 
 /* $15AB0 dispatches on the item id through the jump table at $15B96.  Sound
@@ -4106,8 +4112,11 @@ static void apply_item(unsigned char kind, int player2)
         if(player2){if(g_luigi.hearts>0)--g_luigi.hearts;}
         else if(g_player_hearts>0)--g_player_hearts;
         Play_Sound_Sample(SFX_PLAYER_HURT,0,0);
+        /* A killing poison pick-up (last heart spent) goes straight to the
+           death animation instead of the 60-frame hurt flicker used for
+           non-killing hits. */
         if(player2){if(g_luigi.hearts<=0)begin_luigi_death();}
-        else if(g_player_hearts<=0)g_hurt_pending_death=1;
+        else if(g_player_hearts<=0)begin_player_death();
         break;
     case ITEM_EXTRA_LIFE:
         if(player2){if(g_luigi.lives<9)++g_luigi.lives;}
