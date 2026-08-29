@@ -1240,6 +1240,16 @@ static void load_menu_asset(void)
 static void boot_exact_setup(void)
 {
     int y,x;
+    /* The animation is a delta stream: after frame 12 it only rewrites the
+       cells whose art changes, so every cell it has not reached yet shows
+       whatever is already in the boot tile bank.  From a cold start that is
+       zero -- black, which is what the opening is drawn against -- but the
+       bank is shared with the stage/boss background sets and with the
+       CONTINUE room, so coming back to the title from a lost game left the
+       level and CONTINUE tiles showing through the middle of the title for
+       the first few hundred frames.  Restore the cold-start state. */
+    vdc_set_vram_write(BACK_CHIP,BOOT_TILE_BASE_WORD);
+    for (y=0;y<BOOT_EXACT_CELL_COUNT*TILE_WORDS;++y) vdc_vram_write(BACK_CHIP,0);
     clear_bat(BACK_CHIP,BG_BAT_WORDS);
     clear_bat(FRONT_CHIP,FG_BAT_WORDS);
     set_map_height(BACK_CHIP,0); set_map_height(FRONT_CHIP,0);
