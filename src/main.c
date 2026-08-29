@@ -4499,7 +4499,13 @@ static void update_enemies(void)
                         ++e->behavior_phase;
                     }
                 }else if(e->behavior_phase>=3){
+                    /* The escape leg still flaps: the cel selector below is
+                       driven by behavior_timer, so leaving it parked at 0
+                       froze the wings on one cel for the whole climb out.
+                       The counter is a byte and 256 is a whole number of
+                       8-frame cels, so the wrap keeps the flap seamless. */
                     e->x-=FIX_ONE;e->y-=FIX_ONE;
+                    ++e->behavior_timer;
                 }
                 x=(int)(e->x>>FIX_SHIFT);y=(int)(e->y>>FIX_SHIFT);goto enemy_attack_checks;
             }else if(e->kind==ENEMY_KIND_STRIKE_SNAKE){ /* hold, rear up, then long strike */
