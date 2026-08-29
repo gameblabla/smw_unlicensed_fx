@@ -349,7 +349,15 @@ def build_sets(stage_manifest):
                     else:
                         crop=LEVEL3_ACTIVE_CROP_ROWS if slot==3 else 0
                         if y>=MD_VISIBLE_ROWS:
-                            sy=min(MD_VISIBLE_ROWS-1+crop,src_h-1)
+                            # The PC-FX shows two 8-pixel rows the Mega Drive's
+                            # V28 picture cuts off.  Repeating the single last
+                            # row splits the backdrop's 16-pixel tiles in half
+                            # and reads as a stripe -- the lava under slot 10
+                            # is where it shows worst.  Continue the last whole
+                            # 16-pixel tile row instead, which keeps the tile
+                            # phase (the same rule make_dumped_boss_planes()
+                            # already applies to slot 16's floor).
+                            sy=min(MD_VISIBLE_ROWS-2+((y-MD_VISIBLE_ROWS)&1)+crop,src_h-1)
                         else:
                             sy=min(y+crop,src_h-1)
                     for half in (left,right):
