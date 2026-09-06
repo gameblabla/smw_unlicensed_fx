@@ -31,9 +31,12 @@ ELF := $(OBJDIR)/$(TARGET).elf
 PROGRAM_BIN := $(OBJDIR)/$(TARGET).bin
 MAP := $(OBJDIR)/$(TARGET).map
 
-.PHONY: all disc clean assets editor apply-level-edits vram-map dist
+.PHONY: all disc clean assets editor apply-level-edits vram-map dist zip
 DIST_DIR := build/dist
 DIST_ZIP := $(TARGET)_beta.zip
+# Bare disc image: the cue plus the data track and every CD-DA track it
+# indexes.  A cue on its own names files that are not there.
+ZIP := $(TARGET).zip
 RELEASE_README := docs/RELEASE_README.txt
 CDDA_TOOL := tools/build_cdda.py
 CDDA_WAVS := NEWMUSIC/BOSS.wav NEWMUSIC/continue.wav NEWMUSIC/finallevelsmusic.wav \
@@ -91,7 +94,7 @@ disc: out_ram.bin cdlink.txt $(CDDA_TOOL) $(CDDA_WAVS)
 	$(PCFX_CDLINK) cdlink.txt $(TARGET)
 	python3 $(CDDA_TOOL) --music-dir NEWMUSIC --output $(TARGET) --cue $(TARGET).cue --header src/cdda_tracks.h
 clean:
-	rm -rf $(OBJDIR) out_ram.bin $(TARGET).cue $(TARGET).bin $(TARGET)_*.bin
+	rm -rf $(OBJDIR) out_ram.bin $(TARGET).cue $(TARGET).bin $(TARGET)_*.bin $(ZIP) $(DIST_ZIP)
 
 dist: disc
 	rm -rf $(DIST_DIR)
@@ -100,3 +103,8 @@ dist: disc
 	cp $(RELEASE_README) $(DIST_DIR)/README.txt
 	cd $(DIST_DIR) && zip -9 ../$(DIST_ZIP) *
 	@echo "Packaged disc: $(DIST_ZIP)"
+
+zip: disc
+	rm -f $(ZIP)
+	zip -9 -j $(ZIP) $(TARGET).cue $(TARGET).bin $(TARGET)_*.bin
+	@echo "Packaged disc: $(ZIP)"
