@@ -1543,6 +1543,21 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
     g_satb_page^=1;g_back_satb_page^=1;
 }
 
+/* The two menu walkers.  Their bank sits inside the range the per-level enemy
+   variants claim during a stage (ENEMY_BASE_WORD .. +0x3300), so anything that
+   reaches the menu from gameplay has to put it back; keeping it in its own
+   routine lets both entry paths do that. */
+static void upload_menu_sprites(void)
+{
+    int i;
+    /* Keep menu characters resident at a non-conflicting high VRAM address.
+       This avoids changing tile/BAT layouts during the title->menu fade. */
+    vdc_set_vram_write(FRONT_CHIP,MENU_MARIO_BASE_WORD);
+    for (i=0;i<1536;++i) vdc_vram_write(FRONT_CHIP,g_menu_mario_words[i]);
+    vdc_set_vram_write(FRONT_CHIP,MENU_LUIGI_BASE_WORD);
+    for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_menu_luigi_words[i]);
+}
+
 static void upload_front_sprites(void)
 {
     int i;
@@ -1560,12 +1575,7 @@ static void upload_front_sprites(void)
     for (i=0;i<128;++i) vdc_vram_write(FRONT_CHIP,g_menu_star_sprite_words[i]);
     vdc_set_vram_write(FRONT_CHIP,COIN_BASE_WORD);
     for (i=0;i<4096;++i) vdc_vram_write(FRONT_CHIP,g_coin_sprite_words[i]);
-    /* Keep menu characters resident at a non-conflicting high VRAM address.
-       This avoids changing tile/BAT layouts during the title->menu fade. */
-    vdc_set_vram_write(FRONT_CHIP,MENU_MARIO_BASE_WORD);
-    for (i=0;i<1536;++i) vdc_vram_write(FRONT_CHIP,g_menu_mario_words[i]);
-    vdc_set_vram_write(FRONT_CHIP,MENU_LUIGI_BASE_WORD);
-    for (i=0;i<384;++i) vdc_vram_write(FRONT_CHIP,g_menu_luigi_words[i]);
+    upload_menu_sprites();
 }
 
 static int palettes_equal(const unsigned short *a, const unsigned short *b)
@@ -2327,12 +2337,23 @@ static void overlay_upload(void)
        the count at the number of words the eight dots occupy and requires the
        offsets to ascend within the eight-cycle bank.  BG1 is a BAT layer, so
        it also needs the cell's BAT word fetched before the two CG words that
-       word addresses.  Five of the bank's eight cycles; the rest idle. */
-    mprog[0]=KING_CODE_BG0_CG_0;
-    mprog[1]=KING_CODE_BG0_CG_1;
-    mprog[2]=KING_CODE_BG1_BAT_0;
-    mprog[3]=KING_CODE_BG1_BATCG_0;
-    mprog[4]=KING_CODE_BG1_BATCG_1;
+       word addresses -- and 3.6.7.4(B) puts a hard two-cycle latency on that:
+       "水平8ドット分のBAT参照CGデータ読み出しは、BAT読み出し記述サイクルの
+       2サイクル後のサイクルから7サイクルの範囲に記述します", and a BAT-CG
+       fetch written earlier than that "そのCGデータは、8ドット左の値となり
+       正常に表示されません" -- it silently returns the cell eight dots to the
+       left.  With the BAT at cycle 2 the first BAT-CG fetch has to be at 4 or
+       later, so the old cycle-3 slot took half of every HUD row from the
+       neighbouring cell: on hardware the whole strip came out scrambled, while
+       emulators, which do not model the latency, drew it correctly.  Put the
+       BAT read at cycle 0 and its two CG reads at 2 and 3, inside the legal
+       window; BG0 keeps its ascending offsets around them.  Five of the bank's
+       eight cycles; the rest idle. */
+    mprog[0]=KING_CODE_BG1_BAT_0;
+    mprog[1]=KING_CODE_BG0_CG_0;
+    mprog[2]=KING_CODE_BG1_BATCG_0;
+    mprog[3]=KING_CODE_BG1_BATCG_1;
+    mprog[4]=KING_CODE_BG0_CG_1;
     for(i=5;i<16;++i)mprog[i]=KING_CODE_NOP;
     king_disable_microprogram();
     king_write_microprogram(mprog,0,16);
@@ -6902,6 +6923,38 @@ static void update_boss_motion(void)
     }
 }
 
+/* Bowser's breath, in the space its metasprite is actually drawn in.
+
+   The object coordinate is not the picture: draw_game_sprites() puts the 3x2
+   cell block at (+32,-3) from it, mirrored to (-32,-3) when it travels left,
+   and g_bowser_flame_mask (0x37) leaves the outer cell of the lower row empty.
+   The contact test used the generic small-projectile box -- 24x24 at the
+   object itself -- which never overlapped any of those cells, so the breath
+   swept through both players without touching them.  Test the two drawn rows
+   instead, inset by two pixels for the art's soft edge. */
+static int bowser_flame_hits(int sx,int sy,int dir,int bx,int by,int bw,int bh)
+{
+    int fx=sx+((dir<0)?-32:32),fy=sy-3;
+    /* The lower row keeps the two cells nearest the muzzle, which the flip
+       moves to the other side of the block. */
+    int lx=(dir<0)?fx:fx+16;
+    return aabb(bx,by,bw,bh,fx+2,fy+2,44,14) ||
+           aabb(bx,by,bw,bh,lx+2,fy+16,28,14);
+}
+
+/* Player two is a separate actor with its own hearts and its own mercy
+   window; the boss room only ever tested player one, so nothing the boss
+   threw could hurt Luigi. */
+static int luigi_boss_target(int *bx,int *by)
+{
+    if(!multiplayer_active()||g_luigi.out||g_luigi.mode!=PMODE_NORMAL||
+       g_luigi.invuln>0)return 0;
+    *bx=(int)(g_luigi.x>>FIX_SHIFT)+PLAYER_BODY_XOFF+4;
+    *by=(int)(g_luigi.y>>FIX_SHIFT)+PLAYER_BODY_YOFF+
+        bowser_room_object_y_offset()+5;
+    return 1;
+}
+
 static void update_boss_actor(void)
 {
     int i,bx,by,hitx,hity,hitw,hith;
@@ -6970,17 +7023,26 @@ static void update_boss_actor(void)
         }
     }
     if(g_boss_shot_active){
-        int sx,sy,py;
+        int sx,sy,py,px,lx,ly;
         g_boss_shot_x+=g_boss_shot_vx;g_boss_shot_y+=g_boss_shot_vy;
         sx=(int)(g_boss_shot_x>>FIX_SHIFT);sy=(int)(g_boss_shot_y>>FIX_SHIFT);
-        py=player_body_y()+bowser_room_object_y_offset();
+        px=player_body_x()+4;
+        py=player_body_y()+bowser_room_object_y_offset()+5;
         if(g_boss_class==1){
             if(sx<-16||sx>272||sy>=BOSS8_DROP_END_Y)g_boss_shot_active=0;
-            else if(g_invuln==0&&aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx,sy,7,16)){hurt_player();g_boss_shot_active=0;}
+            else{
+                if(g_invuln==0&&aabb(px,py,8,PLAYER_BODY_H-10,sx,sy,7,16)){hurt_player();g_boss_shot_active=0;}
+                else if(luigi_boss_target(&lx,&ly)&&
+                        aabb(lx,ly,8,PLAYER_BODY_H-10,sx,sy,7,16)){hurt_luigi();g_boss_shot_active=0;}
+            }
         }else{
-            sy-=16;
-            if(sx<-40||sx>272||sy>240)g_boss_shot_active=0;
-            else if(g_invuln==0&&aabb(player_body_x()+4,py+5,8,PLAYER_BODY_H-10,sx+4,sy+4,24,24)){hurt_player();g_boss_shot_active=0;}
+            int dir=(g_boss_shot_vx<0)?-1:1;
+            if(sx<-40||sx>272||sy-16>240)g_boss_shot_active=0;
+            else{
+                if(g_invuln==0&&bowser_flame_hits(sx,sy,dir,px,py,8,PLAYER_BODY_H-10)){hurt_player();g_boss_shot_active=0;}
+                else if(luigi_boss_target(&lx,&ly)&&
+                        bowser_flame_hits(sx,sy,dir,lx,ly,8,PLAYER_BODY_H-10)){hurt_luigi();g_boss_shot_active=0;}
+            }
         }
     }
     /* The player and crate sides of this test are quoted in the arena's drawn
@@ -8085,6 +8147,12 @@ static void enter_title_fade(void)
 
 static void enter_menu(void)
 {
+    /* SELECT jumps here straight out of a stage, whose enemy variant banks
+       cover $8400..$8B80.  upload_front_sprites() only runs on the way to the
+       title, so without this the walkers are drawn from whatever enemy art the
+       abandoned level left behind.  The caller has already blanked both VDC
+       outputs, so the transfer is safe here. */
+    upload_menu_sprites();
     g_menu_choice=MENU_1P;
     g_menu_sprite_fade=FADE_FULL;
     show_menu_back(g_menu_choice);
