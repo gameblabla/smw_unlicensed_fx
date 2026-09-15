@@ -1,6 +1,10 @@
 Super Mario World (Unlicensed, Taiwanese bootleg 1996 game) for PC-FX
 ===========================
 
+
+<img width="256" height="240" alt="smb_pcfx_title" src="https://github.com/user-attachments/assets/a790d1a0-8a19-4262-9f54-99dd4b5b0ff9" />
+<img width="256" height="240" alt="smb_ingame" src="https://github.com/user-attachments/assets/1e236f4e-b128-4dd4-acfc-e112e8d27861" />
+
 WHAT THIS IS
 ------------
 This game is a from-source reconstruction of the unlicensed Mega Drive
@@ -25,17 +29,15 @@ CONTROLS
   I      - jump
   II     - lift/throw crate
   III    - throw fireball
-  RUN    - front-end / continue confirmation
-  SELECT - return to the menu during gameplay
-  MODE1  - toggle debug mode (invulnerable, unlimited fireballs)
+  RUN    - Pause / start game
 
 BETA STATUS
 -----------
-This is a BETA release. The full level/data progression is implemented,
-but several source systems are still approximations rather than exact 68000 ports.
+This is near close to release, with a few expected issues not visible on Megadrive game
+but the game is playable from start to finish.
 
-Expect bugs. Please report issues along with the emulator used and, if
-possible, a save state describing where the problem occurred.
+Please report issues if you do encounter them.
+
 
 CREDITS
 -------
