@@ -24,7 +24,7 @@ LDFLAGS := -L$(V810GCC)/lib -L$(V810GCC)/$(PREFIX)/lib \
            -L$(V810GCC)/lib/gcc/$(PREFIX)/4.9.4 \
            $(V810GCC)/$(PREFIX)/lib/crt0.o --gc-sections
 LIBS := -lpcfx -lc -lsim -lgcc
-SRCS := src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/music.c src/game_levels_generated.c src/staff_roll.c
+SRCS := src/bare_stubs.c src/main.c src/assets_generated.c src/boot_exact.c src/boot_dual.c src/audio_stub.c src/music.c src/game_levels_generated.c src/staff_roll.c
 ASM_SRCS := src/pcfx_tetsu_wait.S
 OBJS := $(patsubst src/%.c,$(OBJDIR)/%.o,$(SRCS)) $(patsubst src/%.S,$(OBJDIR)/%.o,$(ASM_SRCS))
 ELF := $(OBJDIR)/$(TARGET).elf

@@ -449,6 +449,17 @@ static int g_level_rows=1; /* stacked screens; 1 for a purely horizontal level *
 static int g_level_cols;
 static int g_room;      /* route index of the live room, the port's FF0046 */
 static int g_satb_page;
+
+/* Per page, the number of SATB entries that could still be non-zero in VRAM.
+   The two pages alternate, so each keeps its own mark and submit_game_satbs()
+   only has to rewrite the range between the mark and this frame's count.  Zero
+   is the honest starting value rather than a guess: clear_satb() runs from
+   init_video() before anything can submit and leaves both pages zero.  The
+   other three writers of these pages -- clear_satb() itself, the front end's
+   submit_front_satb() and clear_front_sprites() -- go around the allocator, so
+   each resets the mark of the page it wrote. */
+static unsigned char g_satb_front_hi[2];
+static unsigned char g_satb_back_hi[2];
 static int g_back_satb_page;
 static int g_player_anim_clock;
 static int g_player_down;
@@ -1037,12 +1048,14 @@ static void clear_satb(void)
     for (i = 0; i < 0x100; ++i) vdc_vram_write(FRONT_CHIP, 0);
     vdc_set_satb_address(FRONT_CHIP, SATB_BASE0);
     g_satb_page = 0;
+    g_satb_front_hi[0]=g_satb_front_hi[1]=0;
     vdc_set_vram_write(BACK_CHIP, BACK_SATB_BASE0);
     for (i = 0; i < 0x100; ++i) vdc_vram_write(BACK_CHIP, 0);
     vdc_set_vram_write(BACK_CHIP, BACK_SATB_BASE1);
     for (i = 0; i < 0x100; ++i) vdc_vram_write(BACK_CHIP, 0);
     vdc_set_satb_address(BACK_CHIP, BACK_SATB_BASE0);
     g_back_satb_page = 0;
+    g_satb_back_hi[0]=g_satb_back_hi[1]=0;
 }
 
 static void clear_bat(int chip, int words)
@@ -1449,9 +1462,10 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
        scratch state below one 2 KiB DRAM page. */
     u16 front_line[240]={0},back_line[240]={0};
     int i,j,nf=0,nb=0;
-    u16 front_base=(u16)(g_satb_page?SATB_BASE1:SATB_BASE0);
-    u16 back_base=(u16)(g_back_satb_page?BACK_SATB_BASE1:BACK_SATB_BASE0);
-    for(i=0;i<64*4;++i)front[i]=back[i]=0;
+    unsigned char pg=(unsigned char)g_satb_page,bpg=(unsigned char)g_back_satb_page;
+    int fhi=g_satb_front_hi[pg],bhi=g_satb_back_hi[bpg];
+    u16 front_base=(u16)(pg?SATB_BASE1:SATB_BASE0);
+    u16 back_base=(u16)(bpg?BACK_SATB_BASE1:BACK_SATB_BASE0);
 
     for(i=0;i<logical_count;){
         int k,len=group_len[i]?group_len[i]:1;
@@ -1539,11 +1553,24 @@ static void submit_game_satbs(const u16 *logical,const unsigned char *group_len,
     }
 
     /* Prepare both hidden pages completely, then queue both SATB DMAs.  They
-       become visible together at the following VDW->VCR boundary. */
+       become visible together at the following VDW->VCR boundary.
+
+       "Completely" only has to reach the page's high-water mark.  Every entry
+       past it is already zero, and the entries this frame dropped off the
+       end are the only ones between the new count and the mark that can still
+       be live, so the 256 words per chip this used to refill every frame --
+       512 VDC writes for the eight to sixteen sprites a stage actually shows
+       -- become the sprites themselves plus the handful they displaced. */
+    if(nf>fhi)fhi=nf;
+    if(nb>bhi)bhi=nb;
     vdc_set_vram_write(FRONT_CHIP,front_base);
-    for(i=0;i<64*4;++i)vdc_vram_write(FRONT_CHIP,front[i]);
+    for(i=0;i<nf*4;++i)vdc_vram_write(FRONT_CHIP,front[i]);
+    for(i=nf*4;i<fhi*4;++i)vdc_vram_write(FRONT_CHIP,0);
     vdc_set_vram_write(BACK_CHIP,back_base);
-    for(i=0;i<64*4;++i)vdc_vram_write(BACK_CHIP,back[i]);
+    for(i=0;i<nb*4;++i)vdc_vram_write(BACK_CHIP,back[i]);
+    for(i=nb*4;i<bhi*4;++i)vdc_vram_write(BACK_CHIP,0);
+    g_satb_front_hi[pg]=(unsigned char)nf;
+    g_satb_back_hi[bpg]=(unsigned char)nb;
     vdc_set_satb_address(FRONT_CHIP,front_base);
     vdc_set_satb_address(BACK_CHIP,back_base);
     g_satb_page^=1;g_back_satb_page^=1;
@@ -2216,6 +2243,9 @@ static int g_overlay_active;
 #define HUD_KING_CG_ADDR    33
 
 static u16 g_hud_cg[HUD_KING_CELLS*HUD_KING_CELL_WORDS];
+/* Which cells of each row the strip is currently showing, so a repaint can
+   blank the ones it is about to redraw and leave the rest of KRAM alone. */
+static unsigned int g_hud_cell_live[2];
 static u32 g_hud_king_sig;
 static int g_hud_king_on;
 
@@ -2235,6 +2265,9 @@ static void hud_king_setup(void)
     king_set_kram_pages(0,0,0,1);
     king_set_kram_write(HUD_KING_CG_ADDR*1024,1);
     for(i=0;i<HUD_KING_CELL_WORDS;++i)king_kram_write(0);
+    /* Blank every cell once, so a cell the strip never draws is blank in KRAM
+       as well as in the shadow and never has to be written again. */
+    for(i=0;i<HUD_KING_CELLS*HUD_KING_CELL_WORDS;++i)king_kram_write(0);
     king_set_kram_write(HUD_KING_BAT_ADDR*1024,1);
     for(i=0;i<HUD_KING_COLS*32;++i)king_kram_write(0);
     king_set_bg_mode(KING_BGMODE_16_PAL,
@@ -2246,6 +2279,7 @@ static void hud_king_setup(void)
        layer line 208 on screen line 209 is written as its 10-bit residue. */
     king_set_scroll(KING_BG1,0,
         (s16)((HUD_KING_BAT_ROW*8-HUD_KING_TOP-hud_y_offset())&0x03FF));
+    g_hud_cell_live[0]=g_hud_cell_live[1]=0;
     g_hud_king_sig=0;
 }
 
@@ -3068,10 +3102,26 @@ static const StageObjectData *stage_objects(void)
     return &g_stage_objects[g_current_level];
 }
 
+/* The shape table belongs to the stage for as long as the stage lasts, but
+   platform_shape() reached it through stage_objects() on every call, and the
+   four accessors below call it four to six times per carrier per frame -- the
+   bulk of what walking a 60-record level costs.  init_objects() resolves the
+   stage's table once; the initial entry is the same empty one stage_objects()
+   hands out outside a stage. */
+/* The empty entry carries a real shape row rather than a null one.  It is
+   never indexed -- the shape count is zero, so every lookup returns before it
+   gets there -- but a null pointer field the compiler can see is a path it
+   will isolate into an abort() call, and this toolchain's libc cannot link
+   one. */
+static const unsigned short g_platform_shapes_none[8]={0,0,0,0,0,0,0,0};
+static const StageObjectData g_platform_objects_none=
+    {0,g_platform_shapes_none,0,0,0,0,0};
+static const StageObjectData *g_platform_objects=&g_platform_objects_none;
+
 /* (word offset, cols, rows, x offset, y offset, width, height) */
 static const unsigned short *platform_shape(const MovingPlatform *p)
 {
-    const StageObjectData *so=stage_objects();
+    const StageObjectData *so=g_platform_objects;
     if (!PLATFORM_KIND_IS_STAGE_OBJECT(p->kind) || p->shape>=so->shape_count) return 0;
     return so->shapes+p->shape*STAGE_OBJECT_SHAPE_WORDS;
 }
@@ -3674,6 +3724,7 @@ static void init_objects(void)
 #endif
         }
     }
+    g_platform_objects=stage_objects();
     init_moving_platforms();
     g_carry_index=-1;g_lift_timer=0;g_gem_count=0;g_invuln=0;
     g_crate_hide=0;
@@ -5219,14 +5270,15 @@ static void hud_king_blit(int x,int y,const unsigned short *cell)
         p0=cell[row];p1=cell[16+row];p2=cell[32+row];p3=cell[48+row];
         if(!(p0|p1|p2|p3))continue;
         for(col=0;col<16;++col){
-            int bit=15-col,sx=x+col,idx,w,sh;
+            int bit=15-col,sx=x+col,idx,w,sh,celli;
             idx=(int)((p0>>bit)&1)|(int)(((p1>>bit)&1)<<1)|
                 (int)(((p2>>bit)&1)<<2)|(int)(((p3>>bit)&1)<<3);
             if(!idx||sx<0||sx>=HUD_KING_COLS*8)continue;
-            w=((sy>>3)*HUD_KING_COLS+(sx>>3))*HUD_KING_CELL_WORDS
-              +(sy&7)*2+((sx&7)>>2);
+            celli=(sy>>3)*HUD_KING_COLS+(sx>>3);
+            w=celli*HUD_KING_CELL_WORDS+(sy&7)*2+((sx&7)>>2);
             sh=(3-(sx&3))*4;
             g_hud_cg[w]=(u16)((g_hud_cg[w]&~(0xF<<sh))|(idx<<sh));
+            g_hud_cell_live[sy>>3]|=1u<<(celli&(HUD_KING_COLS-1));
         }
     }
 }
@@ -5265,6 +5317,7 @@ static void hud_king_write_bat(void)
 static void hud_king_refresh(void)
 {
     int lives=g_lives,ammo=g_fireball_ammo,i;
+    unsigned int old_live[2];
     u32 sig;
     if(lives<0)lives=0; if(lives>9)lives=9;
     if(ammo<0)ammo=0; if(ammo>9)ammo=9;
@@ -5276,7 +5329,25 @@ static void hud_king_refresh(void)
     if(sig==g_hud_king_sig)return;
     g_hud_king_sig=sig;
 
-    for(i=0;i<HUD_KING_CELLS*HUD_KING_CELL_WORDS;++i)g_hud_cg[i]=0;
+    /* Only the cells the previous strip was showing can hold anything, so
+       those are the ones worth blanking -- a cell that was blank stays blank
+       in KRAM without being touched.  Their mask is kept: every one of them
+       has to be written back even when nothing redraws it, because KRAM still
+       holds the art the blank just removed. */
+    old_live[0]=g_hud_cell_live[0];
+    old_live[1]=g_hud_cell_live[1];
+    for(i=0;i<2;++i){
+        unsigned int live=old_live[i],c=0;
+        while(live){
+            if(live&1){
+                u16 *cell=&g_hud_cg[i*HUD_KING_COLS*HUD_KING_CELL_WORDS
+                                  +c*HUD_KING_CELL_WORDS];
+                int k;
+                for(k=0;k<HUD_KING_CELL_WORDS;++k)cell[k]=0;
+            }
+            live>>=1;++c;
+        }
+    }
     /* The same layout emit_game_sprites() uses, minus the 209/217 origin the
        strip already carries. */
     hud_king_blit(8,0,g_hud_life_words);
@@ -5297,8 +5368,22 @@ static void hud_king_refresh(void)
         hud_king_blit(208,8,g_hud_digit_words+lammo*64);
     }
 
-    king_set_kram_write(HUD_KING_CG_ADDR*1024+HUD_KING_CELL_WORDS,1);
-    for(i=0;i<HUD_KING_CELLS*HUD_KING_CELL_WORDS;++i)king_kram_write(g_hud_cg[i]);
+    /* Only the cells this repaint drew, plus the ones it blanked, reach KRAM.
+       The other half of the 32x2 strip was blank when the stage armed the
+       layer and has not been drawn into since, so it stays blank in KRAM
+       without a write. */
+    for(i=0;i<2;++i){
+        unsigned int live=old_live[i]|g_hud_cell_live[i],c=0;
+        while(live){
+            if(live&1){
+                int base=i*HUD_KING_COLS*HUD_KING_CELL_WORDS
+                        +c*HUD_KING_CELL_WORDS,k;
+                king_set_kram_write(HUD_KING_CG_ADDR*1024+HUD_KING_CELL_WORDS+base,1);
+                for(k=0;k<HUD_KING_CELL_WORDS;++k)king_kram_write(g_hud_cg[base+k]);
+            }
+            live>>=1;++c;
+        }
+    }
     hud_king_write_bat();
 }
 
@@ -7481,6 +7566,9 @@ static void submit_front_satb(u16 *satb)
     vdc_set_vram_write(FRONT_CHIP,base);
     for (i=0;i<64*4;++i) vdc_vram_write(FRONT_CHIP,satb[i]);
     vdc_set_satb_address(FRONT_CHIP,base);
+    /* The whole page was written behind submit_game_satbs()' back, so it has
+       to count as fully live again. */
+    g_satb_front_hi[g_satb_page]=64;
     g_satb_page^=1;
 }
 
@@ -7495,6 +7583,8 @@ static void clear_front_sprites(void)
     vdc_set_vram_write(BACK_CHIP,base);
     for(i=0;i<64*4;++i)vdc_vram_write(BACK_CHIP,back[i]);
     vdc_set_satb_address(BACK_CHIP,base);
+    /* This page went down zero from end to end, the strongest mark there is. */
+    g_satb_back_hi[g_back_satb_page]=0;
     g_back_satb_page^=1;
 }
 
