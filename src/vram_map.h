@@ -32,16 +32,10 @@
 #define CRATE_BASE_WORD 0x6800
 /* 0x6900..0x69C0 [play,boss] gem, three frames */
 #define GEM_BASE_WORD 0x6900
-/* 0x6A00..0x6AC0 [play,boss] life icon (128) + fire icon (64) */
-#define HUD_BASE_WORD 0x6A00
 /* 0x6B00..0x6CC0 [play] seven hidden crate items, 16x16 each */
 #define ITEM_BASE_WORD 0x6B00
-/* 0x6D00..0x6DC0 [play,boss] packed 1-5 heart HUD strip */
-#define HUD_HEART_STRIP_BASE_WORD 0x6D00
 /* 0x6E00..0x6F00 [play,boss] fireball */
 #define FIREBALL_BASE_WORD 0x6E00
-/* 0x7040..0x72C0 [play,boss] HUD digits */
-#define HUD_DIGIT_BASE_WORD 0x7040
 /* 0x7300..0x73C0 [play] level 2/6/8 carrier, 48x16 */
 #define PLATFORM_BASE_WORD 0x7300
 /* 0x7400..0xA700 [play] per-level enemy variant banks */

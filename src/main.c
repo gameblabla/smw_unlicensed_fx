@@ -37,8 +37,10 @@ extern void pcfx_tetsu_wait_frame(void);
    notes require saving this selector when an IRQ can interrupt VDC accesses. */
 extern u16 vdc_get_last_regnum(int chip);
 
-/* Defined with the rest of the World 3 cellophane layer, below. */
+/* Defined with the rest of the World 3 cellophane layer and the KING HUD,
+   below. */
 static void overlay_disable(void);
+static void hud_king_hide(void);
 
 #define BACK_CHIP VDC0
 #define FRONT_CHIP VDC1
@@ -60,8 +62,6 @@ static void overlay_disable(void);
 #define BOOT_TILE_BASE_WORD BG_TILE_BASE_WORD
 #define BOOT_TILE_BASE_INDEX (BOOT_TILE_BASE_WORD / TILE_WORDS)
 
-#define HUD_LIFE_BASE_WORD HUD_BASE_WORD
-#define HUD_FIRE_BASE_WORD (HUD_BASE_WORD + 128)
 /* The four 32x16 strips of the down-right wedge come first; its 16-wide
    remainder column follows them. */
 #define LEVEL8_WEDGE_R_RIGHT_WORD (LEVEL8_WEDGE_R_BASE_WORD+512)
@@ -1082,6 +1082,7 @@ static void show_black(void)
     vdc_set_scroll(FRONT_CHIP, 0, 0);
     clear_satb();
     overlay_disable();
+    hud_king_hide();
 }
 
 /* The HuC6261 picture-mode register also carries the KING BG0 display bit, so
@@ -1116,6 +1117,11 @@ static void init_video(void)
     tetsu_set_rainbow_palette(0);
     tetsu_set_priorities(1, 2, 0, 0, 0, 0, 0);
     tetsu_set_chroma_key(0, 1, 0, 1, 0, 1);
+    /* Nothing draws a KING layer before the first stage arms one, so pin them
+       off rather than trust the state king_init() left behind. */
+    king_disable_microprogram();
+    king_set_bg_prio(KING_BGPRIO_HIDE, KING_BGPRIO_HIDE, KING_BGPRIO_HIDE,
+                     KING_BGPRIO_HIDE, 0);
     set_display_layers(0,0);
     clear_satb();
     /* The shadow has to start out matching nothing the hardware holds, or the
@@ -1609,21 +1615,6 @@ static void upload_throw_sprite_words(int chip,u16 address)
     upload_sprite_words(chip,(u16)(address+384),g_player_death_words+320,64);
 }
 
-static void upload_hud_heart_strip(void)
-{
-    static u16 words[192];
-    int i;
-    /* The source heart is an 8x8 image in the upper half of a 16x16 cell.
-       Duplicate those eight bits into the right half. Two paired cells make
-       four adjacent hearts in one 32-pixel sprite; the original cell at the
-       tail supplies odd counts. */
-    for(i=0;i<64;++i){
-        u16 pair=(u16)(g_hud_heart_words[i]|(g_hud_heart_words[i]>>8));
-        words[i]=pair;words[64+i]=pair;words[128+i]=g_hud_heart_words[i];
-    }
-    upload_world_sprite_words(HUD_HEART_STRIP_BASE_WORD,words,192);
-}
-
 static void upload_game_sprites(void)
 {
     int i,j,k,uniq=0,walk_top=0,hit_top=0,alt_top=0,shot_top=0;
@@ -1654,12 +1645,10 @@ static void upload_game_sprites(void)
     upload_sprite_words(BACK_CHIP,BACK_MIRROR_DOWN_MARIO_WORD,g_player_down_words,384);
     upload_sprite_words(FRONT_CHIP,GAMEPLAY_DOWN_LUIGI_BASE_WORD,g_luigi_down_words,384);
     upload_sprite_words(BACK_CHIP,BACK_MIRROR_DOWN_LUIGI_WORD,g_luigi_down_words,384);
-    /* A full two-player HUD is 18 entries / 288 sprite pixels on its busiest
-       scanline, so its tail legitimately spills to VDC0.  Mirror all HUD art,
-       not only world objects; otherwise Luigi's last hearts name unrelated
-       background VRAM on the auxiliary chip. */
-    upload_world_sprite_words(HUD_LIFE_BASE_WORD,g_hud_life_words,128);
-    upload_world_sprite_words(HUD_FIRE_BASE_WORD,g_hud_fire_words,64);
+    /* The HUD art is blitted straight into KING BG1's KRAM by hud_king_blit(),
+       so none of it is mirrored into the two VDCs any more -- and a full
+       two-player HUD no longer shares a scanline with world objects, so
+       nothing it drew can be spilled to VDC0 either. */
     upload_world_sprite_words(CRATE_BASE_WORD,g_crate_sprite_words,256);
     /* Boss 3 uses the supplied pot object; upload it with the shared gameplay
        bank so entering that room does not need a mid-frame pattern transfer. */
@@ -1667,8 +1656,6 @@ static void upload_game_sprites(void)
     upload_world_sprite_words(GEM_BASE_WORD,g_gem_sprite_words,192);
     upload_world_sprite_words(FIREBALL_BASE_WORD,g_fireball_sprite_words,256);
     if(!g_in_boss)upload_world_sprite_words(ITEM_BASE_WORD,g_item_sprite_words,ITEM_KIND_COUNT*ITEM_CELL_WORDS);
-    upload_world_sprite_words(HUD_DIGIT_BASE_WORD,g_hud_digit_words,640);
-    upload_hud_heart_strip();
     if (!g_in_boss && (g_current_level==1 || g_current_level==5 || g_current_level==7)) {
         const u16 *platform_words=(g_current_level==5)?g_level6_platform_words:
                                   (g_current_level==7)?g_level8_platform_words:
@@ -2201,12 +2188,15 @@ static int g_overlay_active;
    lost their tint for the same sixteen lines, which is the seam that shows
    up as the band "switching off" around the score row.
 
-   So the HUD leaves the VDC sprites altogether and becomes KING BG1.  KING
-   resolves its own four planes into a single pixel before the VCE sees a
-   KING layer at all, so an opaque HUD dot simply replaces the band's dot and
-   arrives at the VCE tagged BG1 -- a layer with no cellophane coefficient --
-   while every other dot is still the band, in front of the VDC sprites for
-   every line of the frame.  Nothing needs a raster split any more.
+   So the HUD leaves the VDC sprites altogether and becomes KING BG1, and it
+   does so for every stage rather than only the banded ones.  KING resolves
+   its own four planes into a single pixel before the VCE sees a KING layer
+   at all, so an opaque HUD dot simply replaces whatever was underneath it
+   and arrives at the VCE tagged BG1 -- a layer with no cellophane
+   coefficient -- while every other dot keeps its own.  Nothing needs a
+   raster split any more, the HUD keeps out of both sprite planes' way, and
+   the two players' rows no longer have to share one scanline budget with the
+   world's enemies.
 
    BG1 is a 256x256 BAT layer: a BAT cell picks its own sixteen-colour
    palette line, so both players' HUDs keep the palettes their sprites used.
@@ -2220,12 +2210,14 @@ static int g_overlay_active;
 #define HUD_KING_TOP        209        /* first screen line of the HUD */
 #define HUD_KING_LUIGI_COL  15         /* x 120, where player two's HUD starts */
 /* KRAM granules of 1024 words.  BG0's 512x256 4bpp band is granules 0..31,
-   so the HUD's 32x32 BAT and its 65 tiles follow it. */
+   so the HUD's 32x32 BAT and its 65 tiles follow it.  The band is the only
+   other user of KRAM page 0, so the HUD can sit here in every stage. */
 #define HUD_KING_BAT_ADDR   32
 #define HUD_KING_CG_ADDR    33
 
 static u16 g_hud_cg[HUD_KING_CELLS*HUD_KING_CELL_WORDS];
 static u32 g_hud_king_sig;
+static int g_hud_king_on;
 
 /* Both HUD rows sit sixteen lines higher in the boss rooms and in level 3. */
 static int hud_y_offset(void)
@@ -2234,14 +2226,19 @@ static int hud_y_offset(void)
 }
 
 /* Publish the layer registers and the parts of KRAM that never change: the
-   blank tile every unused BAT entry points at, and a cleared BAT. */
+   blank tile every unused BAT entry points at, and a cleared BAT.  A cleared
+   BAT is a blank layer, so the strip can be filled in after the display bit
+   is set without anything being visible in between. */
 static void hud_king_setup(void)
 {
     int i;
+    king_set_kram_pages(0,0,0,1);
     king_set_kram_write(HUD_KING_CG_ADDR*1024,1);
     for(i=0;i<HUD_KING_CELL_WORDS;++i)king_kram_write(0);
     king_set_kram_write(HUD_KING_BAT_ADDR*1024,1);
     for(i=0;i<HUD_KING_COLS*32;++i)king_kram_write(0);
+    king_set_bg_mode(KING_BGMODE_16_PAL,
+                     (king_bgmode)(KING_BGMODE_16_PAL|KING_BGMODE_BAT),0,0);
     king_set_bg_size(KING_BG1,KING_BGSIZE_256,KING_BGSIZE_256,
                      KING_BGSIZE_256,KING_BGSIZE_256);
     king_set_bat_cg_addr(KING_BG1,HUD_KING_BAT_ADDR,HUD_KING_CG_ADDR);
@@ -2250,6 +2247,75 @@ static void hud_king_setup(void)
     king_set_scroll(KING_BG1,0,
         (s16)((HUD_KING_BAT_ROW*8-HUD_KING_TOP-hud_y_offset())&0x03FF));
     g_hud_king_sig=0;
+}
+
+/* The whole picture's KING state, derived from the two flags that own it: the
+   band is optional, the HUD is not.  Everything the HuC6261 and the HuC6272
+   need to agree on -- the display bits, the layer priorities, and the fetch
+   microprogram -- is written here, so a screen that turns either of them on
+   or off cannot leave a stale one behind.
+
+   Two CG fetches cover eight 16-colour pixels -- the doc (3.6.7.4) fixes the
+   count at the number of words the eight dots occupy and requires the offsets
+   to ascend within the eight-cycle bank.  BG1 is a BAT layer, so it also needs
+   the cell's BAT word fetched before the two CG words that word addresses --
+   and 3.6.7.4(B) puts a hard two-cycle latency on that: "水平8ドット分のBAT参照
+   CGデータ読み出しは、BAT読み出し記述サイクルの2サイクル後のサイクルから7
+   サイクルの範囲に記述します", and a BAT-CG fetch written earlier than that
+   "そのCGデータは、8ドット左の値となり正常に表示されません" -- it silently
+   returns the cell eight dots to the left.  With the BAT at cycle 2 the first
+   BAT-CG fetch has to be at 4 or later, so the old cycle-3 slot took half of
+   every HUD row from the neighbouring cell: on hardware the whole strip came
+   out scrambled, while emulators, which do not model the latency, drew it
+   correctly.  The BAT read therefore sits in cycle 0 and its two CG reads in
+   cycles 2 and 3, and the band, when it is up, keeps its own ascending offsets
+   around them in cycles 1 and 4. */
+static void king_refresh_layers(void)
+{
+    int band=g_overlay_active,hud=g_hud_king_on,i;
+    u16 mprog[16];
+    mprog[0]=KING_CODE_BG1_BAT_0;
+    mprog[1]=band?KING_CODE_BG0_CG_0:KING_CODE_NOP;
+    mprog[2]=KING_CODE_BG1_BATCG_0;
+    mprog[3]=KING_CODE_BG1_BATCG_1;
+    mprog[4]=band?KING_CODE_BG0_CG_1:KING_CODE_NOP;
+    for(i=5;i<16;++i)mprog[i]=KING_CODE_NOP;
+    king_disable_microprogram();
+    king_write_microprogram(mprog,0,16);
+    if(band||hud)king_enable_microprogram();
+    /* KING resolves its own planes in this order, so the HUD lands on top of
+       the band before either reaches the HuC6261. */
+    king_set_bg_prio(band?KING_BGPRIO_0:KING_BGPRIO_HIDE,
+                     hud?KING_BGPRIO_1:KING_BGPRIO_HIDE,
+                     KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,0);
+    /* No band means no cellophane anywhere, so the HUD cannot inherit a
+       coefficient left over from the banded stage it followed. */
+    if(!band)tetsu_set_cellophane_control(0,0,TETSU_NO_COEFF,TETSU_NO_COEFF,
+                                          TETSU_NO_COEFF,TETSU_NO_COEFF,
+                                          TETSU_NO_COEFF,TETSU_NO_COEFF,
+                                          TETSU_NO_COEFF);
+    tetsu_set_priorities(1,band?3:2,band?OVERLAY_PRIO_OVER_SPRITES:0,
+                         hud?HUD_KING_PRIO:0,0,0,0);
+    set_display_layers(band,hud);
+}
+
+/* Bring the HUD up for a stage.  The strip itself is rebuilt by the next
+   hud_king_refresh(), which the stage's first frame calls. */
+static void hud_king_show(void)
+{
+    g_hud_king_on=1;
+    hud_king_setup();
+    king_refresh_layers();
+}
+
+/* Every screen outside a stage owns the whole picture, and the HUD is part of
+   the stage's, so it goes down with the band. */
+static void hud_king_hide(void)
+{
+    if(!g_hud_king_on)return;
+    g_hud_king_on=0;
+    g_hud_king_sig=0;
+    king_refresh_layers();
 }
 
 static const LevelOverlayData *level_overlay(void)
@@ -2278,21 +2344,16 @@ static void overlay_disable(void)
 {
     if(!g_overlay_active)return;
     g_overlay_active=0;
-    king_disable_microprogram();
-    king_set_bg_prio(KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,KING_BGPRIO_HIDE,
-                     KING_BGPRIO_HIDE,0);
-    tetsu_set_cellophane_control(0,0,TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_NO_COEFF,
-                                 TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_NO_COEFF,
-                                 TETSU_NO_COEFF);
-    tetsu_set_priorities(1,2,0,0,0,0,0);
-    set_display_layers(0,0);
+    /* Only the band retires here -- the cellophane coefficient, the display
+       bits and the fetch program all go with it; the HUD, which every stage
+       has, stays. */
+    king_refresh_layers();
 }
 
 static void overlay_upload(void)
 {
     const LevelOverlayData *ov=level_overlay();
     signed char rowmap[LEVEL_OVERLAY_ROWS];
-    u16 mprog[16];
     int y,x,i;
 
     if(!ov){overlay_disable();return;}
@@ -2329,35 +2390,6 @@ static void overlay_upload(void)
     king_set_bat_cg_addr(KING_BG0SUB,0,0);
     king_set_scroll(KING_BG0,0,0);
     hud_king_setup();
-    /* KING resolves its own planes in this order, so the HUD lands on top of
-       the band before either reaches the HuC6261. */
-    king_set_bg_prio(KING_BGPRIO_0,KING_BGPRIO_1,KING_BGPRIO_HIDE,
-                     KING_BGPRIO_HIDE,0);
-    /* Two CG fetches cover eight 16-colour pixels -- the doc (3.6.7.4) fixes
-       the count at the number of words the eight dots occupy and requires the
-       offsets to ascend within the eight-cycle bank.  BG1 is a BAT layer, so
-       it also needs the cell's BAT word fetched before the two CG words that
-       word addresses -- and 3.6.7.4(B) puts a hard two-cycle latency on that:
-       "水平8ドット分のBAT参照CGデータ読み出しは、BAT読み出し記述サイクルの
-       2サイクル後のサイクルから7サイクルの範囲に記述します", and a BAT-CG
-       fetch written earlier than that "そのCGデータは、8ドット左の値となり
-       正常に表示されません" -- it silently returns the cell eight dots to the
-       left.  With the BAT at cycle 2 the first BAT-CG fetch has to be at 4 or
-       later, so the old cycle-3 slot took half of every HUD row from the
-       neighbouring cell: on hardware the whole strip came out scrambled, while
-       emulators, which do not model the latency, drew it correctly.  Put the
-       BAT read at cycle 0 and its two CG reads at 2 and 3, inside the legal
-       window; BG0 keeps its ascending offsets around them.  Five of the bank's
-       eight cycles; the rest idle. */
-    mprog[0]=KING_CODE_BG1_BAT_0;
-    mprog[1]=KING_CODE_BG0_CG_0;
-    mprog[2]=KING_CODE_BG1_BATCG_0;
-    mprog[3]=KING_CODE_BG1_BATCG_1;
-    mprog[4]=KING_CODE_BG0_CG_1;
-    for(i=5;i<16;++i)mprog[i]=KING_CODE_NOP;
-    king_disable_microprogram();
-    king_write_microprogram(mprog,0,16);
-    king_enable_microprogram();
 
     /* BG1's palette base is zero, so a BAT cell's four-bit bank number is
        the same sprite palette line the HUD used as sprites. */
@@ -2368,7 +2400,6 @@ static void overlay_upload(void)
        or the freshly uploaded band flashes at full colour over the black
        screen for the frames the rest of the load takes. */
     overlay_set_palette(0);
-    tetsu_set_priorities(1,3,OVERLAY_PRIO_OVER_SPRITES,HUD_KING_PRIO,0,0,0);
     tetsu_set_cellophane_coeffs(1,4,4,4,4,4,4);
     /* Neither front nor back cellophane: those replace the hindmost layer with
        a constant colour, while plain per-layer cellophane blends BG0 with the
@@ -2376,8 +2407,8 @@ static void overlay_upload(void)
     tetsu_set_cellophane_control(0,0,TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_COEFF_1,
                                  TETSU_NO_COEFF,TETSU_NO_COEFF,TETSU_NO_COEFF,
                                  TETSU_NO_COEFF);
-    set_display_layers(1,1);
     g_overlay_active=1;
+    king_refresh_layers();
 }
 
 static void init_level_ring(void)
@@ -2403,6 +2434,8 @@ static void init_level_ring(void)
     vdc_set_scroll(FRONT_CHIP,0,0);
     vdc_set_scroll(level_stage_chip(),0,(u16)(g_camera_y&0x00FF));
     overlay_upload();
+    /* Every stage draws its HUD on KING BG1, band or no band. */
+    hud_king_show();
     /* Publish every palette black: start_gameplay() re-publishes at the level
        the caller asked for once the whole load has finished, and the KING
        overlay band is visible during the load even with both VDCs blanked. */
@@ -5269,24 +5302,6 @@ static void hud_king_refresh(void)
     hud_king_write_bat();
 }
 
-static void emit_hud_hearts(u16 *satb,int *n,int x,int y,int count,u16 palette)
-{
-    u16 ctrl=(u16)(VDC_SPR_PRIO_SP|palette);
-    if(count>PLAYER_MAX_HEARTS)count=PLAYER_MAX_HEARTS;
-    if(count>=4&&*n<GAME_SPRITE_CAPACITY){
-        set_sprite_entry(satb,(*n)++,x,y,HUD_HEART_STRIP_BASE_WORD,
-                         (u16)(ctrl|VDC_SPR_X_WIDTH_2));
-        x+=32;count-=4;
-    }
-    if(count>=2&&*n<GAME_SPRITE_CAPACITY){
-        set_sprite_entry(satb,(*n)++,x,y,HUD_HEART_STRIP_BASE_WORD,ctrl);
-        x+=16;count-=2;
-    }
-    if(count&&*n<GAME_SPRITE_CAPACITY)
-        set_sprite_entry(satb,(*n)++,x,y,
-                         (u16)(HUD_HEART_STRIP_BASE_WORD+128),ctrl);
-}
-
 static void draw_game_sprites(void)
 {
     static u16 satb[GAME_SPRITE_CAPACITY * 4];
@@ -5323,50 +5338,14 @@ static void draw_game_sprites(void)
         py+=8;
     }
     int player_visible=1;
-    int hud_yoff=(g_in_boss||(!g_in_boss&&g_current_level==2))?-16:0;
 
     for (i = 0; i < GAME_SPRITE_CAPACITY * 4; ++i) satb[i] = 0;
     for (i = 0; i < GAME_SPRITE_CAPACITY; ++i) group_len[i] = 1;
 
-    /* Exact Mega Drive HUD object boundaries, emitted first in SATB so a busy
-       room cannot drop them: 24x16 life icon/x, 16x16 fire icon, then live
-       digits and individual heart sprites.  Where the cellophane band is up
-       the whole HUD lives on KING BG1 instead, above the band rather than
-       under it, and none of this is emitted. */
-    if(g_overlay_active)hud_king_refresh();
-    else{
-    set_sprite_entry(satb,n++,8,209+hud_yoff,HUD_LIFE_BASE_WORD,
-        (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|player_pal));
-    set_sprite_entry(satb,n++,80,209+hud_yoff,HUD_FIRE_BASE_WORD,
-        (u16)(VDC_SPR_PRIO_SP|player_pal));
-    if (n<GAME_SPRITE_CAPACITY) {
-        int lives=g_lives; if (lives<0) lives=0; if (lives>9) lives=9;
-        set_sprite_entry(satb,n++,32,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
-    }
-    emit_hud_hearts(satb,&n,40,217+hud_yoff,g_player_hearts,player_pal);
-    if (n<GAME_SPRITE_CAPACITY) {
-        int digit=g_fireball_ammo;
-        if (digit<0) digit=0; if (digit>9) digit=9;
-        set_sprite_entry(satb,n++,96,217+hud_yoff,(u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|player_pal));
-    }
-    if(multiplayer_active() && n<GAME_SPRITE_CAPACITY){
-        int lives=g_luigi.lives,digit=g_luigi.fireball_ammo;
-        if(lives<0)lives=0;if(lives>9)lives=9;
-        if(digit<0)digit=0;if(digit>9)digit=9;
-        set_sprite_entry(satb,n++,120,209+hud_yoff,HUD_LIFE_BASE_WORD,
-            (u16)(VDC_SPR_PRIO_SP|VDC_SPR_X_WIDTH_2|LUIGI_SPR_PAL));
-        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,144,217+hud_yoff,
-            (u16)(HUD_DIGIT_BASE_WORD+lives*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
-        emit_hud_hearts(satb,&n,152,217+hud_yoff,g_luigi.hearts,LUIGI_SPR_PAL);
-        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,192,209+hud_yoff,
-            HUD_FIRE_BASE_WORD,(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
-        if(n<GAME_SPRITE_CAPACITY)set_sprite_entry(satb,n++,208,217+hud_yoff,
-            (u16)(HUD_DIGIT_BASE_WORD+digit*64),(u16)(VDC_SPR_PRIO_SP|LUIGI_SPR_PAL));
-    }
-    }
-    /* Everything emitted from here on is world content and may be occluded by
-       a front-plane scenery layer; the HUD above never is. */
-    int hud_entries=n;
+    /* The HUD is a KING layer, so nothing here emits it: the life icon/x, the
+       fire icon, the lives and ammo digits and both rows of hearts are blitted
+       into BG1's KRAM instead, and no SATB entry is spent on them. */
+    hud_king_refresh();
 
     /* The boss body leads the world content so it cannot lose cells to a
        full SATB and so nothing in the room draws over it.  On the Mega
@@ -5869,8 +5848,11 @@ static void draw_game_sprites(void)
         set_sprite_entry(satb,n++,sx,sy,FIREBALL_BASE_WORD,ctrl);
     }
 
+    /* The HUD is a KING layer, so it is not in the SATB to strip; every entry
+       left here is world content and may be occluded by a front-plane scenery
+       layer. */
     if (level_front_scenery_over_sprites())
-        for (i=hud_entries;i<n;++i) satb[i*4+3]&=(u16)~VDC_SPR_PRIO_SP;
+        for (i=0;i<n;++i) satb[i*4+3]&=(u16)~VDC_SPR_PRIO_SP;
 
     submit_game_satbs(satb,group_len,n);
 }
@@ -5956,6 +5938,9 @@ static void start_boss(int fade_in)
     const BossRoomData *br;
     g_in_boss=1; g_paused=0; g_level=&g_game_levels[g_current_level]; g_level_width_tiles=32; g_level_rows=1;
     overlay_disable();
+    /* The boss rooms lift both HUD rows, so the layer's scroll is rewritten
+       for the room rather than the stage it was armed in. */
+    hud_king_show();
     music_transition_to_boss();
     g_boss_class=boss_class_for_level(g_current_level);bv=(g_boss_class>0)?&g_later_boss_visuals[g_boss_class-1]:0;br=bv?0:&g_bowser_rooms[(g_current_level==5)?1:0];
     vdc_setreg(BACK_CHIP,VDC_REG_CR,0);vdc_setreg(FRONT_CHIP,VDC_REG_CR,0);
@@ -8398,11 +8383,14 @@ int main(void)
         }
         else if (g_state==STATE_STAFF)
             commit_staff_scroll();
-        /* Every other screen owns the whole picture, and the cellophane layer
-           is anchored to the stage's rasters, so retire it on the way out. */
+        /* Every other screen owns the whole picture, and both the cellophane
+           layer and the HUD are anchored to the stage's rasters, so retire
+           them on the way out. */
         if (g_state!=STATE_PLAY && g_state!=STATE_LEVEL_FADE &&
-            g_state!=STATE_STAGE_PREP && g_state!=STATE_STAGE_LOAD)
+            g_state!=STATE_STAGE_PREP && g_state!=STATE_STAGE_LOAD) {
             overlay_disable();
+            hud_king_hide();
+        }
         btn = read_buttons();
         pressed = (u16)(btn & (u16)~g_prev_buttons);
         g_prev_buttons = btn;

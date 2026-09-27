@@ -58,11 +58,10 @@ BANKS = [
     ('THROW_BASE_WORD',             FRONT, 0x6600, 448,    (PLAY, BOSS), 'death/throw 48x32 pose'),
     ('CRATE_BASE_WORD',             FRONT, 0x6800, 256,    (PLAY, BOSS), 'crate object'),
     ('GEM_BASE_WORD',               FRONT, 0x6900, 192,    (PLAY, BOSS), 'gem, three frames'),
-    ('HUD_BASE_WORD',               FRONT, 0x6A00, 192,    (PLAY, BOSS), 'life icon (128) + fire icon (64)'),
+    # 0x6A00..0x72C0 is free: the life/fire icons, the heart strip and the
+    # digits moved to KING BG1, whose KRAM the strip is blitted into directly.
     ('ITEM_BASE_WORD',              FRONT, 0x6B00, 448,    (PLAY,), 'seven hidden crate items, 16x16 each'),
-    ('HUD_HEART_STRIP_BASE_WORD',   FRONT, 0x6D00, 192,    (PLAY, BOSS), 'packed 1-5 heart HUD strip'),
     ('FIREBALL_BASE_WORD',          FRONT, 0x6E00, 256,    (PLAY, BOSS), 'fireball'),
-    ('HUD_DIGIT_BASE_WORD',         FRONT, 0x7040, 640,    (PLAY, BOSS), 'HUD digits'),
     ('PLATFORM_BASE_WORD',          FRONT, 0x7300, 192,    (PLAY,), 'level 2/6/8 carrier, 48x16'),
     ('ENEMY_BASE_WORD',             FRONT, 0x7400, 'sized:enemy_variants', (PLAY,), 'per-level enemy variant banks'),
     ('BOSS_BASE_WORD',              FRONT, 0x7400, 'sized:boss_body', (BOSS,), 'boss body poses (Bowser uses the ten-pose bank)'),
